@@ -6,6 +6,11 @@ arTerm keeps a Windows remote shell running independently of
 your local terminal. Return to the same shell with the same named command,
 or control an attached session from another local CLI or agent.
 
+Reach configured Windows Dev Boxes, VMs and Windows Sandbox hosts across networks
+through an authenticated tunnel—no same-LAN connection or direct inbound host
+access required. Client and host still need permitted outbound connectivity under
+organizational network policy.
+
 ## Why use it?
 
 - **Long-running remote CLI agents and builds:** leave work running on a remote
