@@ -106,7 +106,7 @@ impl Fixture {
     fn wait_for_session_state(&self, id: &str, exited: bool, attached: bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let output = self.host_command("sessions").output().unwrap();
+            let output = self.host_command("sessions").arg("--json").output().unwrap();
             assert!(
                 output.status.success(),
                 "session status failed: {}",

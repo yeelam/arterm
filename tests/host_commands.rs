@@ -13,6 +13,27 @@ fn host_help_and_version_use_neutral_product_branding() {
             String::from_utf8_lossy(&output.stderr));
         assert_eq!(text.lines().next(), Some(expected.as_str()));
     }
+
+}
+
+#[test]
+fn host_output_flags_are_documented_and_invalid_options_do_not_touch_state() {
+    let home = std::env::temp_dir().join(format!("arterm-host-output-{}", uuid::Uuid::now_v7()));
+    let help = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
+        .env("VSTERM_REMOTE_HOME", &home).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stderr).unwrap();
+    assert!(help.contains("status [--json] | sessions [--json]"));
+    assert!(help.contains("terminate <session-id> --yes [--json]"));
+    for verb in ["status", "sessions", "terminate", "stop"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
+            .env("VSTERM_REMOTE_HOME", &home)
+            .args([verb, "--json", "--json"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate option: --json"));
+    }
+    assert!(!home.exists());
 }
 
 #[test]

@@ -34,6 +34,15 @@ arterm-host.exe status
 arterm-host.exe doctor
 ```
 
+Host `status` prints a retained-session count and setup details; `sessions` prints a
+table of retained sessions (including exited sessions). For scripts, use
+`arterm-host.exe sessions --json` to retain the original JSON array unchanged.
+`status --json` emits the broker response object (`ok` and numeric `sessions`) without
+setup prose. `terminate SESSION-ID --yes` and `stop [--terminate-sessions]`
+print request acknowledgements; add `--json` for an `{"ok":true}` acknowledgement.
+Acknowledgement does not assert confirmed process exit. Failures retain exit 1
+and a single stderr diagnostic; successful commands retain exit 0.
+
 The host starts at Windows user logon. A cold boot still requires a Windows
 sign-in; network/RDP disconnection is not the same as Windows logoff.
 

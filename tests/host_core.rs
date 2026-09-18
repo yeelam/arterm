@@ -492,7 +492,7 @@ fn real_conpty_survives_bridge_loss_and_duplicate_create() {
     ));
     let second_text = collect_marker(&mut second, id, &mut cursor, ":resumable");
     assert!(second_text.contains(&format!("SECOND={pid}:resumable")));
-    let sessions = host.command(&["sessions"]);
+    let sessions = host.command(&["sessions", "--json"]);
     assert!(sessions.status.success());
     let listed = String::from_utf8_lossy(&sessions.stdout);
     assert_eq!(listed.matches(&id.to_string()).count(), 1);
@@ -528,7 +528,7 @@ fn real_conpty_survives_bridge_loss_and_duplicate_create() {
     drop(terminator);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let listed = host.command(&["sessions"]);
+        let listed = host.command(&["sessions", "--json"]);
         let sessions: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
         if sessions
             .as_array()
@@ -607,7 +607,7 @@ fn concurrent_identical_create_requests_spawn_one_session() {
         .collect::<Vec<_>>();
     assert_eq!(recovered.iter().filter(|value| !**value).count(), 1);
     assert_eq!(recovered.iter().filter(|value| **value).count(), 1);
-    let sessions = host.command(&["sessions"]);
+    let sessions = host.command(&["sessions", "--json"]);
     let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
     assert_eq!(sessions.as_array().unwrap().len(), 1);
     assert_eq!(sessions[0]["id"], id.to_string());

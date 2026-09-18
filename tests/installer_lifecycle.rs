@@ -196,7 +196,7 @@ fn live_legacy_host_blocks_upgrade_and_uninstall_without_replacing_files() {
         assert!(!dir.join(deployment::exe_name(Role::Host)).exists());
         assert_eq!(fs::read(&legacy).unwrap(), payload);
         assert_eq!(fs::read(dir.join("installed.json")).unwrap(), marker);
-        let status = Command::new(&legacy).arg("sessions").output().unwrap();
+        let status = Command::new(&legacy).args(["sessions", "--json"]).output().unwrap();
         let sessions: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
         assert!(sessions.as_array().unwrap().iter().any(|v| v["id"] == id.to_string() && v["exited"] == false));
     }
