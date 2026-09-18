@@ -3,6 +3,7 @@ use rmpv::Value;
 use std::{
     fs,
     io::{Read, Write},
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     thread,
@@ -17,7 +18,20 @@ struct Host {
 impl Host {
     fn start() -> Self {
         let home = std::env::temp_dir().join(format!("devbox-host-core-{}", Uuid::now_v7()));
+        Self::start_at(home, false)
+    }
+    fn start_at(mut home: PathBuf, use_short_alias: bool) -> Self {
         fs::create_dir_all(&home).unwrap();
+        if use_short_alias {
+            let path = home.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+            let mut short = vec![0u16; 32768];
+            let length = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                    path.as_ptr(), short.as_mut_ptr(), short.len() as u32)
+            } as usize;
+            assert!(length > 0 && length < short.len(), "resolve test-owned short path: {}", std::io::Error::last_os_error());
+            home = std::ffi::OsString::from_wide(&short[..length]).into();
+        }
         let child = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
@@ -261,7 +275,14 @@ fn command_protocol_rejects_unintegrated_shell_before_input() {
 
 #[test]
 fn managed_commands_preserve_runspace_and_report_real_completion() {
-    let host = Host::start();
+    // Exercise 8.3 spelling where available and a displayed path wider than the
+    // 100-column terminal. Neither representation is a cwd identity oracle.
+    let home = std::env::temp_dir().join(format!(
+        "devbox-host-core-cwd-{}-{}", "path-representation-".repeat(4), Uuid::now_v7()));
+    let host = Host::start_at(home, true);
+    assert!(fs::canonicalize(&host.home).unwrap().as_os_str().len() > 100);
+    let cwd_nonce = Uuid::now_v7().to_string();
+    fs::write(host.home.join("cwd-sentinel.txt"), &cwd_nonce).unwrap();
     let mut bridge = host.bridge();
     let client = vec![17; 16];
     let broker = bridge.hello_capabilities(&client, true);
@@ -293,13 +314,17 @@ fn managed_commands_preserve_runspace_and_report_real_completion() {
     bridge.send(submit(first, &code));
     receive_command_state(&mut bridge, Some(first), "completed");
     let second = Uuid::now_v7();
-    bridge.send(submit(second, "$Keep++; Write-Output ('SECOND='+$PID+':resumable'); Write-Output ('VALUE='+$Keep); Write-Output ('DIR='+$PWD.Path)"));
-    let (_, output) = receive_command_state(&mut bridge, Some(second), "completed");
+    let second_code = "$Keep++; Write-Output ('SECOND='+$PID+':resumable'); Write-Output ('VALUE='+$Keep); Write-Output ('DIR='+$PWD.Path); $cwdSentinel=Get-Content -LiteralPath 'cwd-sentinel.txt' -Raw -ErrorAction Stop; Set-Content -LiteralPath 'cwd-proof.txt' -Value ($PID.ToString()+'|'+$Keep+'|'+$cwdSentinel) -Encoding Ascii -NoNewline -ErrorAction Stop";
+    bridge.send(submit(second, second_code));
+    let (record, output) = receive_command_state(&mut bridge, Some(second), "completed");
+    assert_eq!(get(&record, "succeeded").unwrap().as_bool(), Some(true), "{output}");
     assert_eq!(marker_pid(&output, "SECOND="), pid);
     assert!(output.contains("VALUE=42"), "{output}");
-    assert!(output.contains(host.home.to_str().unwrap()), "{output}");
+    let proof = fs::read_to_string(host.home.join("cwd-proof.txt")).unwrap_or_else(|error|
+        panic!("relative cwd proof missing in {}: {error}; output: {output}", host.home.display()));
+    assert_eq!(proof, format!("{pid}|42|{cwd_nonce}"), "wrong cwd or lost runspace state: {output}");
     // Duplicate IDs must not increment again.
-    bridge.send(submit(second, "$Keep++; Write-Output ('SECOND='+$PID+':resumable'); Write-Output ('VALUE='+$Keep); Write-Output ('DIR='+$PWD.Path)"));
+    bridge.send(submit(second, second_code));
     receive_command_state(&mut bridge, Some(second), "completed");
     let formatted = Uuid::now_v7();
     bridge.send(submit(formatted, "$Text=@'\nquotes ' \" and \u{20ac}\n'@\nWrite-Output ('UTF8='+$Text); [pscustomobject]@{Answer=42}"));
