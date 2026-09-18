@@ -565,14 +565,39 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             if owners[0]["shell_status"] == "ready" { break; }
             assert!(Instant::now() < deadline, "clear interactive line: {owners}; input={:?}", trace.lock().unwrap());
         }
-        let busy = control(&["send", "fixture", &reference, "--command", "Start-Sleep -Seconds 2", "--json"]);
+        let busy_id = Uuid::now_v7().to_string();
+        let busy = control(&["send", "fixture", &reference, "--command",
+            "while ($true) { Start-Sleep -Milliseconds 100 }", "--command-id", &busy_id, "--json"]);
         assert!(busy.status.success(), "{}", String::from_utf8_lossy(&busy.stdout));
+        let running_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let query = control(&["read", "fixture", &reference, "--command-id", &busy_id, "--json"]);
+            assert!(query.status.success(), "{} {}", String::from_utf8_lossy(&query.stdout), String::from_utf8_lossy(&query.stderr));
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "running" { break; }
+            assert!(Instant::now() < running_deadline, "busy command never started: {query}");
+            thread::sleep(Duration::from_millis(20));
+        }
         writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
         let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
         assert!(!rejected.status.success());
         let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
         assert_eq!(rejected["shell_status"], "busy");
-        assert!(control(&["interrupt", "fixture", &reference, "--json"]).status.success());
+        let interrupted = control(&["interrupt", "fixture", &reference, "--json"]);
+        assert!(interrupted.status.success(), "interrupt: {} {}",
+            String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
+        let completion_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let query = control(&["read", "fixture", &reference, "--command-id", &busy_id, "--json"]);
+            assert!(query.status.success(), "{} {}", String::from_utf8_lossy(&query.stdout), String::from_utf8_lossy(&query.stderr));
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "completed" {
+                assert_eq!(query["record"]["interrupt_requested"], true);
+                break;
+            }
+            assert!(Instant::now() < completion_deadline, "interrupted command did not complete: {query}");
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(control(&["detach", "fixture", &reference]).status.success());
         client.0.wait().unwrap();
         drop(writer);
