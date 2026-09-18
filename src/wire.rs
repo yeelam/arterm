@@ -93,6 +93,20 @@ impl Frames {
 mod tests {
     use super::*;
     #[test]
+    fn architecture_independent_wire_bytes() {
+        let value = map(vec![
+            ("v", 1.into()),
+            ("type", s("Ping")),
+            ("body", map(vec![("n", 0x0102030405060708u64.into())])),
+        ]);
+        let expected = b"\x00\x00\x00\x1f\x83\xa1v\x01\xa4type\xa4Ping\xa4body\x81\xa1n\xcf\x01\x02\x03\x04\x05\x06\x07\x08";
+        assert_eq!(encode(&value).unwrap(), expected);
+        let mut frames = Frames::default();
+        frames.push(expected).unwrap();
+        assert_eq!(frames.next().unwrap(), Some(value));
+    }
+
+    #[test]
     fn fragmented_and_coalesced() {
         let data = encode(&message("Ping", map(vec![]))).unwrap();
         let mut f = Frames::default();

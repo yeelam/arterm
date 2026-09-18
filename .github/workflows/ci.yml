@@ -11,18 +11,41 @@ permissions:
 
 jobs:
   windows:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTUP_TOOLCHAIN: stable-${{ matrix.target }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Require native Rust host
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ine '${{ matrix.arch }}') {
+            throw 'Runner OS architecture does not match matrix.'
+          }
+          $version = rustc -vV
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($version -notcontains 'host: ${{ matrix.target }}') {
+            throw 'Rust must run natively for this matrix entry.'
+          }
       - name: Test unsigned fixtures (not production IPC authentication)
         shell: pwsh
         run: |
-          cargo test --locked --features test-unsigned-ipc -- --test-threads=1
+          cargo test --locked --target ${{ matrix.target }} --features test-unsigned-ipc -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --features test-unsigned-ipc --test resume_e2e -- --ignored --test-threads=1 2>&1 |
+          cargo test --locked --target ${{ matrix.target }} --features test-unsigned-ipc --test resume_e2e -- --ignored --test-threads=1 2>&1 |
             Tee-Object -Variable resumeOutput
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (($resumeOutput -join "`n") -notmatch '(?m)^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') {
@@ -31,14 +54,15 @@ jobs:
       - name: Build unsigned development installers
         shell: pwsh
         run: |
-          cargo run --locked --release --bin package
+          cargo run --locked --release --bin package -- --target ${{ matrix.target }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate unsigned artifact allowlist
         shell: pwsh
         run: |
+          Set-Location 'dist\windows-${{ matrix.arch }}'
           $allowed = @('arterm.exe','arterm-host.exe','arTerm-Client-Setup.exe',
                        'arTerm-Host-Setup.exe','LICENSE','THIRD-PARTY-NOTICES.txt','SHA256SUMS')
-          $entries = @(Get-ChildItem -LiteralPath dist -Force)
+          $entries = @(Get-ChildItem -LiteralPath . -Force)
           if ($entries.Count -ne $allowed.Count) { throw 'Unsigned artifact must contain exactly seven files.' }
           foreach ($entry in $entries) {
             if ($entry.PSIsContainer -or $entry.Name -cnotin $allowed -or
@@ -47,25 +71,25 @@ jobs:
             }
           }
           foreach ($name in $allowed | Where-Object { $_ -like '*.exe' }) {
-            if ((Get-AuthenticodeSignature -LiteralPath "dist\$name").Status -ne 'NotSigned') {
+            if ((Get-AuthenticodeSignature -LiteralPath $name).Status -ne 'NotSigned') {
               throw "Public CI output must be unsigned: $name"
             }
           }
           $lines = foreach ($name in $allowed | Where-Object { $_ -ne 'SHA256SUMS' } | Sort-Object) {
-            '{0}  {1}' -f (Get-FileHash -LiteralPath "dist\$name" -Algorithm SHA256).Hash.ToLowerInvariant(), $name
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $name -Algorithm SHA256).Hash.ToLowerInvariant(), $name
           }
-          $lines | Set-Content dist\SHA256SUMS -Encoding ascii
+          $lines | Set-Content SHA256SUMS -Encoding ascii
       - name: Upload unsigned development artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: arterm-windows-x64-unsigned
+          name: arterm-windows-${{ matrix.arch }}-unsigned
           path: |
-            dist\arterm.exe
-            dist\arterm-host.exe
-            dist\arTerm-Client-Setup.exe
-            dist\arTerm-Host-Setup.exe
-            dist\LICENSE
-            dist\THIRD-PARTY-NOTICES.txt
-            dist\SHA256SUMS
+            dist\windows-${{ matrix.arch }}\arterm.exe
+            dist\windows-${{ matrix.arch }}\arterm-host.exe
+            dist\windows-${{ matrix.arch }}\arTerm-Client-Setup.exe
+            dist\windows-${{ matrix.arch }}\arTerm-Host-Setup.exe
+            dist\windows-${{ matrix.arch }}\LICENSE
+            dist\windows-${{ matrix.arch }}\THIRD-PARTY-NOTICES.txt
+            dist\windows-${{ matrix.arch }}\SHA256SUMS
           if-no-files-found: error
           retention-days: 7

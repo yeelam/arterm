@@ -227,8 +227,11 @@ do not gain the new in-memory command adapter when a client reconnects.
 <details>
 <summary>Native Windows/MSVC builds and isolated verification</summary>
 
-Windows x64 and the pinned MSVC Rust toolchain are required. The C runtime is
-statically linked.
+Use Windows and a host-native stable MSVC Rust toolchain. The C runtime is
+statically linked on both x64 and ARM64. ARM64 runtimes and installers have
+been cross-built and their PE architecture checked; native ARM64 functional,
+installer lifecycle, and signed-production IPC validation are still pending.
+Do not treat cross-compilation as a native support certification.
 
 ```text
 cargo test --locked --features test-unsigned-ipc -- --test-threads=1
@@ -244,6 +247,46 @@ builds:
 ```text
 cargo build --locked --release --bin arterm --bin arterm-host
 ```
+
+For architecture-labeled packages, run the package builder on the build host
+and pass the payload target **after** `--`:
+
+```text
+cargo run --locked --release --bin package -- --target x86_64-pc-windows-msvc
+cargo run --locked --release --bin package -- --target aarch64-pc-windows-msvc
+```
+
+These write separate `dist\windows-x64` and `dist\windows-arm64` directories,
+each with its own six-entry `SHA256SUMS` and the same seven filenames above.
+No `--target` still selects x64 and the legacy flat `dist` output. The builder
+always uses an explicit Cargo target for runtimes and installers; intermediate
+outputs are `target\<triple>\release` (or under `CARGO_TARGET_DIR`).
+Cross-compilation requires the target's Rust standard library and MSVC/Windows
+SDK libraries; add `rustup target add aarch64-pc-windows-msvc` if missing.
+Do not run an ARM64 package builder on an x64 host: the builder itself must
+remain host-runnable. Avoid an ambient `CARGO_BUILD_TARGET` when launching it,
+or explicitly pass the host target to `cargo run` before `--`.
+
+The builder checks PE32+ executable headers, section-table and raw-data bounds,
+a file-backed executable entry point, certificate-table bounds when present,
+and matching PE machines in both runtime payloads and resulting installers.
+Truncated runtime inputs are rejected before the installer build. These
+structural checks do not replace Authenticode verification or native execution.
+`--target <triple> --payload-dir <signed-directory>` preserves the supplied
+runtime bytes without rebuilding, with the same architecture checks.
+Public CI uses native `windows-2022` x64 and `windows-11-arm` ARM64 jobs,
+explicit target triples, and a required nonzero ignored-functional-test count.
+These jobs have been configured, not executed as part of this local change.
+For feature-branch validation, open a draft pull request against `main` after
+review: the existing `pull_request` trigger runs both native jobs on opening
+and subsequent pushes. No signing credentials or production trust are available
+to that workflow. A cross-build alone must not be reported as a native CI pass.
+
+The remote MessagePack protocol uses architecture-independent framing; a
+golden-byte test runs on both CI targets. An ARM64 client connecting to an x64
+remote host still needs mixed-architecture end-to-end validation. Local IPC
+peers must remain byte-identical signed images from the same architecture and
+build; neither certificate nor image-hash checks are relaxed.
 
 `test-unsigned-ipc` is an explicit debug-only fixture feature, off by default.
 Release builds must omit it; enabling it for release fails compilation.
