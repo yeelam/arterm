@@ -235,6 +235,9 @@ struct ControlState {
     replies: BTreeMap<Uuid, Value>,
     supported: bool,
     shell_status: String,
+    creation_enabled: Option<bool>,
+    host_version: Option<String>,
+    readiness_reason: Option<String>,
     delivered: u64,
 }
 pub struct Owner {
@@ -442,6 +445,14 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         self.shared.control.lock().unwrap().supported = supported;
         self.shared.changed.notify_all();
     }
+    fn command_context(&mut self, enabled: bool, host_version: Option<&str>) {
+        let mut control = self.shared.control.lock().unwrap();
+        control.creation_enabled = Some(enabled);
+        control.host_version = host_version.map(str::to_owned);
+        control.shell_status = if enabled { "not_ready" } else { "unsupported" }.into();
+        control.readiness_reason = Some(if enabled { "initializing" } else { "integration_disabled" }.into());
+        self.shared.changed.notify_all();
+    }
     fn command_output_progress(&mut self, seq: u64) {
         self.shared.control.lock().unwrap().delivered = seq;
         self.shared.changed.notify_all();
@@ -452,6 +463,9 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         if let Some(status) = value["shell_status"].as_str() {
             control.shell_status = status.into();
         }
+        if let Some(reason) = value["readiness_reason"].as_str() { control.readiness_reason = Some(reason.into()); }
+        else if value.get("shell_status").is_some() { control.readiness_reason = None; }
+        if let Some(enabled) = value["command_execution"].as_bool() { control.creation_enabled = Some(enabled); }
         let barrier = value["after_output_seq"].as_u64().unwrap_or(0);
         if let Some(records) = value["records"].as_array() {
             for record in records {
@@ -497,6 +511,21 @@ fn json_wire(value: &rmpv::Value) -> Value {
         ),
         _ => Value::Null,
     }
+}
+
+fn readiness_error(control: &ControlState) -> String {
+    let hint = match (control.shell_status.as_str(), control.readiness_reason.as_deref()) {
+        ("busy", _) => "a managed command owns input; query its command ID or wait for completion",
+        ("unsupported", _) => "the host reports no supported shell integration for this session; use a new compatible PowerShell session",
+        (_, Some("partial_human_input")) => "interactive input is pending; finish or clear the line in the owning terminal before sending a command",
+        (_, Some("partial_input_sequence")) => "an incomplete terminal input sequence is pending; wait for it to finish",
+        (_, Some("unclassified_terminal_input")) => "terminal control/editing input could not be classified; inspect the owning terminal and shell integration; this is not proof that a person typed a partial command",
+        (_, Some("human_command_pending")) => "an interactive invocation has not returned to an integrated prompt",
+        (_, Some("initializing")) => "shell integration has not emitted its first ready event; inspect shell startup/profile compatibility",
+        _ => "the host has not reported a safe prompt; inspect the owning terminal and shell/profile integration",
+    };
+    format!("shell_status={}, reason={}: {hint}; no command input was sent",
+        control.shell_status, control.readiness_reason.as_deref().unwrap_or("unreported"))
 }
 
 fn command_rpc(shared: &Shared, operation_id: Uuid, action: Operation) -> Result<Value> {
@@ -550,10 +579,8 @@ fn command_rpc(shared: &Shared, operation_id: Uuid, action: Operation) -> Result
         }
     }
     let connected = *shared.state.lock().unwrap() == "connected";
-    ensure!(
-        connected && control.supported,
-        "session is disconnected or host lacks command-execution-v1"
-    );
+    ensure!(connected, "local connection is not connected; wait for reconnection before control operations");
+    ensure!(control.supported, "remote host does not advertise command-execution-v1; update the remote host, then use a new compatible session (existing sessions are not retrofitted)");
     ensure!(
         control.queue.len() < 16 && control.replies.len() < 512,
         "local command capacity reached"
@@ -569,10 +596,9 @@ fn command_rpc(shared: &Shared, operation_id: Uuid, action: Operation) -> Result
             ensure!(*previous == hash, "command ID conflicts with prior text");
             actual = Operation::CommandStatus { command_id: id };
         } else {
-            ensure!(
-                control.shell_status == "ready",
-                "shell is unsupported, busy, or not ready"
-            );
+            ensure!(control.creation_enabled != Some(false),
+                "session was created without command integration; use a new supported PowerShell session after updating the remote host; saved identity was not changed");
+            ensure!(control.shell_status == "ready", "{}", readiness_error(&control));
             ensure!(
                 control.submitted.len() < 256,
                 "local command identity capacity reached"
@@ -686,6 +712,14 @@ fn serve(
                 }
             }
         }
+    }
+    {
+        let control = shared.control.lock().unwrap();
+        result["shell_status"] = control.shell_status.clone().into();
+        result["command_capability"] = control.supported.into();
+        result["command_execution"] = json!(control.creation_enabled);
+        result["readiness_reason"] = json!(control.readiness_reason);
+        result["host_version"] = json!(control.host_version);
     }
     result["connection_state"] = shared.state.lock().unwrap().clone().into();
     write_frame(pipe, &serde_json::to_vec(&result)?)?;
@@ -978,6 +1012,21 @@ fn write_frame(file: &File, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_diagnostics_distinguish_shell_and_input_states() {
+        for (status, reason, expected) in [
+            ("unsupported", None, "no supported shell integration"),
+            ("busy", Some("managed_command"), "managed command owns input"),
+            ("not_ready", Some("initializing"), "first ready event"),
+            ("not_ready", Some("partial_human_input"), "interactive input is pending"),
+            ("not_ready", Some("unclassified_terminal_input"), "not proof that a person typed"),
+            ("not_ready", None, "host has not reported a safe prompt"),
+        ] {
+            let control = ControlState { shell_status: status.into(), readiness_reason: reason.map(str::to_owned), ..ControlState::default() };
+            let error = readiness_error(&control);
+            assert!(error.contains(expected) && error.contains(status), "{error}");
+        }
+    }
     #[test]
     fn vt_snapshot_overwrites_and_decodes_split_unicode() {
         let mut buffer = Buffer::new();

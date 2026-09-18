@@ -20,6 +20,12 @@ fn host_executable() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| std::env::var("SIGNED_HOST").unwrap_or_else(|_| option_env!("CARGO_BIN_EXE_arterm-host").unwrap().into()))
 }
+fn controller_executable() -> String {
+    std::env::var("SIGNED_CONTROLLER").unwrap_or_else(|_| client_executable().into())
+}
+fn test_shell() -> String {
+    std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into())
+}
 fn s(v: &str) -> Value {
     v.into()
 }
@@ -133,7 +139,7 @@ impl Fixture {
         }
         command.args(["--address", addr, "--stdio", "--retries", "2"]);
         if verb == "connect" {
-            command.args(["--shell", &std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into())]);
+            command.args(["--shell", &test_shell()]);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -264,6 +270,10 @@ impl Drop for RunningClient {
 }
 
 pub(crate) fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receiver<TcpStream>) {
+    relay_traced(home, attachments, None)
+}
+
+fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Vec<Vec<u8>>>>>) -> (String, mpsc::Receiver<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
@@ -272,6 +282,7 @@ pub(crate) fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receive
             let (mut incoming, _) = listener.accept().unwrap();
             let home = home.clone();
             let tx = tx.clone();
+            let trace = trace.clone();
             thread::spawn(move || {
             incoming
                 .set_read_timeout(Some(Duration::from_secs(45)))
@@ -369,10 +380,21 @@ pub(crate) fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receive
                 });
             }
             let mut stdin = bridge.stdin.take().unwrap();
+            let mut input_frames = arterm::wire::Frames::default();
             while let Ok(value) = rmpv::decode::read_value(&mut incoming) {
                 let params = get(&value, "params");
                 match get(params, "segment") {
                     Value::Binary(bytes) => {
+                        if let Some(trace) = &trace {
+                            input_frames.push(bytes).unwrap();
+                            while let Some(frame) = input_frames.next().unwrap() {
+                                if get(&frame, "type").as_str() == Some("Input") {
+                                    let bytes = arterm::wire::binary(get(&frame, "body"), "bytes").unwrap();
+                                    let mut trace = trace.lock().unwrap();
+                                    if trace.len() < 32 { trace.push(bytes.into_iter().take(512).collect()); }
+                                }
+                            }
+                        }
                         if stdin.write_all(bytes).is_err() {
                             break;
                         }
@@ -403,6 +425,119 @@ fn pid_marker(text: &str, prefix: &str, suffix: &str) -> Option<String> {
             None
         }
     })
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn interactive_win32_keyup_preserves_command_readiness() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    struct Interactive(Box<dyn portable_pty::Child + Send + Sync>);
+    impl Drop for Interactive { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    let fixture = Fixture::new();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let (address, _) = relay_traced(fixture.home.clone(), 2, Some(trace.clone()));
+    for reference in [Uuid::now_v7().to_string(), "interactive-named".into()] {
+        let pair = native_pty_system().openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut command = CommandBuilder::new(client_executable());
+        command.env("VSTERM_REMOTE_HOME", &fixture.home);
+        command.args(["connect", "fixture", &reference, "--address", &address, "--retries", "0", "--shell", &test_shell()]);
+        let mut client = Interactive(pair.slave.spawn_command(command).unwrap());
+        drop(pair.slave);
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let terminal_writer = writer.clone();
+        let reader_thread = thread::spawn(move || {
+            let mut terminal = vt100::Parser::new(40, 120, 0);
+            let mut tail = Vec::new();
+            let mut bytes = [0; 4096];
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 { break; }
+                terminal.process(&bytes[..n]);
+                tail.extend_from_slice(&bytes[..n]);
+                for query in [b"\x1b[6n".as_slice(), b"\x1b[c", b"\x1b[>c"] {
+                    let count = tail.windows(query.len()).filter(|window| *window == query).count();
+                    for _ in 0..count {
+                        let (row, col) = terminal.screen().cursor_position();
+                        let response = match query {
+                            b"\x1b[6n" => format!("\x1b[{};{}R", row + 1, col + 1),
+                            b"\x1b[c" => "\x1b[?1;2c".into(),
+                            _ => "\x1b[>0;10;1c".into(),
+                        };
+                        if terminal_writer.lock().unwrap().write_all(response.as_bytes()).is_err() { return; }
+                    }
+                }
+                if tail.len() > 2 { tail.drain(..tail.len() - 2); }
+            }
+        });
+        let control = |args: &[&str]| Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut ready_since = None;
+        loop {
+            assert!(client.0.try_wait().unwrap().is_none(), "interactive client exited");
+            let listed = control(&["list", "--client", "--json"]);
+            if listed.status.success() {
+                let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+                if owners[0]["shell_status"] == "ready" {
+                    let since = ready_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_millis(500) { break; }
+                } else { ready_since = None; }
+                assert!(Instant::now() < deadline, "interactive readiness: {owners}; forwarded input={:?}", trace.lock().unwrap());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        writer.lock().unwrap().write_all(b"$InteractiveProof=41; Write-Output ('MANUAL-OK='+$InteractiveProof)\r").unwrap();
+        let manual_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = control(&["read", "fixture", &reference, "--lines", "20", "--json"]);
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let listed = control(&["list", "--client", "--json"]);
+            let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+            if String::from_utf8_lossy(&output.stdout).contains("MANUAL-OK=41")
+                && owners[0]["shell_status"] == "ready" { break; }
+            assert!(Instant::now() < manual_deadline, "manual interactive command did not finish: {owners}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        writer.lock().unwrap().write_all(b"\x1b[16;42;0;0;0;1_").unwrap(); // Shift key release, no edit.
+        thread::sleep(Duration::from_millis(250));
+        let sent = control(&["send", "fixture", &reference, "--command", "$InteractiveProof++; if ($InteractiveProof -ne 42) { throw 'interactive runspace state lost' }; Get-ChildItem | Select-Object -First 1", "--wait", "--timeout", "10s", "--json"]);
+        assert!(sent.status.success(), "{} {}; forwarded input={:?}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr), trace.lock().unwrap());
+        writer.lock().unwrap().write_all(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let listed = control(&["list", "--client", "--json"]);
+            let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+            if owners[0]["readiness_reason"] == "partial_human_input" { break; }
+            assert!(Instant::now() < deadline, "{owners}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
+        assert!(!rejected.status.success());
+        let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["readiness_reason"], "partial_human_input");
+        assert_eq!(rejected["command_execution"], true);
+        assert_eq!(rejected["command_capability"], true);
+        assert_eq!(rejected["host_version"], env!("CARGO_PKG_VERSION"));
+        writer.lock().unwrap().write_all(b"\x03").unwrap();
+        loop {
+            let listed = control(&["list", "--client", "--json"]);
+            let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+            if owners[0]["shell_status"] == "ready" { break; }
+            assert!(Instant::now() < deadline, "clear interactive line: {owners}; input={:?}", trace.lock().unwrap());
+        }
+        let busy = control(&["send", "fixture", &reference, "--command", "Start-Sleep -Seconds 2", "--json"]);
+        assert!(busy.status.success(), "{}", String::from_utf8_lossy(&busy.stdout));
+        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
+        assert!(!rejected.status.success());
+        let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["shell_status"], "busy");
+        assert!(control(&["interrupt", "fixture", &reference, "--json"]).status.success());
+        assert!(control(&["detach", "fixture", &reference]).status.success());
+        client.0.wait().unwrap();
+        drop(writer);
+        drop(pair.master);
+        reader_thread.join().unwrap();
+    }
 }
 
 #[test]
@@ -526,7 +661,7 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().unwrap());
         let _background_connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
-        let control = |args: &[&str]| Command::new(std::env::var("SIGNED_CONTROLLER").unwrap_or_else(|_| client_executable().into()))
+        let control = |args: &[&str]| Command::new(controller_executable())
             .env("VSTERM_REMOTE_HOME", &fixture.home)
             .current_dir(std::env::temp_dir())
             .args(args).output().unwrap();

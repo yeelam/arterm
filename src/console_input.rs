@@ -121,35 +121,40 @@ fn candidate_state(bytes: &[u8]) -> CandidateState {
 }
 
 fn is_ctrl_close_bracket(bytes: &[u8]) -> bool {
+    let Some(fields) = win32_fields(bytes) else { return false };
+    fields[0] == VK_OEM_6
+        && fields[2] == GROUP_SEPARATOR as u32
+        && fields[3] == 1
+        && fields[4] & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0
+}
+
+pub(crate) fn win32_fields(bytes: &[u8]) -> Option<[u32; 6]> {
     let Some(body) = bytes
         .strip_prefix(b"\x1b[")
         .and_then(|value| value.strip_suffix(b"_"))
     else {
-        return false;
+        return None;
     };
     let mut fields = [0u32; 6];
     fields[5] = 1;
     let mut count = 0;
     for (index, value) in body.split(|byte| *byte == b';').enumerate() {
         if index >= fields.len() {
-            return false;
+            return None;
         }
         count = index + 1;
         if !value.is_empty() {
             let Ok(text) = std::str::from_utf8(value) else {
-                return false;
+                return None;
             };
             let Ok(number) = text.parse() else {
-                return false;
+                return None;
             };
             fields[index] = number;
         }
     }
-    count >= 4
-        && fields[0] == VK_OEM_6
-        && fields[2] == GROUP_SEPARATOR as u32
-        && fields[3] == 1
-        && fields[4] & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0
+    (count >= 4 && fields[0] <= 255 && fields[1] <= 255 && fields[2] <= 0x10ffff
+        && fields[3] <= 1 && (fields[3] == 0 || fields[5] > 0)).then_some(fields)
 }
 
 #[cfg(test)]

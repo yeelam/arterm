@@ -106,6 +106,16 @@ the remote command, nor does exiting the waiter. Query the command ID rather
 than blindly resending. See [automation and limits](QUICKSTART.md#automation)
 for status, interruption, termination, and idempotency.
 
+If a send is rejected, `arterm list --client --json` and the rejection JSON report
+`shell_status`, `readiness_reason`, `command_capability`, `command_execution`, and
+the remote `host_version` when reported. Connected does not imply ready: an old
+host, a session created without integration, startup/profile initialization,
+pending interactive input, and a running managed command are distinct cases.
+An absent host version is unknown, not the local client's version. Win32 key-up
+events do not edit a line and must not block sends; key-down edits, partial
+sequences, and unclassified terminal input remain guarded. Existing sessions
+are never silently replaced or retrofitted.
+
 For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.
 

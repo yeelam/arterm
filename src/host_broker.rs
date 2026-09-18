@@ -454,6 +454,8 @@ fn command_snapshot(id: Uuid, state: &SessionState, requested: Option<Uuid>) -> 
     map(vec![
         ("session_id", s(&id.to_string())),
         ("shell_status", s(commands.map_or("unsupported", Commands::shell_status))),
+        ("readiness_reason", s(commands.map_or("integration_disabled", Commands::readiness_reason))),
+        ("command_execution", commands.is_some().into()),
         ("input_ready", commands.map_or(true, Commands::input_ready).into()),
         ("after_output_seq", (state.next_output - 1).into()),
         ("command_id", requested.map(|id| s(&id.to_string())).unwrap_or(Value::Nil)),
@@ -748,6 +750,7 @@ impl Broker {
                 "HelloOk",
                 map(vec![
                     ("version", 1.into()),
+                    ("host_version", s(env!("CARGO_PKG_VERSION"))),
                     ("broker_instance_id", Value::Binary(self.instance.clone())),
                     (
                         "capabilities",

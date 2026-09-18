@@ -1,5 +1,5 @@
 #[path = "console_input.rs"]
-mod console_input;
+pub(crate) mod console_input;
 
 use anyhow::{ensure, Result};
 use console_input::{ConsoleInput, MAX_BUFFERED_INPUT};
@@ -31,6 +31,7 @@ pub trait Terminal {
     fn output_gap(&mut self) {}
     fn control(&mut self) -> Option<crate::local_control::ControlMessage> { None }
     fn command_capability(&mut self, _supported: bool) {}
+    fn command_context(&mut self, _enabled: bool, _host_version: Option<&str>) {}
     fn command_output_progress(&mut self, _seq: u64) {}
     fn command_event(&mut self, _kind: &str, _body: &rmpv::Value) {}
 }
