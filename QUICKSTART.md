@@ -69,6 +69,18 @@ Repeated `arterm-host setup` retains the saved name and Code CLI path; `--name`
 is required only for first setup. Explicit name/path arguments reconfigure them.
 Setup does not reset the isolated tunnel sign-in.
 
+If the bridge reports `cannot connect to broker pipe ... (os error 2)`, the
+executable ran but its scoped broker pipe was absent. This does not establish
+that the registered executable path is wrong or that registration was lost.
+On the remote host, use `arterm-host start`, then `arterm-host status --json`
+and `arterm-host sessions --json`. These commands are available in 0.5.3.
+Run them as the same Windows user, in the same logon session, with the same
+`VSTERM_REMOTE_HOME` (or default data root) as the bridge. A stopped broker or
+a mismatch in any of these scopes can produce this error. Starting a broker
+does not recover sessions lost when the previous broker was killed; use a new
+session reference for new work. An arbitrary attachment loss alone does not
+prove whether the remote session is still alive.
+
 By default, an upgrade refuses to stop a host with live sessions; unchanged
 runtime setup leaves the running host alone. To deliberately end its sessions:
 

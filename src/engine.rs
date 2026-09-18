@@ -369,6 +369,32 @@ mod tests {
         assert!(snapshots[0].origin.is_some());
     }
     #[test]
+    fn saved_session_rejects_restarted_broker_without_attach_or_replacement() {
+        let mut engine = Engine::new(state());
+        let mut server = FakeLink::new(engine.state.id);
+        let mut terminal = FakeTerminal::default();
+        engine.run(&mut server, &mut terminal, &mut |_| Ok(())).unwrap();
+        assert!(engine.state.token.is_some());
+        let saved = engine.state.clone();
+        let mut engine = Engine::new(saved.clone());
+        server.broker = vec![9; 16];
+        let before = server.sent.len();
+        let mut persisted = None;
+        let error = engine.run(&mut server, &mut terminal, &mut |state| {
+            persisted = Some(state.clone());
+            Ok(())
+        }).unwrap_err();
+        assert!(error.to_string().contains("refusing to recreate session"));
+        assert_eq!(server.sent.len(), before + 1);
+        assert_eq!(text(&server.sent[before], "type").unwrap(), "Hello");
+        assert_eq!(server.creates, 1);
+        let persisted = persisted.unwrap();
+        assert!(persisted.ended);
+        assert_eq!(persisted.id, saved.id);
+        assert_eq!(persisted.token, saved.token);
+    }
+
+    #[test]
     fn restart_and_expired_create_fail_without_replacement() {
         let mut engine = Engine::new(state());
         let mut server = FakeLink::new(engine.state.id);

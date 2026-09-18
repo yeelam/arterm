@@ -247,6 +247,19 @@ fn print_recovery(id: Uuid, command: &str) {
     eprintln!("[session] Resume command: {command}");
 }
 
+const ATTACHMENT_LOST_MESSAGE: &str =
+    "[session] Attachment lost; this client did not request termination. Remote session state is unknown.";
+
+#[cfg(test)]
+#[test]
+fn attachment_loss_does_not_claim_remote_survival() {
+    assert_eq!(
+        ATTACHMENT_LOST_MESSAGE,
+        "[session] Attachment lost; this client did not request termination. Remote session state is unknown."
+    );
+    assert!(!ATTACHMENT_LOST_MESSAGE.contains("was not terminated"));
+}
+
 fn run_session(
     root: &Path,
     alias: &str,
@@ -337,7 +350,7 @@ fn run_session(
                 End::Disconnected => {
                     owner.set_state("reconnecting");
                     terminal.reading(false);
-                    eprintln!("[session] Attachment lost; remote session was not terminated.");
+                    eprintln!("{ATTACHMENT_LOST_MESSAGE}");
                     print_recovery(id, &command);
                 }
             }

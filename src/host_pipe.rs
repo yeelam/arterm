@@ -198,8 +198,20 @@ fn open(path: &Path, deadline: Instant) -> Result<File> {
         if !matches!(error.raw_os_error(), Some(code) if code == ERROR_PIPE_BUSY as i32 || code == ERROR_FILE_NOT_FOUND as i32)
             || Instant::now() >= deadline
         {
-            return Err(error)
-                .with_context(|| format!("cannot connect to broker pipe {}", path.display()));
+            let missing = error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32);
+            return Err(error).with_context(|| {
+                let mut message = format!("cannot connect to broker pipe {}", path.display());
+                if missing {
+                    message.push_str(
+                        "; no broker pipe was found in this scope. On the remote host, run \
+                         `arterm-host start` using the same Windows user, logon session, and \
+                         data root (VSTERM_REMOTE_HOME; default: %LOCALAPPDATA%\\VsTerm) \
+                         as the bridge. If the host is already running, check those scopes. \
+                         Restarting a broker does not restore its old sessions",
+                    );
+                }
+                message
+            });
         }
         unsafe {
             WaitNamedPipeW(name.as_ptr(), 100);

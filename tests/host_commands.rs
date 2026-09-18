@@ -1,6 +1,34 @@
 use std::process::Command;
 
 #[test]
+fn absent_bridge_broker_reports_host_recovery_without_creating_state() {
+    let home = std::env::temp_dir().join(format!("arterm-absent-broker-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
+        .env("VSTERM_REMOTE_HOME", &home)
+        .args(["bridge", "--protocol", "vsterm-session-v1"])
+        .output()
+        .unwrap();
+    let entries = std::fs::read_dir(&home).unwrap().count();
+    std::fs::remove_dir(&home).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    for expected in [
+        "cannot connect to broker pipe \\\\.\\pipe\\vsterm-",
+        "no broker pipe was found in this scope",
+        "`arterm-host start`",
+        "same Windows user, logon session, and data root",
+        "VSTERM_REMOTE_HOME",
+        "Restarting a broker does not restore its old sessions",
+        "os error 2",
+    ] {
+        assert!(error.contains(expected), "missing {expected:?}: {error}");
+    }
+    assert_eq!(entries, 0, "bridge must not create a broker or session state");
+}
+
+#[test]
 fn host_help_and_version_use_neutral_product_branding() {
     for (arg, expected) in [
         ("--help", "arTerm host".to_owned()),
