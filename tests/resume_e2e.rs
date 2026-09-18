@@ -634,6 +634,98 @@ fn interactive_win32_keyup_preserves_command_readiness() {
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn local_shell_accepts_command_after_detach_failure_and_remote_exit() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    struct Shell(Box<dyn portable_pty::Child + Send + Sync>);
+    impl Drop for Shell {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let fixture = Fixture::new();
+    let (address, _) = relay(fixture.home.clone(), 2);
+    for outcome in ["detach", "failure", "exit"] {
+        let connected = outcome != "failure";
+        let rejected = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = if connected { address.clone() } else { rejected.local_addr().unwrap().to_string() };
+        // An owned listener explicitly closes the failure connection; no external port.
+        let reject = if connected { None } else { Some(thread::spawn(move || {
+            let (socket, _) = rejected.accept().unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+        })) };
+        let pair = native_pty_system().openpty(PtySize { rows: 40, cols: 160, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.env("VSTERM_REMOTE_HOME", &fixture.home);
+        command.env("VSTERM_HISTORY_PATH", fixture.home.join("exit-history.txt"));
+        command.cwd(&fixture.home);
+        command.args(["/d", "/q", "/v:on"]);
+        let mut shell = Shell(pair.slave.spawn_command(command).unwrap());
+        drop(pair.slave);
+        let mut writer = pair.master.take_writer().unwrap();
+        writer.write_all(format!(
+            "\"{}\" connect fixture {} --address {} --retries 0 --shell \"{}\" & echo CLIENT-EXIT=!errorlevel!\r",
+            client_executable(), Uuid::now_v7(), endpoint, test_shell()).as_bytes()).unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 || tx.send(bytes[..n].to_vec()).is_err() { break; }
+            }
+        });
+        let mut terminal = vt100::Parser::new(40, 160, 0);
+        let mut tail = Vec::new();
+        let mut wait = |writer: &mut Box<dyn Write + Send>, expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let bytes = rx.recv_timeout(Duration::from_millis(500)).unwrap_or_default();
+                terminal.process(&bytes);
+                tail.extend_from_slice(&bytes);
+                for query in [b"\x1b[6n".as_slice(), b"\x1b[c", b"\x1b[>c"] {
+                    if tail.windows(query.len()).any(|b| b == query) {
+                        writer.write_all(match query {
+                            b"\x1b[6n" => b"\x1b[1;1R",
+                            b"\x1b[c" => b"\x1b[?1;2c",
+                            _ => b"\x1b[>0;10;1c",
+                        }).unwrap();
+                    }
+                }
+                if tail.len() > 2 { tail.drain(..tail.len() - 2); }
+                let screen = terminal.screen().contents();
+                if screen.lines().any(|line| line.trim() == expected) { break; }
+                assert!(Instant::now() < deadline, "waiting for {expected:?}; screen={screen:?}");
+            }
+        };
+        if connected {
+            // Wait for the remote PowerShell prompt before changing remote modes.
+            thread::sleep(Duration::from_millis(1000));
+            writer.write_all(b"[Console]::Write(([char]27+'[?9001h'+[char]27+'[?1004h'+[char]27+'[?2004h'+[char]27+'[?1003h')); Write-Output 'REMOTE-VT-READY'\r").unwrap();
+            wait(&mut writer, "REMOTE-VT-READY");
+            writer.write_all(if outcome == "detach" {
+                b"\x1d\x1b[221;27;29;0;8;1_\x1b[I\x1b[123;_"
+            } else { b"exit 7\r" }).unwrap();
+        }
+        wait(&mut writer, match outcome {
+            "detach" => "CLIENT-EXIT=0",
+            "failure" => "CLIENT-EXIT=1",
+            _ => "CLIENT-EXIT=7",
+        });
+        writer.write_all(b"echo POST-EXIT-OK\r").unwrap();
+        wait(&mut writer, "POST-EXIT-OK");
+        writer.write_all(b"exit 0\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = shell.0.try_wait().unwrap() { assert!(status.success()); break; }
+            assert!(Instant::now() < deadline, "local shell did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(writer);
+        drop(pair.master);
+        reader_thread.join().unwrap();
+        if let Some(reject) = reject { reject.join().unwrap(); }
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
     use std::sync::atomic::Ordering;
     struct Pending(Option<Child>);

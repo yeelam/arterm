@@ -85,6 +85,22 @@ reference, not a password. Press **Ctrl+]** to detach and leave the shell runnin
 type **`exit` inside the remote shell** to end it. Choose a new reference for a
 new shell; ended or unavailable sessions are not silently replaced.
 
+On detach, remote exit, or connection failure, the interactive client restores
+the local console flags, code pages, and inherited keyboard, focus, paste, and
+mouse input modes. The client's buffered attachment input is discarded on exit;
+unrelated native input records are preserved. Scripted `--stdio` clients
+do not change these console modes. Mode discovery waits at most 100ms. If the
+console does not report a mode, remote changes to that input mode are suppressed
+instead of guessing the parent shell's state; other output remains available.
+Outstanding local mode replies remain tracked across fragmented input and
+connection failure. Exit allows a further bounded 200ms for outstanding replies,
+preserves unrelated startup typeahead, and reports queries still unanswered.
+
+This does not reset the outer ConPTY input parser. An input stream ending in an
+unterminated CSI can consume the next typed character even without arTerm;
+restoring console modes and clearing queued input records cannot repair that
+separate parser state.
+
 Without a reference, `arterm connect my-devbox` **only prints** a complete
 reusable command and exits; it does not start a remote shell.
 
