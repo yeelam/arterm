@@ -39,6 +39,8 @@ pub struct Commands {
     waiting_prompt: bool,
     human_pending: u64,
     last_cr: bool,
+    input_sequence: Vec<u8>,
+    unclassified_input: bool,
     active: Option<Uuid>,
     records: BTreeMap<Uuid, Record>,
     pub revision: u64,
@@ -78,6 +80,8 @@ impl Commands {
             waiting_prompt: false,
             human_pending: 0,
             last_cr: false,
+            input_sequence: Vec::new(),
+            unclassified_input: false,
             active: None,
             records: BTreeMap::new(),
             revision: 0,
@@ -141,6 +145,15 @@ function global:prompt {
     pub fn input_ready(&self) -> bool {
         self.initialized
     }
+    pub fn readiness_reason(&self) -> &'static str {
+        if !self.initialized { "initializing" }
+        else if self.active.is_some() { "managed_command" }
+        else if !self.input_sequence.is_empty() { "partial_input_sequence" }
+        else if self.human_dirty && self.unclassified_input { "unclassified_terminal_input" }
+        else if self.human_dirty { "partial_human_input" }
+        else if self.human_pending > 0 { "human_command_pending" }
+        else { "ready" }
+    }
     pub fn records(&self) -> Vec<Record> {
         self.records.values().cloned().collect()
     }
@@ -190,22 +203,48 @@ function global:prompt {
         }
     }
     pub fn input(&mut self, bytes: &[u8]) -> Result<()> {
-        ensure!(self.initialized && self.active.is_none(), "CommandBusy");
+        let mut pending = self.input_sequence.clone();
+        let mut keys = Vec::new();
+        let mut unclassified = self.unclassified_input;
         for &byte in bytes {
-            if byte == 10 && self.last_cr {
-                self.last_cr = false;
+            if pending.is_empty() {
+                if byte == 27 { pending.push(byte); } else { keys.push((u32::from(byte), 1)); }
                 continue;
             }
-            self.last_cr = byte == 13;
-            if matches!(byte, 3 | 10 | 13) {
-                self.human_pending = self.human_pending.saturating_add(1);
+            pending.push(byte);
+            let prefix = pending == b"\x1b" || pending == b"\x1b["
+                || (pending.starts_with(b"\x1b[") && pending[2..].iter().all(|b| b.is_ascii_digit() || *b == b';'));
+            if prefix && pending.len() <= 128 { continue; }
+            if let Some(fields) = crate::console::console_input::win32_fields(&pending) {
+                if fields[3] == 1 { keys.push((fields[2], fields[5])); }
+                // Key-up still reaches ConPTY unchanged; it does not edit a shell line.
+                pending.clear();
+            } else {
+                unclassified = true;
+                keys.extend(pending.drain(..).map(|byte| (u32::from(byte), 1)));
+            }
+        }
+        ensure!((keys.is_empty() && pending.is_empty()) || (self.initialized && self.active.is_none()), "CommandBusy");
+        self.input_sequence = pending;
+        self.unclassified_input = unclassified;
+        for (key, mut repeat) in keys {
+            if key == 10 && self.last_cr {
+                self.last_cr = false;
+                repeat -= 1;
+                if repeat == 0 { continue; }
+            }
+            self.last_cr = key == 13;
+            if matches!(key, 3 | 10 | 13) {
+                self.human_pending = self.human_pending.saturating_add(u64::from(repeat));
                 self.human_dirty = false;
+                self.unclassified_input = false;
             } else {
                 self.human_dirty = true;
             }
         }
         self.waiting_prompt = self.human_pending > 0;
-        self.ready = false;
+        self.ready = self.initialized && self.active.is_none() && self.human_pending == 0
+            && !self.human_dirty && self.input_sequence.is_empty();
         self.revision += 1;
         Ok(())
     }
@@ -223,6 +262,7 @@ function global:prompt {
             self.records.get_mut(&id).unwrap().state = "unknown".into();
         }
         self.ready = false;
+        self.initialized = false;
         self.revision += 1;
     }
     fn marker(&mut self, body: &[u8]) -> bool {
@@ -247,7 +287,7 @@ function global:prompt {
                 if self.human_pending > 0 {
                     self.human_pending -= 1;
                 }
-                let ready = self.human_pending == 0 && !self.human_dirty;
+                let ready = self.human_pending == 0 && !self.human_dirty && self.input_sequence.is_empty();
                 let changed = self.ready != ready;
                 self.ready = ready;
                 self.initialized = true;
@@ -324,6 +364,33 @@ function global:prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn win32_releases_do_not_edit_but_keydown_and_unknown_replies_remain_guarded() {
+        let mut commands = Commands::new();
+        let ready = format!("\x1b]633;arterm;{};ready\x07", commands.nonce);
+        commands.output(ready.as_bytes());
+        commands.input(b"\x1b[16;42;").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_input_sequence");
+        assert!(commands.submit(Uuid::now_v7(), "unexpected").is_err());
+        commands.input(b"0;0;0;1_").unwrap();
+        assert_eq!(commands.shell_status(), "ready");
+        commands.input(b"\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        assert!(commands.submit(Uuid::now_v7(), "unexpected").is_err());
+        commands.input(b"\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_").unwrap();
+        assert_eq!(commands.readiness_reason(), "human_command_pending");
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.shell_status(), "ready");
+        commands.input(b"\x1b[1;2R").unwrap();
+        assert_eq!(commands.readiness_reason(), "unclassified_terminal_input", "unsolicited replies must not be blindly ignored");
+        commands.input(b"\r").unwrap();
+        commands.output(ready.as_bytes());
+        commands.submit(Uuid::now_v7(), "Start-Sleep -Seconds 1").unwrap();
+        commands.input(b"\x1b[16;42;0;0;0;1_").unwrap();
+        assert_eq!(commands.shell_status(), "busy");
+        assert!(commands.input(b"\x1b[65;30;97;1;0;1_").is_err());
+        assert!(commands.input(b"\x1b[16;42;").is_err(), "unknown partial sequences remain rejected while busy");
+    }
     #[test]
     fn correlated_markers_fragmentation_and_deduplication() {
         let mut commands = Commands::new();

@@ -795,6 +795,7 @@ impl Engine {
                         }
                         ensure!(!self.state.command_execution.unwrap_or(false) || self.command_capable,
                             "saved command-enabled creation requires command-execution-v1; refusing fingerprint change");
+                        terminal.command_context(self.state.command_execution.unwrap_or(false), text(body, "host_version").ok());
                         let broker = bin16(body, "broker_instance_id")?;
                         if let Some(origin) = &self.state.origin {
                             if *origin != broker {
