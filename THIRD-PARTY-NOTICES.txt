@@ -1,7 +1,7 @@
 arTerm - Third-party notices
 ==========================
 
-Scope: arTerm 0.5.0 Windows x86_64 and ARM64 MSVC binary distributions.
+Scope: arTerm 0.5.1 Windows x86_64 and ARM64 MSVC binary distributions.
 Inventory: union of 53 third-party crate/version entries reachable through
 normal (non-dev, non-build) dependency edges in Cargo.lock, resolved with:
   cargo metadata --locked --filter-platform x86_64-pc-windows-msvc
