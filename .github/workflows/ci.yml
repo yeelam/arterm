@@ -1,0 +1,64 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test native client and real ConPTY host
+        shell: pwsh
+        run: |
+          cargo test --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build unsigned development installers
+        shell: pwsh
+        run: |
+          cargo run --locked --release --bin package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate unsigned artifact allowlist
+        shell: pwsh
+        run: |
+          $allowed = @('arterm.exe','arterm-host.exe','arTerm-Client-Setup.exe',
+                       'arTerm-Host-Setup.exe','LICENSE','SHA256SUMS')
+          $entries = @(Get-ChildItem -LiteralPath dist -Force)
+          if ($entries.Count -ne $allowed.Count) { throw 'Unsigned artifact must contain exactly six files.' }
+          foreach ($entry in $entries) {
+            if ($entry.PSIsContainer -or $entry.Name -cnotin $allowed -or
+                ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "Unexpected unsigned output: $($entry.Name)"
+            }
+          }
+          foreach ($name in $allowed | Where-Object { $_ -like '*.exe' }) {
+            if ((Get-AuthenticodeSignature -LiteralPath "dist\$name").Status -ne 'NotSigned') {
+              throw "Public CI output must be unsigned: $name"
+            }
+          }
+          $lines = foreach ($name in $allowed | Where-Object { $_ -ne 'SHA256SUMS' } | Sort-Object) {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath "dist\$name" -Algorithm SHA256).Hash.ToLowerInvariant(), $name
+          }
+          $lines | Set-Content dist\SHA256SUMS -Encoding ascii
+      - name: Upload unsigned development artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arterm-windows-x64-unsigned
+          path: |
+            dist\arterm.exe
+            dist\arterm-host.exe
+            dist\arTerm-Client-Setup.exe
+            dist\arTerm-Host-Setup.exe
+            dist\LICENSE
+            dist\SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

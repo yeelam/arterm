@@ -1,0 +1,232 @@
+use std::{fs, process::Command};
+use uuid::Uuid;
+
+fn run(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .env("VSTERM_REMOTE_HOME", home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
+    let home = std::env::temp_dir().join(format!("devbox-client-commands-{}", Uuid::now_v7()));
+    fs::create_dir_all(&home).unwrap();
+    let host = std::env::current_exe().unwrap();
+    let added = run(
+        &home,
+        &[
+            "add",
+            "work",
+            "--tunnel",
+            "tunnel-1",
+            "--host-path",
+            host.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let duplicate = run(
+        &home,
+        &[
+            "add",
+            "work",
+            "--tunnel",
+            "tunnel-2",
+            "--host-path",
+            host.to_str().unwrap(),
+        ],
+    );
+    assert!(!duplicate.status.success());
+    let listed = run(&home, &["list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("work\ttunnel-1"));
+    assert!(home.join("client").join("config.json").is_file());
+    let removed = run(&home, &["remove", "work"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&run(&home, &["list"]).stdout).contains("work\t"));
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn help_version_and_validation_do_not_require_setup() {
+    let home = std::env::temp_dir().join(format!("devbox-client-help-{}", Uuid::now_v7()));
+    assert!(run(&home, &["--help"]).status.success());
+    assert!(run(&home, &["--version"]).status.success());
+    assert!(!run(
+        &home,
+        &[
+            "add",
+            "Bad Alias",
+            "--tunnel",
+            "x",
+            "--host-path",
+            r"C:\host.exe"
+        ]
+    )
+    .status
+    .success());
+    assert!(!home.join("client").join("config.json").exists());
+}
+
+#[test]
+fn registration_persists_the_friendly_name_not_a_generated_tunnel_id() {
+    let home = std::env::temp_dir().join(format!("arterm-name-registration-{}", Uuid::now_v7()));
+    let output = run(&home, &[
+        "add", "dev01", "--tunnel", "dev01", "--host-path",
+        r"C:\Users\remote\AppData\Local\Programs\VsTerm\Host\arterm-host.exe",
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let path = home.join("client").join("config.json");
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["targets"]["dev01"]["tunnel_id"], "dev01");
+    assert!(String::from_utf8_lossy(&run(&home, &["list"]).stdout).contains("dev01\tdev01\t"));
+    let disabled = Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .env("VSTERM_REMOTE_HOME", &home)
+        .env("VSTERM_NO_HISTORY", "1")
+        .args(["connect", "dev01", "--retries", "0"])
+        .output().unwrap();
+    assert!(disabled.status.success(), "no-reference connect must only print");
+    let stderr = String::from_utf8_lossy(&disabled.stderr);
+    assert!(!stderr.contains("Resume history"));
+    assert!(!stderr.contains("Resume command saved to local PowerShell history"));
+    assert!(run(&home, &["remove", "dev01"]).status.success());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn failed_retries_keep_one_persisted_guid() {
+    let home = std::env::temp_dir().join(format!("devbox-client-retry-{}", Uuid::now_v7()));
+    fs::create_dir_all(&home).unwrap();
+    let host = std::env::current_exe().unwrap();
+    assert!(run(
+        &home,
+        &[
+            "add",
+            "work",
+            "--tunnel",
+            "test",
+            "--host-path",
+            host.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let history = home.join("powershell-history.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .env("VSTERM_REMOTE_HOME", &home)
+        .env("VSTERM_HISTORY_PATH", &history)
+        .env_remove("VSTERM_NO_HISTORY")
+        .args([
+            "connect",
+            "work",
+            "MyWork",
+            "--address",
+            &address,
+            "--stdio",
+            "--retries",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!history.exists(), "failed creation must not insert resume history");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let ids = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("[session] Resume GUID: "))
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 4, "{stderr}");
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    Uuid::parse_str(ids[0]).unwrap();
+    assert!(stderr.contains("connect 'work' mywork"));
+    let records = walk(&home)
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dpapi"))
+        })
+        .count();
+    assert_eq!(records, 1);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn no_reference_only_prints_a_powershell_safe_command_and_preserves_flags() {
+    let home = std::env::temp_dir().join(format!("arterm-print-only-{}", Uuid::now_v7()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let output = run(&home, &["connect", "work", "--shell", "C:\\Tools\\It's PS.exe",
+        "--cwd", "C:\\My Work", "--address", &address, "--stdio", "--retries", "0"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("connect 'work' "));
+    assert!(text.contains("--shell 'C:\\Tools\\It''s PS.exe'"));
+    assert!(text.contains("--cwd 'C:\\My Work'"));
+    assert!(text.contains(&format!("--address '{address}'")));
+    assert!(text.contains("--stdio"));
+    assert!(text.contains("--retries 0"));
+    assert_eq!(text.lines().count(), 1);
+    assert!(listener.accept().is_err());
+    assert!(!home.exists(), "print-only must not write state or history");
+}
+
+#[test]
+fn unused_guid_lookup_does_not_consume_printed_reference() {
+    let home = std::env::temp_dir().join(format!("arterm-unused-guid-{}", Uuid::now_v7()));
+    assert!(run(&home, &["add", "work", "--tunnel", "fixture",
+        "--host-path", r"C:\Tools\arterm-host.exe"]).status.success());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    for verb in ["resume", "terminate"] {
+        let printed = run(&home, &["connect", "work"]);
+        assert!(printed.status.success());
+        let command = String::from_utf8(printed.stdout).unwrap();
+        let id = command.split_whitespace().find(|part| Uuid::parse_str(part).is_ok()).unwrap();
+        let mut args = vec![verb, "work", id, "--address", &address, "--stdio"];
+        if verb == "terminate" {
+            args.push("--yes");
+        }
+        assert!(!run(&home, &args).status.success());
+        assert!(!walk(&home).iter().any(|path|
+            path.file_name().unwrap().to_string_lossy() == format!("{id}.lock")),
+            "{verb} reserved an unused GUID");
+        let created = run(&home, &["connect", "work", id, "--address", &address,
+            "--stdio", "--retries", "0"]);
+        assert!(!created.status.success(), "fixture address must be unavailable");
+        let error = String::from_utf8_lossy(&created.stderr);
+        assert!(error.contains("Connection failed:"), "{error}");
+        assert!(walk(&home).iter().any(|path|
+            path.file_name().unwrap().to_string_lossy() == format!("{id}.dpapi")));
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                result.push(path);
+            }
+        }
+    }
+    result
+}

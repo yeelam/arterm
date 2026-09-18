@@ -1,0 +1,12 @@
+/target/
+/dist/
+/.signing/
+/Generated files/
+.env
+.env.*
+*.pfx
+*.p12
+*.key
+*.pem
+*.dpapi
+*.log

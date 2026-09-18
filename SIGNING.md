@@ -1,0 +1,58 @@
+# arTerm signing
+
+arTerm source is MIT-licensed. Public CI tests and
+packages unsigned Windows builds; it has no signing credentials. Development
+release binaries use the existing self-signed development certificate, not a
+publicly trusted publisher certificate.
+
+## Certificate and trust
+
+The public certificate is `signing/arTerm-Dev.cer`. Its bytes are unchanged by
+the arTerm rename. SHA-256:
+
+```text
+46B3A8A9307652D90662DB056FDEDCB93C91EDCF823F6BE3007A7E54F2AD171C
+```
+
+The certificate retains its original subject; a product rename does not change
+the signing identity. Self-signing does not establish public publisher trust
+or guarantee that Windows SmartScreen will accept a download. See
+[DEVELOPMENT-INSTALL.md](DEVELOPMENT-INSTALL.md) for verification and optional,
+explicit current-user trust instructions.
+
+## Maintainer signing procedure
+
+Signing runs only through a restricted, manual private CI workflow on its
+protected main branch. Signing credentials stay in that private repository;
+they must never be copied into the public source repository. Restrict workflow
+write and dispatch access to trusted signing maintainers, and protect main
+against unreviewed changes.
+
+1. Review and merge the public source to main. Supply its exact 40-hex commit
+   SHA as `source_ref` to the private signing workflow.
+2. CI checks out that exact public commit, verifies it is reachable from public
+   main, and checks the pinned public certificate hash. The signing helper
+   comes from the private workflow's own commit, not the public checkout.
+3. CI tests and builds without signing secrets, signs and timestamps the two
+   runtime EXEs, embeds those exact bytes without rebuilding them, and then
+   signs and timestamps both installers.
+4. CI checks the strict download allowlist, recomputes seven SHA-256 checksums,
+   and uploads `arterm-windows-x64-development-signed` for maintainer review.
+   This workflow does not publish a release.
+
+Secrets are scoped to the two signing steps on disposable GitHub-hosted
+runners. Missing credentials fail the build. The helper checks the certificate
+identity and timestamped signatures, then removes its temporary PFX, imported
+private key, and temporary runner trust. Do not run it locally or regenerate,
+export, or retrieve private signing material during source maintenance.
+
+The signed download contains exactly eight flat files: `arterm.exe`,
+`arterm-host.exe`, `arTerm-Client-Setup.exe`, `arTerm-Host-Setup.exe`,
+`arTerm-Dev.cer`, `DEVELOPMENT-INSTALL.md`, `LICENSE`, and `SHA256SUMS`.
+Public unsigned artifacts contain only the four EXEs, `LICENSE`, and
+`SHA256SUMS`. The recorded public source SHA is in the private workflow summary.
+
+The MIT license covers this project's source, not separately installed vendor
+software. Dependencies retain their own licenses. VS Code Server and other
+runtime/system dependencies are installed separately under their applicable
+terms; they are not embedded or re-signed as part of this download.

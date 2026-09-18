@@ -1,0 +1,59 @@
+[package]
+name = "arterm"
+version = "0.4.0"
+license = "MIT"
+edition = "2021"
+authors = ["arTerm contributors"]
+
+[lib]
+name = "arterm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arterm"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "arterm-host"
+path = "src/bin/host.rs"
+
+[[bin]]
+name = "arTerm-Client-Setup"
+path = "src/bin/setup_client.rs"
+required-features = ["installers"]
+
+[[bin]]
+name = "arTerm-Host-Setup"
+path = "src/bin/setup_host.rs"
+required-features = ["installers"]
+
+[features]
+installers = []
+
+[dependencies]
+anyhow = "1"
+rmpv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+portable-pty = "0.8"
+sha2 = "0.10"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
