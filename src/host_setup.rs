@@ -54,6 +54,7 @@ struct SetupArgs {
     no_download: bool,
     accept_server_license_terms: bool,
     terminate_sessions: bool,
+    force_stop_host: bool,
 }
 
 pub fn handle(args: &[String]) -> Result<Option<i32>> {
@@ -193,9 +194,15 @@ fn setup(args: SetupArgs) -> Result<()> {
 
     prepare_setup_host(
         existing.as_ref() != Some(&proposed),
-        args.terminate_sessions,
+        args.terminate_sessions || args.force_stop_host,
         host_is_running,
-        || deployment::stop_host_command(&current_exe()?, true),
+        || {
+            if args.force_stop_host {
+                deployment::force_stop_host_command(&current_exe()?)
+            } else {
+                deployment::stop_host_command(&current_exe()?, true)
+            }
+        },
     )?;
     login_if_needed(&proposed.code_path, &cli_data)?;
     save_config_if_changed(&root, &proposed)?;
@@ -385,6 +392,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs> {
     let mut no_download = false;
     let mut accept_server_license_terms = false;
     let mut terminate_sessions = false;
+    let mut force_stop_host = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -401,6 +409,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs> {
             "--no-download" => no_download = true,
             "--accept-server-license-terms" => accept_server_license_terms = true,
             "--terminate-sessions" => terminate_sessions = true,
+            "--force-stop-host" => force_stop_host = true,
             other => bail!("unknown setup argument: {other}"),
         }
         index += 1;
@@ -411,6 +420,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs> {
         no_download,
         accept_server_license_terms,
         terminate_sessions,
+        force_stop_host,
     })
 }
 
@@ -880,7 +890,7 @@ fn ensure_help_only(args: &[String], print_help: fn()) -> Result<()> {
 
 fn print_setup_help() {
     println!(
-        "arterm-host setup [--name <lowercase-name>] [--code-path <absolute-code-tunnel.exe>] [--no-download] [--accept-server-license-terms] [--terminate-sessions]\nExisting name and Code CLI path are retained unless explicitly supplied. First setup requires --name.\n--terminate-sessions stops the host for this user, Windows logon session and data root, ending ALL its live sessions before restarting. No other hosts are killed.\nConfigures an isolated GitHub-backed VS Code tunnel, per-user startup, and the native host."
+        "arterm-host setup [--name <lowercase-name>] [--code-path <absolute-code-tunnel.exe>] [--no-download] [--accept-server-license-terms] [--terminate-sessions] [--force-stop-host]\nExisting name and Code CLI path are retained unless explicitly supplied. First setup requires --name.\n--terminate-sessions gracefully stops this user/logon/data-root host and ends its sessions.\n--force-stop-host bypasses graceful shutdown and ends ALL sessions of matching host executable paths for the current user/logon, including other data roots. Other installations/users are not killed.\nConfigures an isolated GitHub-backed VS Code tunnel, per-user startup, and the native host."
     );
 }
 
@@ -981,9 +991,15 @@ mod tests {
         let args = parse_setup_args(&["--terminate-sessions".into()]).unwrap();
         prepare_setup_host(false, args.terminate_sessions, || Ok(true), stop).unwrap();
         assert_eq!(stops.get(), 1);
+        let args = parse_setup_args(&["--force-stop-host".into()]).unwrap();
+        assert!(args.force_stop_host);
+        assert!(!args.terminate_sessions);
+        prepare_setup_host(false, args.terminate_sessions || args.force_stop_host,
+            || bail!("force-stop must not require a responsive status query"), stop).unwrap();
+        assert_eq!(stops.get(), 2);
         assert!(prepare_setup_host(true, true, || Ok(true), || bail!("mock stop failure")).is_err());
         assert!(prepare_setup_host(true, false, || bail!("mock status failure"), stop).is_err());
-        assert_eq!(stops.get(), 1);
+        assert_eq!(stops.get(), 2);
     }
 
     #[test]

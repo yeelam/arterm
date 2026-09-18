@@ -7,7 +7,7 @@ use std::{
     os::windows::ffi::OsStrExt,
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -93,15 +93,28 @@ pub(crate) fn stop_host_command(path: &Path, terminate_sessions: bool) -> Result
     let mut command = Command::new(path);
     command.args(host_stop_args(terminate_sessions)).stdin(Stdio::null());
     let mut child = command.spawn().context("start scoped host stop command")?;
-    // Dropping Child does not kill it. A timed-out request can still finish later.
-    wait_for_shutdown(Duration::from_secs(20), || {
+    wait_for_stop_child(&mut child, Duration::from_secs(20))
+        .context("scoped graceful shutdown did not complete; the stop helper was reaped, but an already-delivered request may still finish. Check host status, or explicitly use --force-stop-host to end matching host processes")
+}
+
+fn wait_for_stop_child(child: &mut Child, timeout: Duration) -> Result<()> {
+    let result = wait_for_shutdown(timeout, || {
         let Some(status) = child.try_wait()? else { return Ok(false); };
         ensure!(
             status.success(),
             "host has live sessions or cannot be stopped; setup/update/uninstall cancelled (explicit --terminate-sessions or installer /terminate-sessions ends scoped sessions)"
         );
         Ok(true)
-    }).context("host has live sessions or scoped stop did not complete; no process was forcibly killed; a pending request may still complete, check host status before retrying")
+    });
+    if result.is_err() && child.try_wait()?.is_none() {
+        // This is our own controller, not the host. Do not leave timed-out stop
+        // helpers running and locking the installed executable indefinitely.
+        if let Err(error) = child.kill() {
+            ensure!(child.try_wait()?.is_some(), "cannot clean up timed-out stop helper: {error}");
+        }
+        child.wait().context("reap timed-out stop helper")?;
+    }
+    result
 }
 
 fn wait_for_shutdown(timeout: Duration, mut stopped: impl FnMut() -> Result<bool>) -> Result<()> {
@@ -119,10 +132,26 @@ fn host_stop_args(terminate_sessions: bool) -> Vec<&'static str> {
     if terminate_sessions { vec!["stop", "--terminate-sessions"] } else { vec!["stop"] }
 }
 
-fn stop_installed_host(paths: &[PathBuf], terminate_sessions: bool) -> Result<()> {
+pub(crate) fn force_stop_host_command(path: &Path) -> Result<()> {
+    let dir = path.parent().context("host executable has no parent directory")?;
+    let mut paths = installed_runtimes(dir, Role::Host)?;
+    if !paths.iter().any(|p| p == path) {
+        paths.push(path.to_owned());
+    }
+    eprintln!("WARNING: force-stopping this installation's host processes for the current user/logon. ALL their sessions will end, including hosts using other data roots.");
+    crate::host_shutdown::force_stop(&paths)?;
+    Ok(())
+}
+
+fn stop_installed_host(paths: &[PathBuf], terminate_sessions: bool, force_stop: bool) -> Result<()> {
     ensure!(!paths.is_empty(), "installed host executable is missing");
-    for path in paths {
-        stop_host_command(path, terminate_sessions)?;
+    if force_stop {
+        eprintln!("WARNING: force-stopping this installation's host processes for the current user/logon. ALL their sessions will end, including hosts using other data roots.");
+        crate::host_shutdown::force_stop(paths)?;
+    } else {
+        for path in paths {
+            stop_host_command(path, terminate_sessions)?;
+        }
     }
     // Older installed stop commands acknowledge before the executable is released.
     wait_for_shutdown(Duration::from_secs(10), || match require_closed_runtimes(paths) {
@@ -546,11 +575,11 @@ pub fn write_payload(dir: &Path, role: Role, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn uninstall(dir: &Path, role: Role, terminate_sessions: bool) -> Result<()> {
+fn uninstall(dir: &Path, role: Role, terminate_sessions: bool, force_stop: bool) -> Result<()> {
     verify_install_owner(dir, role)?;
     let existing = installed_runtimes(dir, role)?;
     if role == Role::Host {
-        stop_installed_host(&existing, terminate_sessions)?;
+        stop_installed_host(&existing, terminate_sessions, force_stop)?;
         set_startup(None)?;
     }
     require_closed_runtimes(&existing)?;
@@ -632,18 +661,23 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
     let mut no_download = false;
     let mut remove = false;
     let mut terminate_sessions = false;
+    let mut force_stop = false;
     let mut log = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].to_ascii_lowercase().as_str() {
-            "/quiet" => quiet = true,
-            "/no-download" => no_download = true,
-            "/uninstall" => remove = true,
-            "/terminate-sessions" => {
-                ensure!(role == Role::Host, "/terminate-sessions is host-only");
+            "/quiet" | "--quiet" => quiet = true,
+            "/no-download" | "--no-download" => no_download = true,
+            "/uninstall" | "--uninstall" => remove = true,
+            "/terminate-sessions" | "--terminate-sessions" => {
+                ensure!(role == Role::Host, "--terminate-sessions is host-only");
                 terminate_sessions = true;
             }
-            "/log" => {
+            "/force-stop-host" | "--force-stop-host" => {
+                ensure!(role == Role::Host, "--force-stop-host is host-only");
+                force_stop = true;
+            }
+            "/log" | "--log" => {
                 i += 1;
                 let path = PathBuf::from(args.get(i).context("/log requires a path")?);
                 ensure!(path.is_absolute(), "/log path must be absolute");
@@ -656,13 +690,13 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
     let dir = install_dir(role)?;
     let result = (|| -> Result<()> {
         if remove {
-            return uninstall(&dir, role, terminate_sessions);
+            return uninstall(&dir, role, terminate_sessions, force_stop);
         }
         ensure_dependency(role, None, no_download || quiet)?;
         let existing = installed_runtimes(&dir, role)?;
         if role == Role::Host && !existing.is_empty() {
             verify_install_owner(&dir, role)?;
-            stop_installed_host(&existing, terminate_sessions)?;
+            stop_installed_host(&existing, terminate_sessions, force_stop)?;
         }
         write_payload(&dir, role, payload)?;
         update_path(&dir, true)?;
@@ -697,9 +731,10 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
 
 fn installer_help(role: Role) -> String {
     let host = if role == Role::Host {
-        "\n/terminate-sessions explicitly ends ALL sessions of the current user/logon/data-root host before update/uninstall.\nGraceful scoped shutdown only; unresponsive hosts fail the operation without forced kills."
+        "\n--terminate-sessions requests graceful shutdown of the current user/logon/data-root host, ending its sessions.\n--force-stop-host bypasses an unresponsive control pipe and force-stops only matching installed host executable paths for the current user/Windows logon. ALL sessions of those processes are lost, including hosts using other data roots. Other installations/users are not killed.\nForce-stop is never automatic; without it an unresponsive host cancels the operation."
     } else { "" };
-    format!("arTerm {} installer\n/quiet /no-download /log <absolute-path> /uninstall{host}\n\
+    format!("arTerm {} installer\n--quiet --no-download --log <absolute-path> --uninstall{host}\n\
+        Both --option and /option spellings are accepted.\n\
         Existing configuration and credentials are retained.\n\
         Per-user installation. Signing credentials are not bundled. Login occurs in setup, never in the installer.",
         role_name(role))
@@ -708,6 +743,155 @@ fn installer_help(role: Role) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().is_ok_and(|status| status.is_none()) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    fn hung_fixture(path: &Path, ready: &Path, descendant: Option<&Path>, gate: Option<&Path>) -> OwnedChild {
+        let mut command = Command::new(path);
+        command.args(["--ignored", "--exact", "deployment::tests::force_shutdown_fixture_child"])
+            .env("ARTERM_FORCE_TEST_READY", ready)
+            .env_remove("ARTERM_FORCE_TEST_DESCENDANT")
+            .env_remove("ARTERM_FORCE_TEST_SPAWN_GATE")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(path) = descendant {
+            command.env("ARTERM_FORCE_TEST_DESCENDANT", path);
+        }
+        if let Some(path) = gate {
+            command.env("ARTERM_FORCE_TEST_SPAWN_GATE", path);
+        }
+        let mut child = OwnedChild(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "owned fixture exited before ready");
+            assert!(Instant::now() < deadline, "owned fixture failed to start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
+    #[test]
+    #[ignore = "child of the isolated force-stop regression only"]
+    fn force_shutdown_fixture_child() {
+        let ready = std::env::var_os("ARTERM_FORCE_TEST_READY").expect("parent test readiness path");
+        if let Some(gate) = std::env::var_os("ARTERM_FORCE_TEST_SPAWN_GATE") {
+            fs::write(&ready, b"ready before spawning child").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !Path::new(&gate).exists() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let descendant = std::env::var_os("ARTERM_FORCE_TEST_DESCENDANT").map(|path| {
+            let child_ready = PathBuf::from(&ready).with_extension("child-ready");
+            let child = hung_fixture(Path::new(&path), &child_ready, None, None);
+            fs::write(PathBuf::from(&ready).with_extension("child-pid"), child.0.id().to_string()).unwrap();
+            child
+        });
+        fs::write(&ready, b"ready").unwrap();
+        thread::sleep(Duration::from_secs(90));
+        drop(descendant);
+    }
+
+    #[test]
+    fn explicit_force_recovers_locked_install_without_killing_neighbor_or_resetting_state() {
+        let root = std::env::temp_dir().join(format!("arterm-force-test-{}", uuid::Uuid::now_v7()));
+        let dir = root.join("host");
+        let neighbor = root.join("neighbor");
+        fs::create_dir_all(&neighbor).unwrap();
+        let payload = fs::read(std::env::current_exe().unwrap()).unwrap();
+        write_payload(&dir, Role::Host, &payload).unwrap();
+        let paths = installed_runtimes(&dir, Role::Host).unwrap();
+        let other = neighbor.join(exe_name(Role::Host));
+        fs::write(&other, &payload).unwrap();
+        let descendant_path = root.join("owned-tunnel-fixture.exe");
+        fs::write(&descendant_path, &payload).unwrap();
+        let state = root.join("saved-config.json");
+        fs::write(&state, b"preserved host name, paths and credentials").unwrap();
+        let mut host = hung_fixture(&paths[0], &root.join("host-ready"), Some(&descendant_path), None);
+        let mut alias = hung_fixture(&paths[1], &root.join("alias-ready"), None, None);
+        let mut stop_helper = hung_fixture(&paths[0], &root.join("helper-ready"), None, None);
+        let mut unrelated = hung_fixture(&other, &root.join("neighbor-ready"), None, None);
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE}};
+        let child_pid: u32 = fs::read_to_string(root.join("host-ready.child-pid")).unwrap().parse().unwrap();
+        let child_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child_pid) };
+        assert!(!child_handle.is_null());
+        let child_handle = unsafe { OwnedHandle::from_raw_handle(child_handle) };
+        assert!(require_closed_runtimes(&paths).is_err(), "fixture must really lock the installed image");
+        assert!(write_payload(&dir, Role::Host, b"MZreplacement").is_err());
+        assert!(host.0.try_wait().unwrap().is_none(), "ordinary payload update must not kill anything");
+        stop_installed_host(&paths, true, true).unwrap();
+        for child in [&mut host, &mut alias, &mut stop_helper] {
+            assert!(child.0.try_wait().unwrap().is_some(), "matching installation process survived force-stop");
+        }
+        assert!(unrelated.0.try_wait().unwrap().is_none(), "same-name neighbor was killed");
+        assert_eq!(unsafe { WaitForSingleObject(child_handle.as_raw_handle(), 0) }, WAIT_OBJECT_0,
+            "verified owned tunnel descendant survived host force-stop");
+        write_payload(&dir, Role::Host, b"MZreplacement").unwrap();
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"MZreplacement");
+        }
+        assert_eq!(fs::read(&state).unwrap(), b"preserved host name, paths and credentials");
+        drop((host, alias, stop_helper, unrelated));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn timed_out_stop_helper_is_terminated_and_reaped() {
+        let root = std::env::temp_dir().join(format!("arterm-stop-helper-test-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let mut child = hung_fixture(&std::env::current_exe().unwrap(), &root.join("ready"), None, None);
+        let error = wait_for_stop_child(&mut child.0, Duration::from_millis(30)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(child.0.try_wait().unwrap().is_some(), "timed-out helper remains alive");
+        drop(child);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_stop_catches_tunnel_spawned_after_initial_discovery() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE}};
+        let root = std::env::temp_dir().join(format!("arterm-late-child-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let host_path = root.join("arterm-host.exe");
+        let tunnel_path = root.join("owned-tunnel.exe");
+        let payload = fs::read(std::env::current_exe().unwrap()).unwrap();
+        fs::write(&host_path, &payload).unwrap();
+        fs::write(&tunnel_path, &payload).unwrap();
+        let ready = root.join("ready");
+        let gate = root.join("spawn");
+        let mut host = hung_fixture(&host_path, &ready, Some(&tunnel_path), Some(&gate));
+        let mut descendant = None;
+        let stopped = crate::host_shutdown::force_stop_with_hook(&[host_path], || {
+            fs::write(&gate, b"go")?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pid_file = ready.with_extension("child-pid");
+            while !pid_file.exists() {
+                ensure!(Instant::now() < deadline, "late descendant did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let pid: u32 = fs::read_to_string(pid_file)?.parse()?;
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            ensure!(!handle.is_null(), "late descendant exited unexpectedly");
+            descendant = Some(unsafe { OwnedHandle::from_raw_handle(handle) });
+            Ok(())
+        }).unwrap();
+        assert_eq!(stopped, 2);
+        assert!(host.0.try_wait().unwrap().is_some());
+        assert_eq!(unsafe { WaitForSingleObject(descendant.as_ref().unwrap().as_raw_handle(), 0) }, WAIT_OBJECT_0);
+        drop((host, descendant));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn graceful_shutdown_wait_is_bounded_and_propagates_failures() {
         let mut polls = 0;
@@ -726,11 +910,13 @@ mod tests {
     #[test]
     fn installer_help_documents_actual_host_only_switch_and_scope() {
         let help = installer_help(Role::Host);
-        assert!(help.contains("/terminate-sessions"));
-        assert!(!help.contains("--terminate-sessions"));
+        assert!(help.contains("--terminate-sessions"));
+        assert!(help.contains("--force-stop-host"));
+        assert!(help.contains("Both --option and /option"));
         assert!(help.contains("current user/logon/data-root"));
-        assert!(help.contains("without forced kills"));
-        assert!(!installer_help(Role::Client).contains("/terminate-sessions"));
+        assert!(help.contains("Force-stop is never automatic"));
+        assert!(!installer_help(Role::Client).contains("--terminate-sessions"));
+        assert!(!installer_help(Role::Client).contains("--force-stop-host"));
     }
 
     #[test]
@@ -738,12 +924,13 @@ mod tests {
         assert_eq!(host_stop_args(false), ["stop"]);
         assert_eq!(host_stop_args(true), ["stop", "--terminate-sessions"]);
         assert!(installer_with_args(Role::Client, b"MZtest", &["/terminate-sessions".into()]).is_err());
-        for switch in ["/terminate-sessions", "/TERMINATE-SESSIONS"] {
+        for switch in ["/terminate-sessions", "/TERMINATE-SESSIONS", "--terminate-sessions",
+            "/force-stop-host", "--force-stop-host", "--FORCE-STOP-HOST"] {
             let error = installer_with_args(Role::Host, b"MZtest",
                 &[switch.into(), "/invalid-before-any-install".into()]).unwrap_err();
             assert!(error.to_string().contains("unknown installer parameter: /invalid-before-any-install"));
         }
-        assert!(installer_with_args(Role::Host, b"MZtest", &["--terminate-sessions".into()]).is_err());
+        assert!(installer_with_args(Role::Client, b"MZtest", &["--force-stop-host".into()]).is_err());
     }
 
     #[test]

@@ -488,7 +488,7 @@ struct ProcessImage {
     context: TokenContext,
     image: VerifiedImage,
 }
-fn image_path(process: &OwnedHandle) -> Result<PathBuf> {
+pub(crate) fn image_path(process: &OwnedHandle) -> Result<PathBuf> {
     let mut path = vec![0u16; 32768];
     let mut size = path.len() as u32;
     check(
@@ -498,7 +498,17 @@ fn image_path(process: &OwnedHandle) -> Result<PathBuf> {
     path.truncate(size as usize);
     Ok(std::ffi::OsString::from_wide(&path).into())
 }
-fn creation_time(process: &OwnedHandle) -> Result<u64> {
+pub(crate) fn same_user_logon(process: &OwnedHandle) -> Result<bool> {
+    let current = token_context(&open_process(unsafe { GetCurrentProcessId() })?)?;
+    let candidate = token_context(process)?;
+    Ok(same_logon(&current, &candidate))
+}
+fn same_logon(current: &TokenContext, candidate: &TokenContext) -> bool {
+    current.sid == candidate.sid
+        && current.session == candidate.session
+        && current.authentication_id == candidate.authentication_id
+}
+pub(crate) fn creation_time(process: &OwnedHandle) -> Result<u64> {
     let (mut created, mut exited, mut kernel, mut user) =
         unsafe { (zeroed(), zeroed(), zeroed(), zeroed()) };
     check(
@@ -879,6 +889,7 @@ mod tests {
                 7 => peer.app_container = 1,
                 _ => peer.ui_access = 1,
             }
+
             assert_eq!(
                 check_context(&owner, &peer).unwrap_err().reason,
                 Rejection::UnsafeTokenContext
@@ -888,6 +899,20 @@ mod tests {
             let mut both = owner.clone();
             both.integrity = integrity;
             assert!(check_context(&both, &both).is_err());
+        }
+    }
+    #[test]
+    fn shutdown_scope_excludes_other_users_sessions_and_logons() {
+        let owner = medium();
+        assert!(same_logon(&owner, &owner));
+        for change in 0..3 {
+            let mut peer = owner.clone();
+            match change {
+                0 => peer.sid.push(9),
+                1 => peer.session += 1,
+                _ => peer.authentication_id.0 += 1,
+            }
+            assert!(!same_logon(&owner, &peer));
         }
     }
     #[test]

@@ -81,6 +81,15 @@ account on both machines and run the host's printed registration command on
 the client. Follow [QUICKSTART.md](https://github.com/yeelam/arterm/blob/main/QUICKSTART.md) for the
 complete connection and automation steps.
 
+For an already-configured host, upgrade the binaries and run `arterm-host start`;
+do not repeat setup or client registration. Both `/option` and `--option`
+installer spellings are accepted. `--terminate-sessions` requests graceful
+shutdown. If that times out, `arTerm-Host-Setup.exe --force-stop-host` explicitly
+force-stops verified host processes from that installation for the current
+user/logon and their children. This destroys their active sessions, including
+other data roots sharing the executable, but retains saved configuration and
+credentials. Other installations/users are not force-stopped.
+
 arTerm's `arterm connect my-devbox` only prints a reusable command.
 Type that command or `arterm connect my-devbox MyWork`; repeat it to recover
 the same session. Existing 0.2 GUID recovery records remain supported.

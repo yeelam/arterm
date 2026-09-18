@@ -73,7 +73,7 @@ By default, an upgrade refuses to stop a host with live sessions; unchanged
 runtime setup leaves the running host alone. To deliberately end its sessions:
 
 ```powershell
-.\arTerm-Host-Setup.exe /terminate-sessions
+.\arTerm-Host-Setup.exe --terminate-sessions
 arterm-host start
 # Or, to stop and restart as part of runtime setup:
 arterm-host setup --terminate-sessions
@@ -86,11 +86,33 @@ control command scoped to the current Windows user, logon session and data root,
 not process-name or all-user kills. Hosts in other logons/roots are not stopped;
 if they hold installed executables open, the upgrade fails rather than killing them.
 Setup waits at most 20 seconds for each stop command and installer upgrades wait
-up to 10 seconds for executable release. An unresponsive host cancels the operation;
-there is no forced-kill fallback. A timed-out stop request may still finish later:
-check host status before retrying. This retains the existing scoped host control
+up to 10 seconds for executable release. An unresponsive host cancels the ordinary
+operation. Timed-out controller processes are terminated and reaped, but a stop
+request already delivered to the broker may still finish: check status before retrying.
+This retains the existing scoped host control
 boundary; it does not add pipe image attestation.
-`/terminate-sessions` also applies to host `/uninstall`. No certificate trust or
+Both `--option` and `/option` installer spellings are accepted, including
+`/terminate-sessions`. The option also applies to host `--uninstall`.
+
+If the host will not respond, explicitly force-stop it while upgrading:
+
+```powershell
+.\arTerm-Host-Setup.exe --force-stop-host
+arterm-host start
+# For runtime reconfiguration rather than a binary upgrade:
+arterm-host setup --force-stop-host
+```
+
+**Force-stop bypasses the control pipe and destroys ALL sessions of the matching
+host processes.** It verifies exact installed executable paths and the current
+Windows user/logon, holds process handles, and also stops their verified child
+processes (including the owned tunnel). This scope includes other data roots
+using the same host installation. Same-named executables in other installations
+are not killed; it is not an all-user process-name kill. Run from a separate
+local terminal, not from a remote session owned by the host being stopped.
+Force-stop is never automatic and does not erase configuration or credentials.
+After upgrading a configured host, use `start`, not `setup` or re-registration.
+No certificate trust or
 authentication policy is changed. Live installer/sign-in E2E requires a dedicated
 machine; temporary-fixture tests do not exercise it.
 

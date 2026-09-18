@@ -15,3 +15,4 @@ pub mod wire;
 pub mod local_control;
 pub mod shell_integration;
 pub mod peer_auth;
+mod host_shutdown;
