@@ -1,5 +1,7 @@
 # arTerm
 
+[![arTerm - remote terminal access, automatic reconnect, client-reboot recovery, and an agent-ready CLI](.github/arterm-github-cover.jpg)](https://github.com/yeelam/arterm/releases/latest)
+
 arTerm keeps a Windows remote shell running independently of
 your local terminal. Return to the same shell with the same named command,
 or control an attached session from another local CLI or agent.
