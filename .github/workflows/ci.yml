@@ -17,11 +17,17 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Test native client and real ConPTY host
+      - name: Test unsigned fixtures (not production IPC authentication)
         shell: pwsh
         run: |
-          cargo test --locked -- --test-threads=1
+          cargo test --locked --features test-unsigned-ipc -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --features test-unsigned-ipc --test resume_e2e -- --ignored --test-threads=1 2>&1 |
+            Tee-Object -Variable resumeOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($resumeOutput -join "`n") -notmatch '(?m)^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;') {
+            throw 'Native functional fixtures must execute and pass at least one test, with none ignored.'
+          }
       - name: Build unsigned development installers
         shell: pwsh
         run: |
@@ -31,9 +37,9 @@ jobs:
         shell: pwsh
         run: |
           $allowed = @('arterm.exe','arterm-host.exe','arTerm-Client-Setup.exe',
-                       'arTerm-Host-Setup.exe','LICENSE','SHA256SUMS')
+                       'arTerm-Host-Setup.exe','LICENSE','THIRD-PARTY-NOTICES.txt','SHA256SUMS')
           $entries = @(Get-ChildItem -LiteralPath dist -Force)
-          if ($entries.Count -ne $allowed.Count) { throw 'Unsigned artifact must contain exactly six files.' }
+          if ($entries.Count -ne $allowed.Count) { throw 'Unsigned artifact must contain exactly seven files.' }
           foreach ($entry in $entries) {
             if ($entry.PSIsContainer -or $entry.Name -cnotin $allowed -or
                 ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -59,6 +65,7 @@ jobs:
             dist\arTerm-Client-Setup.exe
             dist\arTerm-Host-Setup.exe
             dist\LICENSE
+            dist\THIRD-PARTY-NOTICES.txt
             dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7

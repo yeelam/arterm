@@ -86,11 +86,14 @@ fn run() -> Result<()> {
             Sha256::digest(fs::read(source)?)
         ));
     }
-    fs::copy(root.join("LICENSE"), dist.join("LICENSE")).context("packaging MIT license")?;
-    hashes.push_str(&format!(
-        "{:x}  LICENSE\n",
-        Sha256::digest(fs::read(dist.join("LICENSE"))?)
-    ));
+    for name in ["LICENSE", "THIRD-PARTY-NOTICES.txt"] {
+        fs::copy(root.join(name), dist.join(name))
+            .with_context(|| format!("packaging {name}"))?;
+        hashes.push_str(&format!(
+            "{:x}  {name}\n",
+            Sha256::digest(fs::read(dist.join(name))?)
+        ));
+    }
     fs::write(dist.join("SHA256SUMS"), hashes)?;
     println!(
         "arTerm packages in {}. Installers are not signed by this builder.",

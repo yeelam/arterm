@@ -60,6 +60,8 @@ fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
 fn help_version_and_validation_do_not_require_setup() {
     let home = std::env::temp_dir().join(format!("devbox-client-help-{}", Uuid::now_v7()));
     assert!(run(&home, &["--help"]).status.success());
+    let help = String::from_utf8(run(&home, &["--help"]).stdout).unwrap();
+    assert!(!help.contains("--file") && !help.contains("arterm receive"));
     assert!(run(&home, &["--version"]).status.success());
     assert!(!run(
         &home,
@@ -75,6 +77,59 @@ fn help_version_and_validation_do_not_require_setup() {
     .status
     .success());
     assert!(!home.join("client").join("config.json").exists());
+    for args in [
+        vec!["resume", "work", "session"],
+        vec!["send", "work", "session"],
+        vec!["send", "work", "session", "--command", "x", "--file", "x"],
+        vec!["send", "work", "session", "--command", "x", "--wait"],
+        vec!["send", "work", "session", "--command", "x", "--timeout", "60s"],
+        vec!["send", "work", "session", "--command", "x", "--wait", "--timeout", "0s"],
+        vec!["send", "work", "session", "--file", "x", "--wait", "--timeout", "60s"],
+        vec!["read", "work", "session", "--lines", "0"],
+        vec!["receive", "work", "session"],
+        vec!["detach", "work", "session", "--target", "work"],
+    ] {
+        assert!(!run(&home, &args).status.success(), "{args:?}");
+    }
+
+    assert!(!home.exists(), "invalid CLI must not create local state");
+}
+
+#[test]
+#[cfg_attr(not(feature = "test-unsigned-ipc"), ignore = "requires explicit unsigned functional fixture feature")]
+fn headless_failure_preserves_final_error_with_drained_stderr() {
+    let home = std::env::temp_dir().join(format!("arterm-diagnostics-{}", Uuid::now_v7()));
+    assert!(run(&home, &["add", "work", "--tunnel", "fixture", "--host-path", r"C:\host.exe"]).status.success());
+    for _ in 0..30 {
+        let output = run(&home, &["connect", "work", "errorprobe", "--retries", "0"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("[client] retry limit reached"),
+            "final error lost: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+#[cfg_attr(feature = "test-unsigned-ipc", ignore = "requires default strict production policy")]
+fn identical_unsigned_production_clients_cannot_start_ipc() {
+    let home = std::env::temp_dir().join(format!("arterm-strict-unsigned-{}", Uuid::now_v7()));
+    fs::create_dir_all(&home).unwrap();
+    assert!(run(&home, &["add","work","--tunnel","fixture","--host-path",r"C:\host.exe"]).status.success());
+    let first = home.join("owner.exe");
+    let second = home.join("controller.exe");
+    fs::copy(env!("CARGO_BIN_EXE_arterm"), &first).unwrap();
+    fs::copy(&first, &second).unwrap();
+    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+    for executable in [&first, &second] {
+        let output = Command::new(executable).env("VSTERM_REMOTE_HOME", &home)
+            .args(["connect","work","probe","--retries","0"]).output().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("authenticate local client program") && error.contains("UntrustedSignature"),
+            "unsigned same-image client did not fail certificate gate: {error}");
+    }
+    assert!(!home.join("client").join("active").exists());
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -103,6 +158,7 @@ fn registration_persists_the_friendly_name_not_a_generated_tunnel_id() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "test-unsigned-ipc"), ignore = "requires explicit unsigned functional fixture feature")]
 fn failed_retries_keep_one_persisted_guid() {
     let home = std::env::temp_dir().join(format!("devbox-client-retry-{}", Uuid::now_v7()));
     fs::create_dir_all(&home).unwrap();
@@ -184,6 +240,7 @@ fn no_reference_only_prints_a_powershell_safe_command_and_preserves_flags() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "test-unsigned-ipc"), ignore = "requires explicit unsigned functional fixture feature")]
 fn unused_guid_lookup_does_not_consume_printed_reference() {
     let home = std::env::temp_dir().join(format!("arterm-unused-guid-{}", Uuid::now_v7()));
     assert!(run(&home, &["add", "work", "--tunnel", "fixture",
@@ -191,15 +248,12 @@ fn unused_guid_lookup_does_not_consume_printed_reference() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     drop(listener);
-    for verb in ["resume", "terminate"] {
+    for verb in ["terminate"] {
         let printed = run(&home, &["connect", "work"]);
         assert!(printed.status.success());
         let command = String::from_utf8(printed.stdout).unwrap();
         let id = command.split_whitespace().find(|part| Uuid::parse_str(part).is_ok()).unwrap();
-        let mut args = vec![verb, "work", id, "--address", &address, "--stdio"];
-        if verb == "terminate" {
-            args.push("--yes");
-        }
+        let args = vec![verb, "work", id, "--address", &address, "--stdio"];
         assert!(!run(&home, &args).status.success());
         assert!(!walk(&home).iter().any(|path|
             path.file_name().unwrap().to_string_lossy() == format!("{id}.lock")),

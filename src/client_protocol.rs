@@ -71,7 +71,7 @@ pub fn doctor(link: &mut impl Link) -> Result<()> {
     Ok(())
 }
 
-pub fn terminate(link: &mut impl Link, state: &State) -> Result<()> {
+pub fn terminate(link: &mut impl Link, state: &State) -> Result<bool> {
     let token = state
         .token
         .clone()
@@ -83,6 +83,12 @@ pub fn terminate(link: &mut impl Link, state: &State) -> Result<()> {
         text(&response, "type")? == "HelloOk",
         "host rejected protocol handshake"
     );
+    let hello_body = get(&response, "body")?;
+    if let Some(origin) = &state.origin {
+        ensure!(arterm::wire::binary(hello_body, "broker_instance_id")? == *origin, "broker identity changed");
+    }
+    let confirmed_capability = get(hello_body, "capabilities").ok().and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("session-termination-confirmed")));
     link.send(&message(
         "TerminateSession",
         map(vec![
@@ -93,18 +99,29 @@ pub fn terminate(link: &mut impl Link, state: &State) -> Result<()> {
         ]),
     ))?;
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut accepted = false;
     loop {
-        let response = wait_message(link, deadline)?;
+        let response = match wait_message(link, deadline) {
+            Ok(response) => response,
+            Err(error) if accepted => {
+                arterm::statusln!("[terminate] Request accepted, but exit confirmation failed: {error:#}");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         let kind = text(&response, "type")?;
         let body = get(&response, "body")?;
         match kind {
-            "TerminateAccepted" | "SessionExited" => {
+            "TerminateAccepted" | "SessionExited" | "SessionTerminated" => {
                 ensure!(
                     text(body, "session_id")? == state.id.to_string(),
                     "remote session ID mismatch"
                 );
-                return Ok(());
+                if kind != "TerminateAccepted" { return Ok(true); }
+                accepted = true;
+                if !confirmed_capability { return Ok(false); }
             }
+
             "Ping" => link.send(&message(
                 "Pong",
                 map(vec![
@@ -112,11 +129,36 @@ pub fn terminate(link: &mut impl Link, state: &State) -> Result<()> {
                     ("broker_time_ms", 0.into()),
                 ]),
             ))?,
+            "Error" if accepted && text(body, "code")? == "TerminationUnconfirmed" => {
+                arterm::statusln!("[terminate] Request accepted; process exit is not confirmed.");
+                return Ok(false);
+            }
             "Error" => bail!("host rejected termination: {}", text(body, "code")?),
             "Unauthorized" => bail!("host rejected the saved session credential"),
             other => bail!("unexpected host protocol message while terminating: {other}"),
         }
     }
+}
+
+pub fn list_sessions(link: &mut impl Link) -> Result<serde_json::Value> {
+    let id = Uuid::now_v7();
+    let mut greeting = hello(id, id);
+    if let Value::Map(fields) = &mut greeting {
+        if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(key, _)| key.as_str() == Some("body")) {
+            if let Some((_, Value::Array(caps))) = body.iter_mut().find(|(key, _)| key.as_str() == Some("capabilities")) {
+                caps.push(s("host-owner-management-v1"));
+            }
+        }
+    }
+    link.send(&greeting)?;
+    let response = wait_message(link, Instant::now() + Duration::from_secs(20))?;
+    ensure!(text(&response, "type")? == "HelloOk", "management handshake rejected");
+    ensure!(get(get(&response, "body")?, "capabilities")?.as_array().context("invalid capabilities")?
+        .iter().any(|v| v.as_str() == Some("host-owner-management-v1")), "host does not support owner inventory");
+    link.send(&message("ListSessions", map(vec![])))?;
+    let response = wait_message(link, Instant::now() + Duration::from_secs(20))?;
+    ensure!(text(&response, "type")? == "SessionInventory", "remote inventory rejected");
+    Ok(serde_json::from_str(text(get(&response, "body")?, "json")?)?)
 }
 
 #[cfg(test)]

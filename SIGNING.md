@@ -33,10 +33,14 @@ against unreviewed changes.
 2. CI checks out that exact public commit, verifies it is reachable from public
    main, and checks the pinned public certificate hash. The signing helper
    comes from the private workflow's own commit, not the public checkout.
-3. CI tests and builds without signing secrets, signs and timestamps the two
-   runtime EXEs, embeds those exact bytes without rebuilding them, and then
-   signs and timestamps both installers.
-4. CI checks the strict download allowlist, recomputes seven SHA-256 checksums,
+3. CI runs unsigned functional fixtures with the debug-only
+   `test-unsigned-ipc` feature, then builds release binaries without that feature
+   or signing secrets. The ignored native functional tests are selected
+   explicitly and must execute successfully. CI signs and timestamps the two
+   runtime EXEs, embeds those unchanged bytes, then signs and timestamps both
+   installers. The exact signed-production IPC test must execute and pass
+   before download assembly and upload.
+4. CI checks the strict download allowlist, recomputes eight SHA-256 checksums,
    and uploads `arterm-windows-x64-development-signed` for maintainer review.
    This workflow does not publish a release.
 
@@ -46,11 +50,30 @@ identity and timestamped signatures, then removes its temporary PFX, imported
 private key, and temporary runner trust. Do not run it locally or regenerate,
 export, or retrieve private signing material during source maintenance.
 
-The signed download contains exactly eight flat files: `arterm.exe`,
+The signed IPC gate has no signing secrets. Only on a disposable GitHub-hosted
+runner, it temporarily imports the fingerprint-verified public certificate
+into `LocalMachine\Root` and removes that trust in `finally` if it added it.
+The debug test harness receives absolute `SIGNED_CLIENT`, `SIGNED_HOST`,
+`SIGNED_INSTALLER`, and `UNSIGNED_CLIENT` paths; its positive peers are the
+signed release binaries, not unsigned fixtures. `SIGNED_INSTALLER` selects the
+signed client installer as a same-certificate, wrong-program fixture. These
+are test-harness selectors, not production authentication bypasses. Hashes of
+all referenced and published EXEs and the release build outputs must remain
+unchanged after testing.
+Public unsigned CI exercises fixtures, not the signed-production IPC gate.
+
+The signed download contains exactly nine flat files: `arterm.exe`,
 `arterm-host.exe`, `arTerm-Client-Setup.exe`, `arTerm-Host-Setup.exe`,
-`arTerm-Dev.cer`, `DEVELOPMENT-INSTALL.md`, `LICENSE`, and `SHA256SUMS`.
-Public unsigned artifacts contain only the four EXEs, `LICENSE`, and
-`SHA256SUMS`. The recorded public source SHA is in the private workflow summary.
+`arTerm-Dev.cer`, `DEVELOPMENT-INSTALL.md`, `LICENSE`,
+`THIRD-PARTY-NOTICES.txt`, and `SHA256SUMS`.
+Public unsigned artifacts contain exactly seven flat files: the four EXEs,
+`LICENSE`, `THIRD-PARTY-NOTICES.txt`, and `SHA256SUMS` (six hashed entries).
+The recorded public source SHA is in the private workflow summary.
+
+Keep `THIRD-PARTY-NOTICES.txt` with the distributed binaries and installers.
+It inventories the locked Windows production dependency graph and reproduces
+the selected dependency licenses and additional notices. Review and refresh
+that inventory whenever dependencies or their versions change.
 
 The MIT license covers this project's source, not separately installed vendor
 software. Dependencies retain their own licenses. VS Code Server and other

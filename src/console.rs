@@ -26,6 +26,13 @@ pub trait Terminal {
     fn input(&mut self, accept_bytes: bool) -> Result<Input>;
     fn size(&self) -> (u16, u16);
     fn reading(&self, enabled: bool);
+    fn connection_state(&mut self, _state: &str) {}
+    fn detach_requested(&self) -> bool { false }
+    fn output_gap(&mut self) {}
+    fn control(&mut self) -> Option<crate::local_control::ControlMessage> { None }
+    fn command_capability(&mut self, _supported: bool) {}
+    fn command_output_progress(&mut self, _seq: u64) {}
+    fn command_event(&mut self, _kind: &str, _body: &rmpv::Value) {}
 }
 
 struct Guard {
@@ -98,14 +105,22 @@ pub struct Console {
     enabled: Arc<AtomicBool>,
     decoder: ConsoleInput,
     eof: bool,
+    headless: bool,
 }
 impl Console {
     pub fn new(stdio: bool) -> Result<Self> {
-        let guard = if stdio { None } else { Some(Guard::new()?) };
+        let mut mode = 0;
+        let interactive = unsafe {
+            GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) != 0
+                && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+        };
+        let headless = !stdio && !interactive;
+        if headless { crate::diagnostics::nonblocking(); }
+        let guard = if stdio || headless { None } else { Some(Guard::new()?) };
         let (tx, input) = mpsc::sync_channel(1);
         let enabled = Arc::new(AtomicBool::new(false));
         let gate = enabled.clone();
-        thread::spawn(move || {
+        if !headless { thread::spawn(move || {
             let mut stdin = io::stdin().lock();
             loop {
                 while !gate.load(Ordering::Acquire) {
@@ -125,18 +140,22 @@ impl Console {
                     }
                 }
             }
-        });
+        }); }
         Ok(Self {
             guard,
             input,
             enabled,
             decoder: ConsoleInput::default(),
             eof: false,
+            headless,
         })
     }
 }
 impl Terminal for Console {
     fn output(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.headless {
+            return Ok(());
+        }
         if let Some(guard) = &self.guard {
             let mut offset = 0;
             while offset < bytes.len() {
@@ -164,6 +183,9 @@ impl Terminal for Console {
         Ok(())
     }
     fn input(&mut self, accept_bytes: bool) -> Result<Input> {
+        if self.headless {
+            return Ok(Input::Idle);
+        }
         let now = Instant::now();
         self.decoder.expire(now);
         if !self.eof && self.decoder.buffered_len() < MAX_BUFFERED_INPUT {

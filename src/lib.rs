@@ -12,3 +12,6 @@ macro_rules! statusln {
 pub mod store;
 pub mod transport;
 pub mod wire;
+pub mod local_control;
+pub mod shell_integration;
+pub mod peer_auth;

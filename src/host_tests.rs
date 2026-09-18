@@ -344,7 +344,7 @@ fn sixteen_live_sessions_enforce_admission_limit() {
     )
     .contains("SessionLimit"));
     for session in &live {
-        session.terminate();
+        session.terminate().unwrap();
     }
     drop(live);
     drop(broker);

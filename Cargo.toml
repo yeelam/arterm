@@ -1,6 +1,6 @@
 [package]
 name = "arterm"
-version = "0.4.0"
+version = "0.5.0"
 license = "MIT"
 edition = "2021"
 authors = ["arTerm contributors"]
@@ -29,6 +29,7 @@ required-features = ["installers"]
 
 [features]
 installers = []
+test-unsigned-ipc = []
 
 [dependencies]
 anyhow = "1"
@@ -38,6 +39,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 portable-pty = "0.8"
 sha2 = "0.10"
+vt100 = "0.16"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

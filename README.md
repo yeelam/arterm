@@ -1,7 +1,8 @@
 # arTerm
 
 arTerm keeps a Windows remote shell running independently of
-your local terminal. Return to the same shell with the same named command.
+your local terminal. Return to the same shell with the same named command,
+or control an attached session from another local CLI or agent.
 
 ## Why use it?
 
@@ -11,10 +12,14 @@ your local terminal. Return to the same shell with the same named command.
   returns, rather than start another shell.
 - **Local tab loss or client reboot:** reopen your terminal and rerun the saved
   command from the same Windows user account with its local recovery data intact.
+- **Automation alongside a human:** send a command, wait for its correlated
+  completion, or read output without creating a second remote shell.
 
 **Limit:** the remote host must stay running and logged in. Remote Windows
 reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.
 arTerm does not checkpoint or resurrect processes after those events.
+Managed command execution requires a newly created, supported PowerShell/pwsh
+session; existing sessions are not retrofitted.
 
 ## What you need
 
@@ -26,8 +31,7 @@ arTerm does not checkpoint or resurrect processes after those events.
 | Tunnel sign-in | Your GitHub account | **The same GitHub account** |
 
 The full VS Code editor is optional when a compatible standalone native CLI is
-provided. Tunnel sign-in is separate from `gh` CLI authentication and has
-nothing to do with the repository owner's identity.
+provided. Tunnel sign-in is separate from `gh` CLI authentication.
 
 Installers detect dependencies and offer downloads only with consent; vendor
 binaries are not bundled. Host setup requires acceptance of the VS Code server
@@ -37,7 +41,10 @@ a cold boot requires Windows sign-in, and arTerm does not configure autologon.
 ## Get connected
 
 1. Download the installers from [Releases](https://github.com/yeelam/arterm/releases/latest).
-   For self-signed development builds, follow
+   Use an official signed build: local control requires valid Windows
+   Authenticode chain trust and matching client binaries. Public CI artifacts
+   and local builds are unsigned, not production IPC-ready. For self-signed
+   development builds, follow
    [DEVELOPMENT-INSTALL.md](DEVELOPMENT-INSTALL.md) first. Their certificate is
    not publicly trusted; any local trust must be explicitly approved and
    permitted by your organization's policy.
@@ -74,6 +81,31 @@ new shell; ended or unavailable sessions are not silently replaced.
 Without a reference, `arterm connect my-devbox` **only prints** a complete
 reusable command and exits; it does not start a remote shell.
 
+## Control an attached session
+
+Leave `arterm connect my-devbox MyWork` running, then use another local terminal:
+
+```powershell
+arterm list --client
+arterm list --server my-devbox
+arterm send my-devbox MyWork --command 'Get-Location' --wait --timeout 60s
+arterm read my-devbox MyWork --lines 20
+```
+
+`connect` is a normal running native process. Your caller, Copilot, or OS owns
+backgrounding; arTerm has no `--background`, `start`, or `resume` command.
+Each connection owns its own local named pipe, not a broadcast endpoint or
+client daemon. Local controls require that exact active owner; missing or
+ambiguous owners are errors. Authorized server inventory and termination also
+work while detached.
+
+`send` returns a command ID and acceptance, not proof of success. With `--wait`,
+it returns early on the matching real completion **after output delivery**.
+The explicit positive, finite timeout is required; exit 124 does not cancel
+the remote command, nor does exiting the waiter. Query the command ID rather
+than blindly resending. See [automation and limits](QUICKSTART.md#automation)
+for status, interruption, termination, and idempotency.
+
 For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.
 
@@ -90,8 +122,8 @@ identity and current Windows user. They are not portable credentials.
 The host owns a persistent ConPTY and drains output while detached. Retries
 reuse the same internal GUID and creation request. Saved authorization uses
 random credentials protected by Windows DPAPI, never secrets derived from names.
-`arterm resume TARGET REF` recovers an existing record only; legacy GUIDs still
-address their saved sessions.
+Repeat `arterm connect my-devbox MyWork` to recover it; saved legacy GUID
+references remain supported by `connect`.
 
 Mapping and protected state are persisted before remote creation. Exclusive
 locks prevent concurrent local use from creating duplicate sessions. Missing,
@@ -111,8 +143,8 @@ not completion of the shell command.
 
 Type the complete reusable command so your shell records it normally. arTerm
 does not append history, inject keystrokes, launch parent-shell wrappers, or
-restore individual tabs. The abandoned history-injection implementation is
-removed; legacy history environment variables do not enable it.
+restore individual tabs. Legacy history environment variables do not enable
+history injection.
 
 </details>
 
@@ -153,7 +185,7 @@ GitHub account, then retry. Do not reinstall the host or delete session records.
 <details>
 <summary>Existing VsTerm installations, saved commands, and older hosts</summary>
 
-arTerm 0.4.0 installs canonical `arterm.exe` / `arterm-host.exe` binaries and
+arTerm 0.5 installs canonical `arterm.exe` / `arterm-host.exe` binaries and
 byte-identical `vsterm.exe` / `vsterm-host.exe` compatibility aliases in the same
 role directories. Existing absolute commands and registered host paths remain
 valid without rewriting target configuration or recovery records.
@@ -170,13 +202,13 @@ canonical and legacy runtime filenames and do not bypass live-session guards
 when only an old executable name exists. Older DevBox Remote prototype state
 is left untouched and is not automatically imported.
 
-Reusable `connect` and named `resume` require the host capability
+Reusable `connect` requires the host capability
 `ended-session-rejection`, supplied by arTerm and compatible VsTerm 0.3 hosts.
 Unsupported hosts are rejected before creation or attachment. The local
 reservation remains available for retry with a compatible host; protocol
 version 1 alone does not establish support.
 
-To finish a still-live VsTerm 0.2 session, explicit `arterm resume TARGET GUID`
+For a still-live VsTerm 0.2 session, `connect` with its saved GUID
 can use an existing unnamed record with a saved credential. This legacy path
 warns that an old host may replay a retained exited session and return its old
 exit code instead of rejecting it as already ended. It never creates a
@@ -184,8 +216,9 @@ replacement. A named record's GUID does not bypass capability negotiation.
 
 Tokenless creation recovery on a 0.2 host still requires the matching 0.2 client.
 Finish legacy sessions before upgrading their host; restarting the broker does
-not preserve running shells. Failed `resume` or `terminate` lookup of an unused
-GUID does not reserve it or prevent its later first `connect`.
+not preserve running shells. A failed `terminate` lookup of an unused GUID does
+not reserve it or prevent its later first `connect`. Existing remote sessions
+do not gain the new in-memory command adapter when a client reconnects.
 
 </details>
 
@@ -198,18 +231,26 @@ Windows x64 and the pinned MSVC Rust toolchain are required. The C runtime is
 statically linked.
 
 ```text
-cargo test --locked -- --test-threads=1
+cargo test --locked --features test-unsigned-ipc -- --test-threads=1
 cargo run --locked --release --bin package
 ```
 
 The package builder writes `arterm.exe`, `arterm-host.exe`,
-`arTerm-Client-Setup.exe`, `arTerm-Host-Setup.exe`, `LICENSE`, and `SHA256SUMS`
+`arTerm-Client-Setup.exe`, `arTerm-Host-Setup.exe`, `LICENSE`,
+`THIRD-PARTY-NOTICES.txt`, and `SHA256SUMS`
 to `dist`. Installers embed only the project's own executables. For runtime-only
 builds:
 
 ```text
 cargo build --locked --release --bin arterm --bin arterm-host
 ```
+
+`test-unsigned-ipc` is an explicit debug-only fixture feature, off by default.
+Release builds must omit it; enabling it for release fails compilation.
+Production has no environment-variable or CLI authentication bypass.
+Unsigned functional tests do not establish signed-production IPC readiness.
+The separate signed CI gate exercises the actual signed CLI; see
+[SIGNING.md](SIGNING.md) for its procedure, not a claim that a run has passed.
 
 Tests exercise actual ConPTY processes, PID/state recovery, exit behavior,
 history non-insertion, and console alignment. Installer lifecycle tests use
@@ -231,6 +272,25 @@ Self-signed development downloads require the explicit trust procedure in
 organizational application-control policy are separate from certificate trust.
 Local package builds are unsigned by default. Neither a GitHub download nor
 source availability establishes Authenticode trust.
+
+<details>
+<summary>Local IPC application identity and trust limits</summary>
+
+The owner and caller mutually verify the actual OS-reported peer PID, image,
+and token context. Both need valid Windows Authenticode chain trust, the exact
+compiled public-certificate SHA-256, and byte-identical client images. Matching
+user SID, logon, Windows session, integrity, and elevation are also required.
+Filename or certificate subject alone, and arbitrary same-user programs, are
+not trusted. Unsigned, tampered, wrong-certificate, or different-build peers
+fail closed; a byte-identical `vsterm.exe` compatibility alias works.
+
+This is an application-identity gate, not a hard boundary against administrators,
+process injection, or other code invoking the legitimate CLI. arTerm does not
+automatically import a certificate or change trust. Use the existing
+[development trust guide](DEVELOPMENT-INSTALL.md) where policy permits it;
+the certificate has not been recreated.
+
+</details>
 
 <details>
 <summary>Maintainer signing and packaging sequence</summary>

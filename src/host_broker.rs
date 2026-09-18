@@ -24,7 +24,8 @@ use windows_sys::Win32::{
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, TerminateJobObject, QueryInformationJobObject,
+            JobObjectBasicAccountingInformation, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
         },
         Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
     },
@@ -33,6 +34,7 @@ use windows_sys::Win32::{
 use crate::host_pipe;
 use arterm::{
     deployment, store,
+    shell_integration::{Commands, CAPABILITY as COMMAND_CAPABILITY},
     wire::{self, bin16, binary, get, map, message, num, s, text, Frames},
 };
 
@@ -47,6 +49,9 @@ const CAPS: &[&str] = &[
     "resize-generation",
     "client-session-id",
     arterm::engine::ENDED_SESSION_CAPABILITY,
+    COMMAND_CAPABILITY,
+    "host-owner-management-v1",
+    "session-termination-confirmed",
 ];
 const MAX_SESSIONS: usize = 16;
 const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
@@ -103,6 +108,21 @@ impl Job {
             std::io::Error::last_os_error()
         );
         Ok(())
+    }
+}
+impl Job {
+    fn terminate(&self) -> Result<()> {
+        ensure!(unsafe { TerminateJobObject(self.0, 1) } != 0,
+            "cannot terminate session job: {}", std::io::Error::last_os_error());
+        Ok(())
+    }
+    fn empty(&self) -> Result<bool> {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        ensure!(unsafe { QueryInformationJobObject(self.0, JobObjectBasicAccountingInformation,
+            (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            std::mem::size_of_val(&info) as u32, std::ptr::null_mut()) } != 0,
+            "cannot inspect session job: {}", std::io::Error::last_os_error());
+        Ok(info.ActiveProcesses == 0)
     }
 }
 impl Drop for Job {
@@ -167,6 +187,7 @@ struct SessionState {
     exit: Option<u32>,
     exited_at: Option<Instant>,
     pid: u32,
+    commands: Option<Commands>,
 }
 struct Session {
     id: Uuid,
@@ -175,6 +196,7 @@ struct Session {
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    job: Job,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -186,6 +208,8 @@ struct Fingerprint {
     cwd: Option<String>,
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    command_execution: bool,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct Reservation {
@@ -206,7 +230,6 @@ struct Broker {
     reservations: Mutex<HashMap<Uuid, Reservation>>,
     create_lock: Mutex<()>,
     stopping: AtomicBool,
-    job: Job,
 }
 
 pub struct RunGuard {
@@ -280,6 +303,7 @@ fn load_reservation(root: &Path, request: Uuid) -> Result<Option<Reservation>> {
 
 impl Session {
     fn spawn(id: Uuid, token: Vec<u8>, fp: &Fingerprint) -> Result<Arc<Self>> {
+        let job = Job::new()?;
         let pair = native_pty_system().openpty(PtySize {
             rows: fp.rows,
             cols: fp.cols,
@@ -288,10 +312,16 @@ impl Session {
         })?;
         let mut command = CommandBuilder::new(&fp.shell);
         command.args(&fp.args);
+        let commands = if fp.command_execution {
+            ensure!(Commands::supported(&fp.shell, &fp.args), "CommandShellUnsupported");
+            let commands = Commands::new();
+            command.args(["-NoExit", "-EncodedCommand", &commands.bootstrap_encoded()]);
+            Some(commands)
+        } else { None };
         if let Some(cwd) = &fp.cwd {
             command.cwd(cwd);
         }
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(command)
             .with_context(|| format!("failed to start {}", fp.shell))?;
@@ -299,6 +329,7 @@ impl Session {
         let pid = child
             .process_id()
             .context("ConPTY child has no process id")?;
+        if let Err(error) = job.assign(pid) { let _ = child.kill(); return Err(error); }
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_INPUT_QUEUE);
@@ -316,10 +347,12 @@ impl Session {
                 exit: None,
                 exited_at: None,
                 pid,
+                commands,
             }),
             input: Mutex::new(Some(input_tx)),
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
+            job,
         });
         let weak = Arc::downgrade(&session);
         thread::spawn(move || {
@@ -363,6 +396,7 @@ impl Session {
                     let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
                     let mut state = session.state.lock().unwrap();
                     state.exit = Some(status.exit_code());
+                    if let Some(commands) = &mut state.commands { commands.exited(); }
                     state.exited_at = Some(Instant::now());
                     return;
                 }
@@ -370,6 +404,7 @@ impl Session {
                 Err(_) => {
                     let mut state = session.state.lock().unwrap();
                     state.exit = Some(1);
+                    if let Some(commands) = &mut state.commands { commands.exited(); }
                     state.exited_at = Some(Instant::now());
                     return;
                 }
@@ -379,6 +414,10 @@ impl Session {
     }
     fn push_output(&self, bytes: Vec<u8>) {
         let mut state = self.state.lock().unwrap();
+        let bytes = if let Some(commands) = &mut state.commands {
+            commands.output(&bytes)
+        } else { bytes };
+        if bytes.is_empty() { return; }
         let seq = state.next_output;
         state.next_output = state.next_output.saturating_add(1);
         state.output_bytes += bytes.len();
@@ -400,10 +439,34 @@ impl Session {
             }
         }
     }
-    fn terminate(&self) {
+    fn terminate(&self) -> Result<()> {
         self.input.lock().unwrap().take();
-        let _ = self.child.lock().unwrap().kill();
+        self.job.terminate()
     }
+}
+
+fn command_snapshot(id: Uuid, state: &SessionState, requested: Option<Uuid>) -> Value {
+    let commands = state.commands.as_ref();
+    let records = commands.map(|commands| {
+        if let Some(id) = requested { commands.record(id).into_iter().collect() }
+        else { commands.records() }
+    }).unwrap_or_default();
+    map(vec![
+        ("session_id", s(&id.to_string())),
+        ("shell_status", s(commands.map_or("unsupported", Commands::shell_status))),
+        ("input_ready", commands.map_or(true, Commands::input_ready).into()),
+        ("after_output_seq", (state.next_output - 1).into()),
+        ("command_id", requested.map(|id| s(&id.to_string())).unwrap_or(Value::Nil)),
+        ("lookup", s(if requested.is_some() && records.is_empty() { "unknown" } else { "known" })),
+        ("records", Value::Array(records.into_iter().map(|record| map(vec![
+            ("command_id", s(&record.command_id.to_string())),
+            ("request_hash", s(&record.request_hash)),
+            ("state", s(&record.state)),
+            ("succeeded", record.succeeded.map(Value::from).unwrap_or(Value::Nil)),
+            ("exit_code", record.exit_code.map(Value::from).unwrap_or(Value::Nil)),
+            ("interrupt_requested", record.interrupt_requested.into()),
+        ])).collect())),
+    ])
 }
 
 fn error(code: &str, detail: &str) -> Value {
@@ -422,6 +485,15 @@ fn parse_uuid16(value: &Value, key: &str) -> Result<Uuid> {
 }
 
 impl Broker {
+    fn inventory(&self, include_exited: bool) -> serde_json::Value {
+        let sessions = self.sessions.lock().unwrap().values().cloned().collect::<Vec<_>>();
+        serde_json::Value::Array(sessions.into_iter().filter_map(|session| {
+            let state = session.state.lock().unwrap();
+            if !include_exited && state.exit.is_some() { return None; }
+            Some(serde_json::json!({"id":session.id,"pid":state.pid,"exited":state.exit.is_some(),
+                "attached":state.attachment.is_some(),"state":if state.exit.is_some() {"exited"} else {"running"}}))
+        }).collect())
+    }
     fn new(root: PathBuf, pipe: String) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             root,
@@ -431,7 +503,6 @@ impl Broker {
             reservations: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
-            job: Job::new()?,
         }))
     }
     fn prune_exited(&self, now: Instant, retention: Duration, cap: usize) {
@@ -478,6 +549,8 @@ impl Broker {
             cwd,
             cols: num(body, "cols")?.try_into()?,
             rows: num(body, "rows")?.try_into()?,
+            command_execution: get(body, "command_execution").ok()
+                .map(|v| v.as_bool().context("invalid command_execution")).transpose()?.unwrap_or(false),
         };
         if let Some(existing) = self.reservations.lock().unwrap().get(&request_id).cloned() {
             ensure!(existing.fingerprint == fp, "CreateRequestConflict");
@@ -534,10 +607,6 @@ impl Broker {
         };
         save_reservation(&self.root, &reservation)?;
         let session = Session::spawn(session_id, token, &fp)?;
-        if let Err(error) = self.job.assign(session.state.lock().unwrap().pid) {
-            session.terminate();
-            return Err(error);
-        }
         reservation.active = true;
         save_reservation(&self.root, &reservation)?;
         self.reservations
@@ -577,8 +646,7 @@ impl Broker {
         match command {
             "status" => response["sessions"] = (self.sessions.lock().unwrap().len() as u64).into(),
             "sessions" => {
-                let sessions = self.sessions.lock().unwrap().values().map(|s| { let st=s.state.lock().unwrap(); serde_json::json!({"id":s.id,"pid":st.pid,"exited":st.exit.is_some(),"attached":st.attachment.is_some()}) }).collect::<Vec<_>>();
-                response["sessions"] = sessions.into();
+                response["sessions"] = self.inventory(true);
             }
             "terminate" => {
                 let id = Uuid::parse_str(
@@ -592,7 +660,7 @@ impl Broker {
                     .unwrap()
                     .get(&id)
                     .context("session not found")?
-                    .terminate();
+                    .terminate()?;
             }
             "stop" => {
                 let terminate = request
@@ -611,7 +679,7 @@ impl Broker {
                     response = serde_json::json!({"ok":false,"error":"live sessions exist; use --terminate-sessions"});
                 } else {
                     for session in live {
-                        session.terminate();
+                        session.terminate()?;
                     }
                     self.stopping.store(true, Ordering::SeqCst);
                 }
@@ -670,6 +738,10 @@ impl Broker {
             "protocol v1 is not supported by peer"
         );
         let client = bin16(hello_body, "client_instance_id")?;
+        let command_capable = get(hello_body, "capabilities")?.as_array()
+            .context("invalid capabilities")?.iter().any(|v| v.as_str() == Some(COMMAND_CAPABILITY));
+        let management_capable = get(hello_body, "capabilities")?.as_array().context("invalid capabilities")?
+            .iter().any(|v| v.as_str() == Some("host-owner-management-v1"));
         send(
             &mut output,
             message(
@@ -688,6 +760,7 @@ impl Broker {
         )?;
         let mut attached: Option<(Arc<Session>, Vec<u8>, u64)> = None;
         let mut cursor = 0u64;
+        let mut command_revision = None;
         let mut last_peer = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -696,7 +769,28 @@ impl Broker {
                     let kind = text(&value, "type")?;
                     let body = get(&value, "body")?;
                     match kind {
-                        "CreateSession" => match self.create(body, &client) {
+                        "ListSessions" => {
+                            // The accepted host pipe authenticates the Windows owner/logon context.
+                            // The remote transport must launch the native helper as that owner.
+                            // A session token is deliberately not used as inventory authority.
+                            if !management_capable {
+                                send(&mut output, error("ManagementCapabilityRequired", "owner inventory was not negotiated"))?;
+                            } else {
+                                let inventory = serde_json::json!({
+                                    "authorization_scope":"host-windows-owner",
+                                    "broker_instance_id":self.instance.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                                    "sessions":self.inventory(false),
+                                });
+                                send(&mut output, message("SessionInventory", map(vec![
+                                    ("json", s(&serde_json::to_string(&inventory)?)),
+                                ])))?;
+                            }
+                        }
+                        "CreateSession" => match (|| {
+                            ensure!(command_capable || get(body, "command_execution").ok().and_then(Value::as_bool) != Some(true),
+                                "CommandCapabilityRequired");
+                            self.create(body, &client)
+                        })() {
                             Ok((session, recovered, attachment)) => {
                                 if recovered {
                                     send(
@@ -742,6 +836,7 @@ impl Broker {
                                         ),
                                     )?;
                                     attached = Some((session, attachment.id, attachment.epoch));
+                                    command_revision = None;
                                 }
                             }
                             Err(e) => {
@@ -782,7 +877,7 @@ impl Broker {
                                 )?;
                                 continue;
                             }
-                            session.terminate();
+                            session.terminate()?;
                             send(
                                 &mut output,
                                 message(
@@ -790,6 +885,20 @@ impl Broker {
                                     map(vec![("session_id", s(&id.to_string()))]),
                                 ),
                             )?;
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            loop {
+                                if session.state.lock().unwrap().exit.is_some() && session.job.empty()? {
+                                    send(&mut output, message("SessionTerminated", map(vec![
+                                        ("session_id", s(&id.to_string())),
+                                    ])))?;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    send(&mut output, error("TerminationUnconfirmed", "termination requested; process exit not confirmed"))?;
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(20));
+                            }
                         }
                         "AttachSession" => {
                             let id = Uuid::parse_str(text(body, "session_id")?)?;
@@ -880,6 +989,66 @@ impl Broker {
                                 ),
                             )?;
                             attached = Some((session, attachment.id, epoch));
+                            command_revision = None;
+                        }
+                        "CommandSubmit" | "CommandStatus" | "CommandInterrupt" | "SessionInterrupt" => {
+                            let result = (|| -> Result<Value> {
+                                ensure!(command_capable, "CommandCapabilityRequired");
+                                let (session, attachment_id, epoch) = attached.as_ref().context("CommandNotAttached")?;
+                                ensure!(text(body, "session_id")? == session.id.to_string(), "CommandSessionMismatch");
+                                let sender = session.input.lock().unwrap().as_ref().cloned().context("CommandInputClosed")?;
+                                let mut state = session.state.lock().unwrap();
+                                let attachment = state.attachment.as_ref().context("CommandLeaseRevoked")?;
+                                ensure!(attachment.id == *attachment_id
+                                    && bin16(body, "attachment_id")? == *attachment_id
+                                    && binary(body, "lease_id")? == attachment.lease
+                                    && bin16(body, "client_instance_id")? == client
+                                    && attachment.client == client
+                                    && num(body, "connection_epoch")? == *epoch
+                                    && attachment.epoch == *epoch, "CommandLeaseRevoked");
+                                ensure!(state.exit.is_none(), "CommandSessionEnded");
+                                if kind == "SessionInterrupt" {
+                                    ensure!(state.commands.as_ref().and_then(Commands::active).is_none(),
+                                        "CommandInterruptTargetChanged");
+                                    sender.try_send(vec![3]).context("SessionInterruptDeliveryFailed")?;
+                                    return Ok(map(vec![
+                                        ("session_id", s(&session.id.to_string())),
+                                        ("command_id", get(body, "command_id")?.clone()),
+                                        ("operation_id", get(body, "operation_id")?.clone()),
+                                    ]));
+                                }
+                                let commands = state.commands.as_mut().context("CommandShellUnsupported")?;
+                                let id = Uuid::parse_str(text(body, "command_id")?)?;
+                                if kind == "CommandSubmit" {
+                                    let (_, bytes) = commands.submit(id, text(body, "command")?)?;
+                                    if let Some(bytes) = bytes {
+                                        if let Err(error) = sender.try_send(bytes) {
+                                            commands.submission_failed(id);
+                                            bail!("CommandDeliveryUnknown: {error}");
+                                        }
+                                    }
+                                } else if kind == "CommandInterrupt" {
+                                    commands.interrupt(id)?;
+                                    sender.try_send(vec![3]).context("CommandInterruptDeliveryFailed")?;
+                                }
+                                let mut snapshot = command_snapshot(session.id, &state, Some(id));
+                                if let (Value::Map(fields), Ok(operation)) = (&mut snapshot, get(body, "operation_id")) {
+                                    fields.push((s("operation_id"), operation.clone()));
+                                }
+                                Ok(snapshot)
+                            })();
+                            match result {
+                                Ok(body) => send(&mut output, message(
+                                    if kind == "CommandSubmit" { "CommandAccepted" }
+                                    else if kind == "CommandInterrupt" { "CommandInterruptAccepted" }
+                                    else if kind == "SessionInterrupt" { "SessionInterruptAccepted" }
+                                    else { "CommandStatus" }, body))?,
+                                Err(error) => send(&mut output, message("CommandRejected", map(vec![
+                                    ("code", s(&error.to_string())),
+                                    ("command_id", get(body, "command_id").cloned().unwrap_or(Value::Nil)),
+                                    ("operation_id", get(body, "operation_id").cloned().unwrap_or(Value::Nil)),
+                                ])))?,
+                            }
                         }
                         "Input" => {
                             if let Some((session, attachment_id, _)) = &attached {
@@ -907,6 +1076,19 @@ impl Broker {
                                     continue;
                                 }
                                 if seq == st.input_committed + 1 {
+                                    if let Some(commands) = &mut st.commands {
+                                        if commands.input(&bytes).is_err() {
+                                            drop(st);
+                                            send(&mut output, message(
+                                                if command_capable { "InputRejected" } else { "Error" }, map(vec![
+                                                ("session_id", s(&session.id.to_string())),
+                                                ("input_seq", seq.into()),
+                                                ("code", s("CommandBusy")),
+                                                ("detail", s("human input rejected while managed command owns input")),
+                                            ])))?;
+                                            continue;
+                                        }
+                                    }
                                     match input_sender
                                         .context("PTY input closed")?
                                         .try_send(bytes.clone())
@@ -1085,6 +1267,10 @@ impl Broker {
                     .collect::<Vec<_>>();
                 let exit = st.exit;
                 let latest = st.next_output - 1;
+                let revision = st.commands.as_ref().map(|commands| commands.revision);
+                let command_update = if command_capable && revision != command_revision {
+                    Some(command_snapshot(session.id, &st, None))
+                } else { None };
                 drop(st);
                 for chunk in chunks {
                     send(
@@ -1099,6 +1285,10 @@ impl Broker {
                         ),
                     )?;
                     cursor = chunk.seq;
+                }
+                if let Some(update) = command_update {
+                    send(&mut output, message("CommandState", update))?;
+                    command_revision = revision;
                 }
                 if let Some(code) = exit {
                     if cursor >= latest {
@@ -1185,7 +1375,7 @@ fn run_at_with_transport<T>(root: PathBuf, start: impl FnOnce() -> Result<T>) ->
         .cloned()
         .collect::<Vec<_>>();
     for session in sessions {
-        session.terminate();
+        session.terminate()?;
     }
     let _ = fs::remove_file(root.join("host").join("broker.json"));
     Ok(())

@@ -44,7 +44,10 @@ pub struct State {
     pub ended: bool,
     #[serde(default)]
     pub reference: Option<String>,
+    #[serde(default = "legacy_command_execution")]
+    pub command_execution: Option<bool>,
 }
+fn legacy_command_execution() -> Option<bool> { Some(false) }
 impl State {
     pub fn new(box_name: String, shell: String, args: Vec<String>, cwd: Option<String>) -> Self {
         Self {
@@ -69,6 +72,7 @@ impl State {
             pending: None,
             ended: false,
             reference: None,
+            command_execution: None,
         }
     }
 }
@@ -327,6 +331,15 @@ pub fn random_claim() -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_records_do_not_opt_into_command_integration() {
+        let state = super::State::new("target".into(), "powershell.exe".into(), vec![], None);
+        assert_eq!(state.command_execution, None);
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("command_execution");
+        let old: super::State = serde_json::from_value(value).unwrap();
+        assert_eq!(old.command_execution, Some(false));
+    }
     use super::*;
     #[test]
     fn existing_only_guid_lookup_preserves_legacy_state_and_interrupted_reservations() {

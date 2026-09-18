@@ -12,6 +12,14 @@ use std::{
 };
 use uuid::Uuid;
 
+fn client_executable() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var("SIGNED_CLIENT").unwrap_or_else(|_| option_env!("CARGO_BIN_EXE_arterm").unwrap().into()))
+}
+fn host_executable() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var("SIGNED_HOST").unwrap_or_else(|_| option_env!("CARGO_BIN_EXE_arterm-host").unwrap().into()))
+}
 fn s(v: &str) -> Value {
     v.into()
 }
@@ -30,15 +38,15 @@ fn send(socket: &Arc<Mutex<TcpStream>>, value: Value) {
     let mut socket = socket.lock().unwrap();
     let _ = rmpv::encode::write_value(&mut *socket, &value);
 }
-struct Fixture {
-    home: PathBuf,
+pub(crate) struct Fixture {
+    pub(crate) home: PathBuf,
     host: Child,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let home = std::env::temp_dir().join(format!("devbox-native-e2e-{}", Uuid::now_v7()));
         fs::create_dir_all(&home).unwrap();
-        let host = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
+        let host = Command::new(host_executable())
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
             .stdin(Stdio::null())
@@ -65,7 +73,7 @@ impl Fixture {
             );
             thread::sleep(Duration::from_millis(100));
         }
-        let registered = Command::new(env!("CARGO_BIN_EXE_arterm"))
+        let registered = Command::new(client_executable())
             .env("VSTERM_REMOTE_HOME", &fixture.home)
             .args([
                 "add",
@@ -73,7 +81,7 @@ impl Fixture {
                 "--tunnel",
                 "fixture",
                 "--host-path",
-                env!("CARGO_BIN_EXE_arterm-host"),
+                host_executable(),
             ])
             .output()
             .unwrap();
@@ -85,7 +93,7 @@ impl Fixture {
         fixture
     }
     fn host_command(&self, verb: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_arterm-host"));
+        let mut command = Command::new(host_executable());
         command.env("VSTERM_REMOTE_HOME", &self.home).arg(verb);
         command
     }
@@ -112,8 +120,8 @@ impl Fixture {
             thread::sleep(Duration::from_millis(50));
         }
     }
-    fn client(&self, verb: &str, id: Option<&str>, addr: &str) -> RunningClient {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_arterm"));
+    pub(crate) fn client(&self, verb: &str, id: Option<&str>, addr: &str) -> RunningClient {
+        let mut command = Command::new(client_executable());
         command
             .env("VSTERM_REMOTE_HOME", &self.home)
             .env("VSTERM_HISTORY_PATH", self.home.join("powershell-history.txt"))
@@ -125,7 +133,7 @@ impl Fixture {
         }
         command.args(["--address", addr, "--stdio", "--retries", "2"]);
         if verb == "connect" {
-            command.args(["--shell", "powershell.exe"]);
+            command.args(["--shell", &std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into())]);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -173,7 +181,7 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.home);
     }
 }
-struct RunningClient {
+pub(crate) struct RunningClient {
     child: Child,
     input: ChildStdin,
     rx: mpsc::Receiver<(bool, Vec<u8>)>,
@@ -181,7 +189,7 @@ struct RunningClient {
     err: String,
 }
 impl RunningClient {
-    fn wait_for(&mut self, predicate: impl Fn(&str, &str) -> bool) {
+    pub(crate) fn wait_for(&mut self, predicate: impl Fn(&str, &str) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !predicate(&self.out, &self.err) {
             assert!(
@@ -204,12 +212,12 @@ impl RunningClient {
             }
         }
     }
-    fn command(&mut self, command: &str) {
+    pub(crate) fn command(&mut self, command: &str) {
         self.input.write_all(command.as_bytes()).unwrap();
         self.input.write_all(b"\r\n").unwrap();
         self.input.flush().unwrap();
     }
-    fn detach(&mut self) {
+    pub(crate) fn detach(&mut self) {
         self.input.write_all(&[0x1d]).unwrap();
         self.input.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -255,13 +263,16 @@ impl Drop for RunningClient {
     }
 }
 
-fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receiver<TcpStream>) {
+pub(crate) fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receiver<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for _ in 0..attachments {
             let (mut incoming, _) = listener.accept().unwrap();
+            let home = home.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
             incoming
                 .set_read_timeout(Some(Duration::from_secs(45)))
                 .unwrap();
@@ -283,9 +294,9 @@ fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receiver<TcpStream
             let params = get(&spawn, "params");
             assert_eq!(
                 get(params, "command").as_str(),
-                Some(env!("CARGO_BIN_EXE_arterm-host"))
+                Some(host_executable())
             );
-            let mut bridge = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
+            let mut bridge = Command::new(host_executable())
                 .args(["bridge", "--protocol", "vsterm-session-v1"])
                 .env("VSTERM_REMOTE_HOME", &home)
                 .stdin(Stdio::piped())
@@ -377,6 +388,7 @@ fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receiver<TcpStream
             }
             let _ = bridge.kill();
             let _ = bridge.wait();
+            });
         }
     });
     (addr, rx)
@@ -394,6 +406,7 @@ fn pid_marker(text: &str, prefix: &str, suffix: &str) -> Option<String> {
 }
 
 #[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn real_shell_survives_network_loss_detach_and_resume() {
     let fixture = Fixture::new();
     let (addr, connections) = relay(fixture.home.clone(), 5);
@@ -440,7 +453,7 @@ fn real_shell_survives_network_loss_detach_and_resume() {
     );
     assert_eq!(resumed.guid(), id);
     resumed.detach();
-    let mut legacy = fixture.client("resume", Some(&id), &addr);
+    let mut legacy = fixture.client("connect", Some(&id), &addr);
     let _legacy = connections.recv_timeout(Duration::from_secs(10)).unwrap();
     legacy.command("Write-Output ('LEGACY=' + $PID + ':' + $global:KeepMe)");
     legacy.wait_for(|out, _| pid_marker(out, "LEGACY=", ":resumable").is_some());
@@ -458,6 +471,7 @@ fn real_shell_survives_network_loss_detach_and_resume() {
 }
 
 #[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
     for code in [0, 7] {
         let fixture = Fixture::new();
@@ -480,7 +494,155 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
     }
 }
 
+    #[test]
+    #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+    pub(crate) fn headless_connection_supports_cross_cwd_read_list_and_detach() {
+        struct Headless(Child);
+        impl Drop for Headless {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let fixture = Fixture::new();
+        let (addr, connections) = relay(fixture.home.clone(), 3);
+        let mut first = fixture.client("connect", Some("Automation"), &addr);
+        first.command("$global:KeepMe='ipc'; 1..600 | ForEach-Object { Write-Output ('x' * 200) }; Write-Output ('READY=' + $PID + ':ipc')");
+        first.wait_for(|out, _| pid_marker(out, "READY=", ":ipc").is_some());
+        let pid = pid_marker(&first.out, "READY=", ":ipc").unwrap();
+        let id = first.guid();
+        first.command("Write-Output ('HUMAN-SLEEP='+$PID+':ipc'); Start-Sleep -Seconds 30");
+        first.wait_for(|out, _| pid_marker(out, "HUMAN-SLEEP=", ":ipc").is_some());
+        let interrupted = Command::new(client_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args(["interrupt", "fixture", "automation", "--json"]).output().unwrap();
+        assert!(interrupted.status.success(), "{} {}", String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
+        first.command("Write-Output ('HUMAN-AFTER='+$PID+':ipc')");
+        first.wait_for(|out, _| pid_marker(out, "HUMAN-AFTER=", ":ipc").is_some());
+        assert_eq!(pid_marker(&first.out, "HUMAN-AFTER=", ":ipc").unwrap(), pid);
+        let _first_connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+        first.detach();
+        let mut background = Headless(Command::new(client_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .current_dir(std::env::temp_dir())
+            .args(["connect", "fixture", "automation", "--address", &addr, "--retries", "0"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap());
+        let _background_connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+        let control = |args: &[&str]| Command::new(std::env::var("SIGNED_CONTROLLER").unwrap_or_else(|_| client_executable().into()))
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .current_dir(std::env::temp_dir())
+            .args(args).output().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = background.0.try_wait().unwrap() {
+                let mut error = String::new();
+                background.0.stderr.take().unwrap().read_to_string(&mut error).unwrap();
+                panic!("headless client exited {status}: {error}");
+            }
+            let output = control(&["read", "fixture", "AUTOMATION", "--json"]);
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("READY=") { break; }
+            assert!(Instant::now() < deadline, "IPC read failed: {}", String::from_utf8_lossy(&output.stderr));
+            thread::sleep(Duration::from_millis(50));
+        }
+        let listed = control(&["list", "--client", "--json"]);
+        assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+        let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(owners.as_array().unwrap().len(), 1);
+        assert_eq!(owners[0]["identity"]["session_id"], id);
+        let command_id = Uuid::now_v7().to_string();
+        let started = Instant::now();
+        let sent = control(&["send", "fixture", "automation", "--command", "$KeepMe='ipc'; $Counter=1; Write-Output ('CONTROL='+$PID+':ipc')",
+            "--command-id", &command_id, "--wait", "--timeout", "60s", "--json"]);
+        assert!(sent.status.success(), "{} {}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr));
+        assert!(started.elapsed() < Duration::from_secs(5), "wait did not return early");
+        let completed: serde_json::Value = serde_json::from_slice(&sent.stdout).unwrap();
+        assert_eq!(completed["status"], "completed");
+        let timed = control(&["send", "fixture", "automation", "--command", "Start-Sleep -Seconds 2; $Counter++",
+            "--wait", "--timeout", "1s", "--json"]);
+        assert_eq!(timed.status.code(), Some(124), "{} {}", String::from_utf8_lossy(&timed.stdout), String::from_utf8_lossy(&timed.stderr));
+        let timed: serde_json::Value = serde_json::from_slice(&timed.stdout).unwrap();
+        let timed_id = timed["command_id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let query = control(&["read", "fixture", "automation", "--command-id", timed_id, "--json"]);
+            assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "completed" { break; }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(30));
+        }
+        let duplicate = control(&["send", "fixture", "automation", "--command",
+            "$KeepMe='ipc'; $Counter=1; Write-Output ('CONTROL='+$PID+':ipc')", "--command-id", &command_id, "--json"]);
+        assert!(duplicate.status.success(), "{}", String::from_utf8_lossy(&duplicate.stdout));
+        assert!(!control(&["send", "fixture", "automation", "--command", "$Counter=999", "--command-id", &command_id, "--json"]).status.success());
+        let abandoned_id = Uuid::now_v7().to_string();
+        let mut waiter = Headless(Command::new(client_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args(["send", "fixture", "automation", "--command", "Start-Sleep -Seconds 2; $CallerGone='survived'",
+                "--command-id", &abandoned_id, "--wait", "--timeout", "60s", "--json"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let query = control(&["read", "fixture", "automation", "--command-id", &abandoned_id, "--json"]);
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "running" { break; }
+            assert!(Instant::now() < deadline, "{query}");
+        }
+        waiter.0.kill().unwrap();
+        waiter.0.wait().unwrap();
+        loop {
+            let query = control(&["read", "fixture", "automation", "--command-id", &abandoned_id, "--json"]);
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "completed" {
+                assert_eq!(query["record"]["succeeded"], true);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let slow = control(&["send", "fixture", "automation", "--command", "Start-Sleep -Seconds 30", "--json"]);
+        assert!(slow.status.success(), "{}", String::from_utf8_lossy(&slow.stdout));
+        let slow: serde_json::Value = serde_json::from_slice(&slow.stdout).unwrap();
+        let slow_id = slow["command_id"].as_str().unwrap();
+        loop {
+            let query = control(&["read", "fixture", "automation", "--command-id", slow_id, "--json"]);
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "running" { break; }
+            assert!(Instant::now() < deadline);
+        }
+        assert!(!control(&["send", "fixture", "automation", "--command", "$Counter=999", "--json"]).status.success());
+        let interrupted = control(&["interrupt", "fixture", "automation", "--json"]);
+        assert!(interrupted.status.success(), "{} {}", String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
+        loop {
+            let query = control(&["read", "fixture", "automation", "--command-id", slow_id, "--json"]);
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "completed" { break; }
+            assert!(Instant::now() < deadline);
+        }
+        let after_command = control(&["send", "fixture", "automation", "--command", "Write-Output ('COUNTER='+$Counter)",
+            "--wait", "--timeout", "60s", "--json"]);
+        assert!(after_command.status.success(), "{} {}", String::from_utf8_lossy(&after_command.stdout), String::from_utf8_lossy(&after_command.stderr));
+        let output = control(&["read", "fixture", "automation", "--lines", "20", "--json"]);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("COUNTER=2"), "{}", String::from_utf8_lossy(&output.stdout));
+        assert!(!control(&["read", "fixture", "missing"]).status.success());
+        assert!(!control(&["read", "othermachine", "automation"]).status.success());
+        assert!(!control(&["connect", "fixture", "automation", "--address", &addr, "--retries", "0"]).status.success());
+        let detached = control(&["detach", "fixture", "automation", "--json"]);
+        assert!(detached.status.success(), "{}", String::from_utf8_lossy(&detached.stderr));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = background.0.try_wait().unwrap() { assert!(status.success()); break; }
+            assert!(Instant::now() < deadline, "IPC detach did not stop local client");
+            thread::sleep(Duration::from_millis(20));
+        }
+        fixture.wait_for_session_state(&id, false, false);
+        let mut again = fixture.client("connect", Some("automation"), &addr);
+        let _again_connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+        again.command("Write-Output ('AFTER=' + $PID + ':' + $global:KeepMe)");
+        again.wait_for(|out, _| pid_marker(out, "AFTER=", ":ipc").is_some());
+        assert_eq!(pid_marker(&again.out, "AFTER=", ":ipc").unwrap(), pid);
+        again.detach();
+    }
+
 #[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn named_termination_is_durable_and_never_recreates() {
     let fixture = Fixture::new();
     let (addr, connections) = relay(fixture.home.clone(), 2);
@@ -489,9 +651,9 @@ fn named_termination_is_durable_and_never_recreates() {
     client.wait_for(|out, _| pid_marker(out, "READY=", ":terminate").is_some());
     let _connection = connections.recv_timeout(Duration::from_secs(5)).unwrap();
     client.detach();
-    let output = Command::new(env!("CARGO_BIN_EXE_arterm"))
+    let output = Command::new(client_executable())
         .env("VSTERM_REMOTE_HOME", &fixture.home)
-        .args(["terminate", "fixture", "terminateme", "--yes", "--address", &addr])
+        .args(["terminate", "fixture", "terminateme", "--address", &addr])
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let mut later = fixture.client("connect", Some("TerminateMe"), &addr);
@@ -500,6 +662,73 @@ fn named_termination_is_durable_and_never_recreates() {
 }
 
 #[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn server_inventory_and_exact_termination_preserve_neighbor_session() {
+    use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{OpenProcess, WaitForSingleObject}};
+    struct Process(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Process { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+    let fixture = Fixture::new();
+    let (addr, _connections) = relay(fixture.home.clone(), 10);
+    let invoke = |args: &[&str]| Command::new(client_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+    let inventory = || {
+        let output = invoke(&["list", "--server", "fixture", "--address", &addr, "--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let mut victim = fixture.client("connect", Some("Victim"), &addr);
+    victim.command("$child=Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 120' -PassThru; Write-Output ('CHILD='+$child.Id+':child'); Write-Output ('VICTIM='+$PID+':live')");
+    victim.wait_for(|out, _| pid_marker(out, "VICTIM=", ":live").is_some());
+    let child_pid: u32 = pid_marker(&victim.out, "CHILD=", ":child").unwrap().parse().unwrap();
+    let child = Process(unsafe { OpenProcess(0x00100000, 0, child_pid) }); // SYNCHRONIZE, test-owned child only.
+    assert!(!child.0.is_null());
+    let victim_id = victim.guid();
+    let mut neighbor = fixture.client("connect", Some("Neighbor"), &addr);
+    neighbor.command("$Keep='neighbor'; Write-Output ('NEIGHBOR='+$PID+':alive')");
+    neighbor.wait_for(|out, _| pid_marker(out, "NEIGHBOR=", ":alive").is_some());
+    let neighbor_pid = pid_marker(&neighbor.out, "NEIGHBOR=", ":alive").unwrap();
+    let list = inventory();
+    assert_eq!(list["authorization_scope"], "host-windows-owner");
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
+    assert!(list["sessions"].as_array().unwrap().iter().any(|s| s["local_reference"] == "victim" && s["attached"] == true));
+    let ended = invoke(&["terminate", "fixture", "VICTIM", "--json"]);
+    assert!(ended.status.success(), "{} {}", String::from_utf8_lossy(&ended.stdout), String::from_utf8_lossy(&ended.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&ended.stdout).unwrap()["status"], "terminated");
+    victim.wait_exit(1);
+    assert_eq!(unsafe { WaitForSingleObject(child.0, 0) }, 0, "session descendant survived confirmed termination");
+    assert!(!inventory()["sessions"].as_array().unwrap().iter().any(|s| s["id"] == victim_id));
+    neighbor.command("Write-Output ('AFTER='+$PID+':alive'); Write-Output $Keep");
+    neighbor.wait_for(|out, _| pid_marker(out, "AFTER=", ":alive").is_some());
+    assert_eq!(pid_marker(&neighbor.out, "AFTER=", ":alive").unwrap(), neighbor_pid);
+    let mut detached = fixture.client("connect", Some("Dormant"), &addr);
+    detached.command("Write-Output ('DETACHED='+$PID+':live')");
+    detached.wait_for(|out, _| pid_marker(out, "DETACHED=", ":live").is_some());
+    let detached_id = detached.guid();
+    detached.detach();
+    assert!(inventory()["sessions"].as_array().unwrap().iter().any(|s| s["id"] == detached_id && s["attached"] == false));
+    let ended = invoke(&["terminate", "fixture", "dormant", "--address", &addr, "--json"]);
+    assert!(ended.status.success(), "{}", String::from_utf8_lossy(&ended.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&ended.stdout).unwrap()["status"], "terminated");
+    assert_eq!(inventory()["sessions"].as_array().unwrap().len(), 1);
+    assert!(!invoke(&["connect", "fixture", "victim", "--address", &addr, "--retries", "0"]).status.success());
+    assert!(!invoke(&["connect", "fixture", "dormant", "--address", &addr, "--retries", "0"]).status.success());
+    neighbor.detach();
+    let unowned = fixture.home.join("inventory-only");
+    fs::create_dir_all(unowned.join("client")).unwrap();
+    fs::copy(fixture.home.join("client").join("config.json"), unowned.join("client").join("config.json")).unwrap();
+    let output = Command::new(client_executable())
+        .env("VSTERM_REMOTE_HOME", &unowned)
+        .args(["list", "--server", "fixture", "--address", &addr, "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inventory["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["sessions"][0]["attached"], false);
+    assert_eq!(inventory["sessions"][0]["local_reference"], serde_json::Value::Null);
+    assert_eq!(inventory["sessions"][0]["has_local_recovery_record"], false);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn exit_while_detached_is_an_error_on_later_connect() {
     let fixture = Fixture::new();
     let (addr, connections) = relay(fixture.home.clone(), 2);

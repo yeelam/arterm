@@ -1,5 +1,4 @@
-#[path = "diagnostics.rs"]
-mod diagnostics;
+use crate::diagnostics;
 use crate::{
     console::{Input, Terminal},
     store::{PendingInput, State},
@@ -44,6 +43,9 @@ pub struct Engine {
     resize_generation: u64,
     last_size: (u16, u16),
     allow_legacy_resume: bool,
+    command_capable: bool,
+    active_command: Option<uuid::Uuid>,
+    command_input_ready: bool,
 }
 
 #[cfg(test)]
@@ -94,6 +96,7 @@ mod tests {
         unavailable: bool,
         reject_input: Option<&'static str>,
         supports_ended_rejection: bool,
+        supports_commands: bool,
         exit_on_attach: Option<u32>,
     }
     impl FakeLink {
@@ -113,6 +116,7 @@ mod tests {
                 unavailable: false,
                 reject_input: None,
                 supports_ended_rejection: true,
+                supports_commands: false,
                 exit_on_attach: None,
             }
         }
@@ -134,6 +138,7 @@ mod tests {
                             "capabilities",
                             Value::Array(CAPS.iter().copied()
                                 .chain(self.supports_ended_rejection.then_some(ENDED_SESSION_CAPABILITY))
+                                .chain(self.supports_commands.then_some(crate::shell_integration::CAPABILITY))
                                 .map(s).collect()),
                         ),
                         ("max_frame", (1024 * 1024).into()),
@@ -335,11 +340,13 @@ mod tests {
             Ok(())
         };
         server.lose_create = true;
+        server.supports_commands = true;
         assert_eq!(
             engine.run(&mut server, &mut terminal, &mut save).unwrap(),
             End::Disconnected
         );
         assert!(engine.state.token.is_none());
+        assert_eq!(engine.state.command_execution, Some(true));
         server.recovered = true;
         assert_eq!(
             engine.run(&mut server, &mut terminal, &mut save).unwrap(),
@@ -535,6 +542,9 @@ impl Engine {
             resize_generation: 0,
             last_size: (0, 0),
             allow_legacy_resume: false,
+            command_capable: false,
+            active_command: None,
+            command_input_ready: false,
         }
     }
     /// Explicit GUID resume may attach to an older host with an existing credential.
@@ -632,6 +642,7 @@ impl Engine {
                 ("cols", self.state.create_cols.into()),
                 ("rows", self.state.create_rows.into()),
                 ("attach_mode", s("writer")),
+                ("command_execution", self.state.command_execution.unwrap_or(false).into()),
                 ("after_output_seq", 0.into()),
             ]),
         )
@@ -677,8 +688,10 @@ impl Engine {
         self.attachment = None;
         self.lease = None;
         self.pending_sent = false;
+        self.command_input_ready = false;
         self.credit = 0;
         let mut phase = "hello";
+        terminal.connection_state("connecting");
         let mut last_received = Instant::now();
         let mut heartbeat = Instant::now();
         let mut pending_since = self.state.pending.as_ref().map(|_| Instant::now());
@@ -701,7 +714,7 @@ impl Engine {
                 (
                     "capabilities",
                     Value::Array(CAPS.iter().copied()
-                        .chain(std::iter::once(ENDED_SESSION_CAPABILITY)).map(s).collect()),
+                        .chain([ENDED_SESSION_CAPABILITY, crate::shell_integration::CAPABILITY]).map(s).collect()),
                 ),
                 ("max_receive_frame", (crate::wire::MAX_FRAME as u64).into()),
             ]),
@@ -710,6 +723,13 @@ impl Engine {
             return Ok(End::Disconnected);
         }
         loop {
+            if terminal.detach_requested() {
+                if self.attachment.is_some() {
+                    let _ = link.send(&self.detach()?);
+                }
+                terminal.reading(false);
+                return Ok(End::Detached);
+            }
             let polled = match link.poll(Duration::from_millis(30)) {
                 Ok(p) => p,
                 Err(error)
@@ -741,6 +761,8 @@ impl Engine {
                         let caps = get(body, "capabilities")?
                             .as_array()
                             .context("invalid capabilities")?;
+                        self.command_capable = caps.iter().any(|v| v.as_str() == Some(crate::shell_integration::CAPABILITY));
+                        terminal.command_capability(self.command_capable);
                         ensure!(
                             CAPS.iter()
                                 .all(|c| caps.iter().any(|v| v.as_str() == Some(c))),
@@ -749,7 +771,7 @@ impl Engine {
                         if !caps.iter().any(|value| value.as_str() == Some(ENDED_SESSION_CAPABILITY)) {
                             ensure!(
                                 self.allow_legacy_resume,
-                                "host lacks ended-session-rejection; reusable connect and named resume require arTerm host 0.3 or later. No create or attach was sent. Use explicit resume TARGET GUID with an existing legacy credential to finish old sessions before upgrading the host"
+                                "host lacks ended-session-rejection; named connections require arTerm host 0.3 or later. No create or attach was sent. Only an existing unnamed GUID credential can connect to a legacy host"
                             );
                             diagnostics::line(format_args!(
                                 "[session] Legacy GUID resume: host lacks ended-session rejection; a retained exited session may report its old exit code. Finish existing sessions before upgrading the host."
@@ -764,6 +786,15 @@ impl Engine {
                             self.credit >= 4096,
                             "host input window must support a 4096-byte chunk"
                         );
+                        let choice_changed = self.state.command_execution.is_none();
+                        if choice_changed {
+                            self.state.command_execution = Some(self.command_capable
+                                && self.state.origin.is_none() && self.state.token.is_none()
+                                && self.state.create_deadline_ms.is_none()
+                                && crate::shell_integration::Commands::supported(&self.state.shell, &self.state.args));
+                        }
+                        ensure!(!self.state.command_execution.unwrap_or(false) || self.command_capable,
+                            "saved command-enabled creation requires command-execution-v1; refusing fingerprint change");
                         let broker = bin16(body, "broker_instance_id")?;
                         if let Some(origin) = &self.state.origin {
                             if *origin != broker {
@@ -771,6 +802,7 @@ impl Engine {
                                 save(&self.state)?;
                                 bail!("Terminal host restarted; refusing to recreate session or replay uncertain input");
                             }
+                            if choice_changed { save(&self.state)?; }
                         } else {
                             self.state.origin = Some(broker);
                             self.state.create_cols = terminal.size().0;
@@ -829,6 +861,7 @@ impl Engine {
                             self.lease = Some(bin16(body, "lease_id")?);
                             self.last_size = (0, 0);
                             phase = "attached";
+                            terminal.connection_state("connected");
                         }
                         diagnostics::line(format_args!("[session] {}", self.state.id));
                     }
@@ -849,6 +882,7 @@ impl Engine {
                         self.resize_generation = num(body, "resize_generation")?;
                         self.last_size = (0, 0);
                         phase = "attached";
+                        terminal.connection_state("connected");
                     }
                     "Output" if phase == "attached" => {
                         self.same_session(body)?;
@@ -863,6 +897,7 @@ impl Engine {
                             );
                             terminal.output(&binary(body, "bytes")?)?;
                             self.output_seq = seq;
+                            terminal.command_output_progress(seq);
                         }
                         let mut fields = self.attached()?;
                         fields.push(("delivered_through", self.output_seq.into()));
@@ -873,6 +908,7 @@ impl Engine {
                         self.same_session(body)?;
                     }
                     "ReplayGap" if phase == "attached" => {
+                        terminal.output_gap();
                         self.same_session(body)?;
                         ensure!(
                             num(body, "requested_after")? == self.output_seq,
@@ -892,6 +928,30 @@ impl Engine {
                         );
                         self.acknowledge_input(num(body, "committed_through")?, save)?;
                         self.credit = num(body, "available_window_bytes")?.min(65536);
+                    }
+                    "CommandState" | "CommandAccepted" | "CommandStatus" | "CommandRejected"
+                    | "CommandInterruptAccepted" | "SessionInterruptAccepted" if phase == "attached" && self.command_capable => {
+                        if let Ok(value) = get(body, "input_ready") {
+                            self.command_input_ready = value.as_bool().context("invalid input_ready")?;
+                        }
+                        if let Ok(records) = get(body, "records").and_then(|v| v.as_array().context("invalid command records")) {
+                            for record in records {
+                                if matches!(text(record, "state")?, "accepted" | "running") {
+                                    self.active_command = Some(uuid::Uuid::parse_str(text(record, "command_id")?)?);
+                                }
+                            }
+                        }
+                        if text(body, "shell_status").ok() == Some("ready") { self.active_command = None; }
+                        terminal.command_event(kind, body);
+                    }
+                    "InputRejected" if phase == "attached" && self.command_capable => {
+                        self.same_session(body)?;
+                        ensure!(self.state.pending.as_ref().map(|p| p.seq) == Some(num(body, "input_seq")?),
+                            "unexpected input rejection");
+                        self.state.pending = None;
+                        self.pending_sent = false;
+                        save(&self.state)?;
+                        diagnostics::line(format_args!("[input] Host rejected human input: {}; input was not queued", text(body, "code")?));
                     }
                     "InputBackpressure" if phase == "attached" => {
                         self.same_session(body)?;
@@ -980,6 +1040,39 @@ impl Engine {
                 }
                 continue;
             }
+                if let Some(control) = terminal.control() {
+                    use crate::local_control::Operation;
+                    let mut fields = self.writer()?;
+                    fields.push(("connection_epoch", self.state.epoch.into()));
+                    fields.push(("operation_id", s(&control.operation_id.to_string())));
+                    let (kind, id) = match control.action {
+                        Operation::Send { command, .. } => {
+                            if self.state.pending.is_some() {
+                                terminal.command_event("CommandRejected", &map(vec![
+                                    ("command_id", s(&control.operation_id.to_string())),
+                                    ("code", s("local human input pending")),
+                                ]));
+                                continue;
+                            }
+                            fields.push(("command", s(&command)));
+                            ("CommandSubmit", control.operation_id)
+                        }
+                        Operation::CommandStatus { command_id } => ("CommandStatus", command_id),
+                        Operation::Interrupt => {
+                            if let Some(id) = self.active_command { ("CommandInterrupt", id) }
+                            else {
+                                fields.push(("expected_command_id", rmpv::Value::Nil));
+                                ("SessionInterrupt", control.operation_id)
+                            }
+                        }
+                        _ => bail!("unexpected engine control operation"),
+                    };
+                    fields.push(("command_id", s(&id.to_string())));
+                    if link.send(&message(kind, map(fields))).is_err() {
+                        terminal.reading(false);
+                        return Ok(End::Disconnected);
+                    }
+                }
             handshake_deadline = Instant::now() + Duration::from_secs(20);
             if last_received.elapsed() > Duration::from_secs(15) {
                 terminal.reading(false);
@@ -1028,7 +1121,8 @@ impl Engine {
                 pending_since = None;
             }
             terminal.reading(true);
-            let accept_bytes = self.state.pending.is_none();
+            let accept_bytes = self.state.pending.is_none()
+                && (!self.state.command_execution.unwrap_or(false) || self.command_input_ready);
             match terminal.input(accept_bytes)? {
                 Input::Eof | Input::Detach => {
                     let _ = link.send(&self.detach()?);

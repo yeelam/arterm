@@ -4,8 +4,11 @@ These are **self-signed development builds**. Their certificate is not publicly
 trusted; installation requires explicit local trust where permitted.
 Organizational application-control rules still apply.
 
-The download contains four signed EXEs, the MIT `LICENSE`, the public `arTerm-Dev.cer`,
-this guide, and checksums. It must never contain a PFX or private key.
+The development-signed download contains four signed EXEs, the MIT `LICENSE`,
+`THIRD-PARTY-NOTICES.txt`, the public `arTerm-Dev.cer`, this guide, and checksums.
+It must never contain a PFX or private key. Public CI artifacts and ordinary
+local builds are unsigned; they are not substitutes for signed production IPC
+peers.
 
 ## Certificate identity
 
@@ -16,6 +19,28 @@ this guide, and checksums. It must never contain a PFX or private key.
 
 Confirm this fingerprint against the repository's copy of this guide, not an
 unrelated download. The public certificate cannot create signatures.
+This is the existing certificate, not a recreated key. Renaming the product
+does not change its certificate identity or automatically alter local trust.
+
+## Required trust for local control
+
+In arTerm 0.5, each running `connect` owns a local named pipe. Owner and caller
+mutually verify the actual OS-reported PID, image, and context. Production IPC
+requires **valid Windows Authenticode chain trust**, the exact compiled public
+certificate SHA-256 above, and byte-identical client binaries. Both peers must
+also match user SID, logon, Windows session, integrity, and elevation.
+
+Unsigned, tampered, wrong-certificate, and different-build peers fail closed.
+A matching filename or certificate subject is insufficient; arbitrary programs
+running as the same user are not trusted. A byte-identical `vsterm.exe` alias
+works. Use the same official signed client bytes for the connection owner and
+all control invocations; signing alone does not grant host/installer binaries
+the client role.
+
+This is an application-identity gate, not a hard boundary against administrators,
+process injection, or other code invoking the legitimate CLI. There is no
+production environment-variable or command-line bypass. arTerm does not import
+trust automatically.
 
 ## Optional one-time trust for your test user
 
@@ -54,19 +79,31 @@ after installation, then run `arterm.exe setup` on the client or
 `arterm-host.exe setup --name my-devbox` on the host. Sign into the same GitHub
 account on both machines and run the host's printed registration command on
 the client. Follow [QUICKSTART.md](https://github.com/yeelam/arterm/blob/main/QUICKSTART.md) for the
-complete connection and resume steps.
+complete connection and automation steps.
 
 arTerm's `arterm connect my-devbox` only prints a reusable command.
 Type that command or `arterm connect my-devbox MyWork`; repeat it to recover
 the same session. Existing 0.2 GUID recovery records remain supported.
-Reusable connect and named resume require the host's
+Reusable connect requires the host's
 `ended-session-rejection` capability. Finish live 0.2 sessions using explicit
-GUID resume with an existing saved credential before upgrading their host.
+GUID connection with an existing saved credential before upgrading their host.
 See QUICKSTART.md for the legacy behavior and tokenless-recovery limitations;
 do not force an update that would terminate live sessions.
 MIT licensing does not change certificate trust or vendor component licenses.
 Signing remains a separate protected workflow; source hosting does not establish
 publisher trust.
+
+For source development only, unsigned functional fixtures require the explicit,
+default-off debug feature:
+
+```text
+cargo test --locked --features test-unsigned-ipc -- --test-threads=1
+```
+
+Release builds omit the feature; enabling it in release fails compilation.
+The separate signed CI gate tests actual signed CLI peers, rather than unsigned
+fixtures. This guide does not assert that the signed gate has passed for any
+particular build. See [SIGNING.md](https://github.com/yeelam/arterm/blob/main/SIGNING.md).
 
 SmartScreen reputation is separate from certificate-chain trust, and WDAC,
 AppLocker, Smart App Control, or other organizational policies can still block

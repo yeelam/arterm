@@ -100,6 +100,9 @@ impl Bridge {
         rmpv::decode::read_value(&mut &bytes[..]).unwrap()
     }
     fn hello(&mut self, client: &[u8]) -> Vec<u8> {
+        self.hello_capabilities(client, false)
+    }
+    fn hello_capabilities(&mut self, client: &[u8], commands: bool) -> Vec<u8> {
         self.send(message(
             "Hello",
             map(vec![
@@ -108,7 +111,9 @@ impl Bridge {
                 ("client_version", s("test")),
                 ("client_instance_id", Value::Binary(client.to_vec())),
                 ("correlation_id", Value::Binary(vec![8; 16])),
-                ("capabilities", Value::Array(vec![s("client-session-id")])),
+                ("capabilities", Value::Array(if commands {
+                    vec![s("client-session-id"), s(arterm::shell_integration::CAPABILITY)]
+                } else { vec![s("client-session-id")] })),
                 ("max_receive_frame", (wire::MAX_FRAME as u64).into()),
             ]),
         ));
@@ -129,6 +134,30 @@ impl Drop for Bridge {
         let _ = self.child.wait();
     }
 }
+fn receive_command_state(bridge: &mut Bridge, id: Option<Uuid>, expected: &str) -> (Value, String) {
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < deadline, "command event deadline: {}", String::from_utf8_lossy(&output));
+        let response = bridge.recv();
+        let kind = text(&response, "type").unwrap();
+        let body = get(&response, "body").unwrap();
+        if kind == "Output" { output.extend(binary(body, "bytes").unwrap()); }
+        if matches!(kind, "CommandState" | "CommandStatus" | "CommandAccepted") {
+            if let Some(id) = id {
+                if let Some(record) = get(body, "records").unwrap().as_array().unwrap().iter()
+                    .find(|record| text(record, "command_id").unwrap() == id.to_string()
+                        && text(record, "state").unwrap() == expected) {
+                    return (record.clone(), String::from_utf8_lossy(&output).into_owned());
+                }
+            } else if text(body, "shell_status").unwrap() == expected {
+                return (body.clone(), String::from_utf8_lossy(&output).into_owned());
+            }
+        }
+        assert_ne!(kind, "CommandRejected", "{response:?}");
+    }
+}
+
 fn writer_message(
     id: Uuid,
     attachment: &[u8],
@@ -199,6 +228,163 @@ fn create_message(request: Uuid, id: Uuid, claim: &[u8], broker: &[u8]) -> Value
             ("after_output_seq", 0.into()),
         ]),
     )
+}
+
+#[test]
+fn command_protocol_rejects_unintegrated_shell_before_input() {
+    let host = Host::start();
+    let mut bridge = host.bridge();
+    let client = vec![21; 16];
+    let broker = bridge.hello_capabilities(&client, true);
+    let session = Uuid::now_v7();
+    bridge.send(create_message(Uuid::now_v7(), session, &[3; 32], &broker));
+    let created = bridge.recv();
+    let body = get(&created, "body").unwrap();
+    let attachment = binary(body, "attachment_id").unwrap();
+    let lease = binary(body, "lease_id").unwrap();
+    bridge.send(writer_message(session, &attachment, &lease, &client, "CommandSubmit",
+        vec![("connection_epoch", 1.into()), ("command_id", s(&Uuid::now_v7().to_string())),
+            ("command", s("$ShouldNotExist=1"))]));
+    loop {
+        let response = bridge.recv();
+        if text(&response, "type").unwrap() == "CommandRejected" {
+            assert!(text(get(&response, "body").unwrap(), "code").unwrap().contains("CommandShellUnsupported"));
+            break;
+        }
+    }
+    bridge.send(writer_message(session, &attachment, &lease, &client, "Input",
+        vec![("input_seq", 1.into()), ("bytes", Value::Binary(
+            b"Write-Output ('UNCHANGED=' + ($null -eq $ShouldNotExist))\r".to_vec()))]));
+    let output = collect_marker(&mut bridge, session, &mut 0, "UNCHANGED=True");
+    assert!(output.contains("UNCHANGED=True"));
+}
+
+#[test]
+fn managed_commands_preserve_runspace_and_report_real_completion() {
+    let host = Host::start();
+    let mut bridge = host.bridge();
+    let client = vec![17; 16];
+    let broker = bridge.hello_capabilities(&client, true);
+    let session = Uuid::now_v7();
+    let mut create = create_message(Uuid::now_v7(), session, &[9; 32], &broker);
+    if let Value::Map(fields) = &mut create {
+        let body = &mut fields.iter_mut().find(|(key, _)| key.as_str() == Some("body")).unwrap().1;
+        if let Value::Map(fields) = body { fields.push((s("command_execution"), true.into())); }
+    }
+    bridge.send(create);
+    let created = bridge.recv();
+    assert_eq!(text(&created, "type").unwrap(), "SessionCreated", "{created:?}");
+    let created = get(&created, "body").unwrap();
+    let attachment = binary(created, "attachment_id").unwrap();
+    let lease = binary(created, "lease_id").unwrap();
+    let token = binary(created, "resume_token").unwrap();
+    receive_command_state(&mut bridge, None, "ready");
+    let submit = |id: Uuid, command: &str| writer_message(session, &attachment, &lease, &client,
+        "CommandSubmit", vec![("connection_epoch", 1.into()), ("command_id", s(&id.to_string())), ("command", s(command))]);
+    let first = Uuid::now_v7();
+    let path = host.home.to_string_lossy().replace('\'', "''");
+    let code = format!("$Keep=41; Set-Location -LiteralPath '{path}'; Write-Output ('FIRST='+$PID+':resumable')");
+    let started = Instant::now();
+    bridge.send(submit(first, &code));
+    let (record, output) = receive_command_state(&mut bridge, Some(first), "completed");
+    assert!(started.elapsed() < Duration::from_secs(5), "completion waited instead of observing shell event");
+    assert_eq!(get(&record, "succeeded").unwrap().as_bool(), Some(true), "{output}");
+    let pid = marker_pid(&output, "FIRST=");
+    bridge.send(submit(first, &code));
+    receive_command_state(&mut bridge, Some(first), "completed");
+    let second = Uuid::now_v7();
+    bridge.send(submit(second, "$Keep++; Write-Output ('SECOND='+$PID+':resumable'); Write-Output ('VALUE='+$Keep); Write-Output ('DIR='+$PWD.Path)"));
+    let (_, output) = receive_command_state(&mut bridge, Some(second), "completed");
+    assert_eq!(marker_pid(&output, "SECOND="), pid);
+    assert!(output.contains("VALUE=42"), "{output}");
+    assert!(output.contains(host.home.to_str().unwrap()), "{output}");
+    // Duplicate IDs must not increment again.
+    bridge.send(submit(second, "$Keep++; Write-Output ('SECOND='+$PID+':resumable'); Write-Output ('VALUE='+$Keep); Write-Output ('DIR='+$PWD.Path)"));
+    receive_command_state(&mut bridge, Some(second), "completed");
+    let formatted = Uuid::now_v7();
+    bridge.send(submit(formatted, "$Text=@'\nquotes ' \" and \u{20ac}\n'@\nWrite-Output ('UTF8='+$Text); [pscustomobject]@{Answer=42}"));
+    let (record, output) = receive_command_state(&mut bridge, Some(formatted), "completed");
+    assert_eq!(get(&record, "succeeded").unwrap().as_bool(), Some(true), "{output}");
+    assert!(output.contains("quotes ' \" and \u{20ac}"), "{output}");
+    assert!(output.contains("Answer") && output.contains("42"), "completion preceded formatted output: {output}");
+    for (code, success, exit) in [
+        ("cmd.exe /c exit 0", true, Some(0)),
+        ("cmd.exe /c exit 7", false, Some(7)),
+        ("Write-Error 'nonterminating'; Write-Output 'AFTER_ERROR'", false, None),
+        ("throw 'terminating'", false, None),
+    ] {
+        let id = Uuid::now_v7();
+        bridge.send(submit(id, code));
+        let (record, _) = receive_command_state(&mut bridge, Some(id), "completed");
+        assert_eq!(get(&record, "succeeded").unwrap().as_bool(), Some(success), "{code}: {record:?}");
+        assert_eq!(get(&record, "exit_code").unwrap().as_i64(), exit, "{code}: {record:?}");
+    }
+    let slow = Uuid::now_v7();
+    bridge.send(submit(slow, "Start-Sleep -Seconds 30"));
+    receive_command_state(&mut bridge, Some(slow), "running");
+    bridge.send(writer_message(session, &attachment, &lease, &client, "CommandStatus",
+        vec![("connection_epoch", 1.into()), ("command_id", s(&slow.to_string()))]));
+    receive_command_state(&mut bridge, Some(slow), "running");
+    bridge.send(writer_message(session, &attachment, &lease, &client, "Input",
+        vec![("input_seq", 1.into()), ("bytes", Value::Binary(b"$Keep=999\r".to_vec()))]));
+    loop {
+        let response = bridge.recv();
+        if text(&response, "type").unwrap() == "InputRejected" { break; }
+    }
+    bridge.send(submit(Uuid::now_v7(), "$Keep=999"));
+    loop {
+        let response = bridge.recv();
+        if text(&response, "type").unwrap() == "CommandRejected" {
+            assert!(text(get(&response, "body").unwrap(), "code").unwrap().contains("CommandBusy"));
+            break;
+        }
+    }
+    bridge.send(writer_message(session, &attachment, &lease, &client, "CommandInterrupt",
+        vec![("connection_epoch", 1.into()), ("command_id", s(&slow.to_string()))]));
+    let (record, _) = receive_command_state(&mut bridge, Some(slow), "completed");
+    assert_eq!(get(&record, "interrupt_requested").unwrap().as_bool(), Some(true));
+    assert_eq!(get(&record, "succeeded").unwrap().as_bool(), Some(false));
+    let after = Uuid::now_v7();
+    bridge.send(submit(after, "Write-Output ('AFTER='+$PID+':resumable'); Write-Output ('VALUE='+$Keep)"));
+    let (_, output) = receive_command_state(&mut bridge, Some(after), "completed");
+    assert_eq!(marker_pid(&output, "AFTER="), pid);
+    assert!(output.contains("VALUE=42"), "{output}");
+    let detached = Uuid::now_v7();
+    bridge.send(submit(detached, "Start-Sleep -Seconds 1; $Keep=77"));
+    receive_command_state(&mut bridge, Some(detached), "running");
+    bridge.send(writer_message(session, &attachment, &lease, &client, "Detach", vec![]));
+    drop(bridge);
+    thread::sleep(Duration::from_millis(1500));
+    let mut bridge = host.bridge();
+    bridge.hello_capabilities(&client, true);
+    bridge.send(attach_message(session, &token, &client, 2));
+    let attachment_reply = bridge.recv();
+    assert_eq!(text(&attachment_reply, "type").unwrap(), "SessionAttached");
+    let body = get(&attachment_reply, "body").unwrap();
+    let new_attachment = binary(body, "attachment_id").unwrap();
+    let new_lease = binary(body, "lease_id").unwrap();
+    receive_command_state(&mut bridge, Some(detached), "completed");
+    // Old leases/epochs never authorize a command, even for the same client.
+    bridge.send(submit(Uuid::now_v7(), "$Keep=999"));
+    loop {
+        let response = bridge.recv();
+        if text(&response, "type").unwrap() == "CommandRejected" {
+            assert!(text(get(&response, "body").unwrap(), "code").unwrap().contains("CommandLeaseRevoked"));
+            break;
+        }
+    }
+    bridge.send(writer_message(session, &new_attachment, &new_lease, &client, "Input",
+        vec![("input_seq", 1.into()), ("bytes", Value::Binary(b"$partial".to_vec()))]));
+    loop { if text(&bridge.recv(), "type").unwrap() == "InputAck" { break; } }
+    bridge.send(writer_message(session, &new_attachment, &new_lease, &client, "CommandSubmit",
+        vec![("connection_epoch", 2.into()), ("command_id", s(&Uuid::now_v7().to_string())), ("command", s("$Keep=999"))]));
+    loop {
+        let response = bridge.recv();
+        if text(&response, "type").unwrap() == "CommandRejected" {
+            assert!(text(get(&response, "body").unwrap(), "code").unwrap().contains("CommandBusy"));
+            break;
+        }
+    }
 }
 
 #[test]

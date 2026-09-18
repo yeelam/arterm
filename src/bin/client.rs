@@ -10,6 +10,7 @@ use arterm::{
     console::{Console, Terminal},
     deployment::{self, Role},
     engine::{End, Engine},
+    local_control::{self, Operation, Owner},
     store::{self, SessionReference, Store},
     transport::{authenticated, Forward, LoginRequired, TunnelLink},
 };
@@ -42,11 +43,17 @@ Usage:\n\
   arterm list\n\
   arterm remove ALIAS\n\
   arterm connect ALIAS [REF] [--shell EXE] [--cwd PATH] [--retries 0..20]\n\
-  arterm resume ALIAS REF [--retries 0..20]\n\
-  arterm terminate ALIAS REF --yes\n\
+  arterm list --client [--json] | list --server MACHINE\n\
+  arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--wait --timeout 60s]\n\
+  arterm read MACHINE SESSION [--lines N | --command-id UUID] [--json]\n\
+  arterm interrupt MACHINE SESSION | detach MACHINE SESSION\n\
+  arterm terminate MACHINE SESSION\n\
   arterm doctor [ALIAS]\n\
   arterm --help | --version\n\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
+Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
+Command IDs are retained for the session lifetime; capacity is 256, with no silent eviction or replacement.\n\
+Local IPC requires OS trust, the pinned certificate, and byte-identical client builds; cross-elevation is rejected.\n\
 Ctrl+] detaches without terminating the remote session.",
         env!("CARGO_PKG_VERSION")
     );
@@ -205,12 +212,12 @@ fn quote_command_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn session_command(alias: &str, reference: &SessionReference, retries: u32, flags: &ConnectionFlags, create: bool) -> Result<String> {
+fn session_command(alias: &str, reference: &SessionReference, retries: u32, flags: &ConnectionFlags, _create: bool) -> Result<String> {
     let exe = std::env::current_exe()?;
     let mut parts = vec![
         "&".into(),
         quote_command_arg(&exe.to_string_lossy()),
-        if create { "connect".into() } else { "resume".into() },
+        "connect".into(),
         quote_command_arg(alias),
         reference.as_str().to_owned(),
         "--retries".into(),
@@ -243,31 +250,57 @@ fn run_session(
     create: bool,
     flags: ConnectionFlags,
 ) -> Result<u32> {
+    let console = Console::new(flags.stdio)?;
     let config = client_config::load(root)?;
     let target = client_config::target(&config, alias)?.clone();
     let retries = flags.retries.unwrap_or(DEFAULT_RETRIES);
     let state_dir = client_config::state_dir(root, &target);
     let (store, state) = Store::resolve(&state_dir, &target.target_id, reference, create, flags.shell.as_deref(), flags.cwd.as_deref())?;
+    let store = std::sync::Arc::new(store);
+    let service_store = store.clone();
     let id = state.id;
     let command = session_command(alias, reference, retries, &flags, create)?;
     eprintln!("[session] GUID {id}; Ctrl+] detaches without killing the remote shell.");
     print_recovery(id, &command);
-    let mut engine = if !create && Uuid::parse_str(reference.as_str()).is_ok() {
+    let mut owner = Owner::start(root, &target.target_id, alias, id, state.reference.clone())?;
+    let snapshot = std::sync::Arc::new(std::sync::Mutex::new(state.clone()));
+    let service_snapshot = snapshot.clone();
+    let service_config = config.clone();
+    let service_target = target.clone();
+    let service_address = flags.address.clone();
+    owner.set_service(std::sync::Arc::new(move |_operation_id, action| {
+        ensure!(matches!(action, Operation::Terminate), "invalid management operation");
+        let state = service_snapshot.lock().unwrap().clone();
+        ensure!(!state.ended && state.token.is_some(), "session is not authorized or has ended");
+        let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
+        let confirmed = client_protocol::terminate(&mut link, &state)?;
+        let mut snapshot = service_snapshot.lock().unwrap();
+        snapshot.ended = true;
+        service_store.save(&snapshot)?;
+        Ok(serde_json::json!({"status":if confirmed { "terminated" } else { "termination_accepted" }, "session_id":state.id}))
+    }));
+    let mut engine = if Uuid::parse_str(reference.as_str()).is_ok()
+        && state.reference.is_none() && state.token.is_some() {
         Engine::resume_guid(state)
     } else {
         Engine::new(state)
     };
-    let mut terminal = Console::new(flags.stdio)?;
+    let mut terminal = owner.terminal(console);
     let result = (|| -> Result<u32> {
         for attempt in 0..=retries {
+            if owner.detached() { return Ok(0); }
             if attempt > 0 {
+                owner.set_state("reconnecting");
                 terminal.reading(false);
                 let jitter = u16::from_le_bytes(store::random_claim()?[..2].try_into().unwrap())
                     as u64
                     % 251;
                 let delay = (500u64 * (1u64 << (attempt - 1).min(6))).min(15_000) + jitter;
                 eprintln!("[session] Reconnecting {attempt}/{retries} in {delay}ms; reusing {id}");
-                thread::sleep(Duration::from_millis(delay));
+                for _ in 0..(delay / 25 + 1) {
+                    if owner.detached() { return Ok(0); }
+                    thread::sleep(Duration::from_millis(25));
+                }
             }
             let mut link = match connect_link(&config, &target, flags.address.as_deref()) {
                 Ok(link) => link,
@@ -275,13 +308,19 @@ fn run_session(
                     eprintln!("[session] Connection failed: {error:#}");
                     print_recovery(id, &command);
                     if error.is::<LoginRequired>() {
+                        owner.set_state("auth_required");
                         return Err(error);
                     }
                     continue;
                 }
             };
             match engine.run(&mut link, &mut terminal, &mut |state| {
-                store.save(state)
+                let mut snapshot = snapshot.lock().unwrap();
+                let mut updated = state.clone();
+                updated.ended |= snapshot.ended;
+                store.save(&updated)?;
+                *snapshot = updated;
+                Ok(())
             })? {
                 End::Detached => {
                     eprintln!("[session] Detached; remote session retained.");
@@ -292,6 +331,7 @@ fn run_session(
                     return Ok(code);
                 }
                 End::Disconnected => {
+                    owner.set_state("reconnecting");
                     terminal.reading(false);
                     eprintln!("[session] Attachment lost; remote session was not terminated.");
                     print_recovery(id, &command);
@@ -310,17 +350,13 @@ fn run_session(
 }
 
 fn terminate_session(root: &Path, args: &[String]) -> Result<()> {
-    ensure!(args.len() >= 3, "terminate requires ALIAS GUID --yes");
+    ensure!(args.len() >= 2, "terminate requires MACHINE SESSION");
     let alias = &args[0];
     let reference = SessionReference::parse(&args[1])?;
-    ensure!(
-        args.iter().skip(2).any(|arg| arg == "--yes"),
-        "terminate requires --yes"
-    );
     let extra = args
         .iter()
         .skip(2)
-        .filter(|arg| arg.as_str() != "--yes")
+        .filter(|arg| arg.as_str() != "--json")
         .cloned()
         .collect::<Vec<_>>();
     let flags = parse_connection_flags(&extra, false)?;
@@ -330,13 +366,24 @@ fn terminate_session(root: &Path, args: &[String]) -> Result<()> {
     );
     let config = client_config::load(root)?;
     let target = client_config::target(&config, alias)?.clone();
+    let owners = local_control::discover(root)?.into_iter().filter(|owner| owner.target_id == target.target_id
+        && (owner.reference.as_deref() == Some(reference.as_str()) || owner.session_id.to_string() == reference.as_str()))
+        .collect::<Vec<_>>();
+    ensure!(owners.len() <= 1, "multiple local owners match the session");
+    if let Some(owner) = owners.first() {
+        let response = local_control::request(owner, Operation::Terminate)?;
+        println!("{}", serde_json::to_string(&response)?);
+        ensure!(matches!(response["status"].as_str(), Some("terminated" | "termination_accepted")),
+            "termination failed: {}", response["error"]);
+        return Ok(());
+    }
     let (store, mut state) = Store::resolve(&client_config::state_dir(root, &target), &target.target_id, &reference, false, None, None)?;
     let id = state.id;
     let mut link = connect_link(&config, &target, flags.address.as_deref())?;
-    client_protocol::terminate(&mut link, &state)?;
+    let confirmed = client_protocol::terminate(&mut link, &state)?;
     state.ended = true;
     store.save(&state)?;
-    println!("Termination accepted for {id}.");
+    println!("{}", serde_json::json!({"status":if confirmed {"terminated"} else {"termination_accepted"}, "session_id":id}));
     Ok(())
 }
 
@@ -372,7 +419,110 @@ fn doctor(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn local_command(root: &Path, args: &[String]) -> Result<u32> {
+    let verb = &args[0];
+    let machine = args.get(1).context("command requires MACHINE SESSION")?;
+    client_config::validate_alias(machine)?;
+    let reference = SessionReference::parse(args.get(2).context("command requires MACHINE SESSION")?)?;
+    let mut lines = None;
+    let mut command = None;
+    let mut wait = false;
+    let mut timeout = None;
+    let mut json = false;
+    let mut command_id = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !json => json = true,
+            "--file" | "--transfer-id" => bail!("file transfer is deferred and is not available in arTerm 0.5"),
+            "--command-id" if matches!(verb.as_str(), "read" | "send") && command_id.is_none() => {
+                command_id = Some(Uuid::parse_str(&value(args, &mut index, "--command-id")?).context("invalid command ID")?);
+            }
+            "--lines" if verb == "read" && lines.is_none() => {
+                let n: usize = value(args, &mut index, "--lines")?.parse().context("invalid line count")?;
+                ensure!((1..=2000).contains(&n), "lines must be 1..=2000");
+                lines = Some(n);
+            }
+            "--command" if verb == "send" && command.is_none() => {
+                command = Some(value(args, &mut index, "--command")?);
+            }
+            "--wait" if verb == "send" && !wait => wait = true,
+            "--timeout" if verb == "send" && timeout.is_none() => {
+                let text = value(args, &mut index, "--timeout")?;
+                let seconds: u64 = text.strip_suffix('s').context("timeout must be whole seconds, e.g. 60s")?
+                    .parse().context("invalid timeout")?;
+                ensure!(seconds > 0, "timeout must be positive and finite");
+                timeout = Some(seconds.checked_mul(1000).context("timeout overflow")?);
+            }
+            other => bail!("unknown or duplicate option: {other}"),
+        }
+        index += 1;
+    }
+    let action = match verb.as_str() {
+        "read" => {
+            ensure!(command_id.is_none() || lines.is_none(), "--command-id and --lines are mutually exclusive");
+            if let Some(command_id) = command_id { Operation::CommandStatus { command_id } }
+            else { Operation::Read { lines: lines.unwrap_or(20) } }
+        }
+        "detach" => Operation::Detach,
+        "interrupt" => Operation::Interrupt,
+        "send" => {
+            ensure!(command.is_some(), "send requires --command");
+            ensure!(wait == timeout.is_some(), "--wait requires explicit --timeout; --timeout requires --wait");
+            ensure!(!wait || command.is_some(), "--wait is only valid with --command");
+            ensure!(command_id.is_none() || command.is_some(), "--command-id is only valid with --command");
+            Operation::Send { command: command.unwrap(), timeout_ms: timeout }
+        }
+        _ => unreachable!(),
+    };
+    let deadline = timeout.map(|ms| std::time::Instant::now().checked_add(Duration::from_millis(ms))
+        .context("timeout exceeds supported clock range")).transpose()?;
+    let config = client_config::load(root)?;
+    let target = client_config::target(&config, machine)?;
+    let matches = local_control::discover(root)?.into_iter().filter(|identity| {
+        identity.target_id == target.target_id
+            && (identity.reference.as_deref() == Some(reference.as_str())
+                || identity.session_id.to_string() == reference.as_str())
+    }).collect::<Vec<_>>();
+    ensure!(matches.len() == 1,
+        "no unique active managed local client for {machine} {}; connect explicitly (an older unmanaged client cannot be controlled)",
+        reference.as_str());
+    let operation_id = command_id.unwrap_or_else(Uuid::now_v7);
+    let mut response = local_control::request_with_id(&matches[0], action, operation_id)
+        .with_context(|| format!("local request failed; command/operation ID {operation_id}; query rather than resubmit"))?;
+    if wait && (response["status"] == "accepted" || response["status"] == "ok") {
+        let remaining = deadline.unwrap().saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            response = serde_json::json!({"status":"timeout","command_id":operation_id,"cancelled":false});
+        } else {
+            response = local_control::request(&matches[0], Operation::Wait {
+                command_id: operation_id, timeout_ms: remaining.as_millis().max(1).try_into().context("timeout overflow")?,
+            })?;
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string(&response)?);
+    } else if verb == "read" && command_id.is_none() && response["status"] == "ok" {
+        if let Some(lines) = response["output"]["lines"].as_array() {
+            for line in lines { println!("{}", line.as_str().unwrap_or("")); }
+        }
+        if response["output"]["truncated"] == true { eprintln!("[read] Output truncated to retained/requested lines."); }
+    } else {
+        println!("{}", serde_json::to_string(&response)?);
+    }
+    if response["status"] == "timeout" { return Ok(124); }
+    if response["status"] == "unknown" { return Ok(6); }
+    if response["status"] == "completed" {
+        return Ok(if response["record"]["succeeded"] == true { 0 } else { 1 });
+    }
+    ensure!(matches!(response["status"].as_str(), Some("ok" | "accepted" | "detach_requested" | "interrupt_requested")),
+        "local operation failed: {}", response["error"]);
+    Ok(0)
+}
+
 fn command(args: &[String]) -> Result<u32> {
+    ensure!(args.first().map(String::as_str) != Some("receive"),
+        "file transfer is deferred and is not available in arTerm 0.5");
     let root = deployment::data_root()?;
     match args.first().map(String::as_str) {
         Some("setup") => {
@@ -401,6 +551,47 @@ fn command(args: &[String]) -> Result<u32> {
             add_target(&root, &args[1..])?;
             Ok(0)
         }
+        Some("list") if args.get(1).map(String::as_str) == Some("--client") => {
+            ensure!(args.len() == 2 || (args.len() == 3 && args[2] == "--json"), "invalid list --client options");
+            let mut connections = Vec::new();
+            for identity in local_control::discover(&root)? {
+                connections.push(local_control::request(&identity, Operation::Inspect)?);
+            }
+            println!("{}", serde_json::to_string(&connections)?);
+            Ok(0)
+        }
+        Some("list") if args.get(1).map(String::as_str) == Some("--server") => {
+            ensure!(args.len() >= 3, "list --server requires MACHINE");
+            let machine = &args[2];
+            client_config::validate_alias(machine)?;
+            let options = args[3..].iter().filter(|arg| arg.as_str() != "--json").cloned().collect::<Vec<_>>();
+            let flags = parse_connection_flags(&options, false)?;
+            ensure!(flags.retries.is_none() && !flags.stdio, "invalid server inventory options");
+            let config = client_config::load(&root)?;
+            let target = client_config::target(&config, machine)?;
+            let mut link = connect_link(&config, target, flags.address.as_deref())?;
+            let mut inventory = client_protocol::list_sessions(&mut link)?;
+            let dir = client_config::state_dir(&root, target);
+            let mut labels = std::collections::BTreeMap::new();
+            if dir.exists() {
+                for entry in std::fs::read_dir(&dir)? {
+                    let path = entry?.path();
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix("ref-")).and_then(|name| name.strip_suffix(".json")) {
+                        let id: Uuid = serde_json::from_slice(&std::fs::read(&path)?).context("invalid local session mapping")?;
+                        labels.insert(id.to_string(), name.to_owned());
+                    }
+                }
+            }
+            for session in inventory["sessions"].as_array_mut().context("invalid inventory")? {
+                let id = Uuid::parse_str(session["id"].as_str().context("invalid session ID")?)?.to_string();
+                session["local_reference"] = labels.get(&id).cloned().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                session["has_local_recovery_record"] = dir.join(format!("{id}.dpapi")).is_file().into();
+            }
+            inventory["machine"] = machine.clone().into();
+            println!("{}", serde_json::to_string(&inventory)?);
+            Ok(0)
+        }
         Some("list") => {
             list_targets(&root, &args[1..])?;
             Ok(0)
@@ -422,12 +613,7 @@ fn command(args: &[String]) -> Result<u32> {
                 Ok(0)
             }
         }
-        Some("resume") => {
-            let alias = args.get(1).context("resume requires an alias")?;
-            let reference = SessionReference::parse(args.get(2).context("resume requires a reference")?)?;
-            let flags = parse_connection_flags(&args[3..], false)?;
-            run_session(&root, alias, &reference, false, flags)
-        }
+        Some("read" | "detach" | "interrupt" | "send") => local_command(&root, args),
         Some("terminate") => {
             terminate_session(&root, &args[1..])?;
             Ok(0)
@@ -457,11 +643,13 @@ fn command(args: &[String]) -> Result<u32> {
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    match command(&args) {
-        Ok(code) => std::process::exit(code as i32),
+    let code = match command(&args) {
+        Ok(code) => code as i32,
         Err(error) => {
             eprintln!("[client] {error:#}");
-            std::process::exit(1);
+            1
         }
-    }
+    };
+    arterm::diagnostics::drain(Duration::from_millis(250));
+    std::process::exit(code);
 }
