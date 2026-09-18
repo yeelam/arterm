@@ -273,7 +273,12 @@ pub(crate) fn relay(home: PathBuf, attachments: usize) -> (String, mpsc::Receive
     relay_traced(home, attachments, None)
 }
 
-fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Vec<Vec<u8>>>>>) -> (String, mpsc::Receiver<TcpStream>) {
+#[derive(Default, Debug)]
+struct SyntheticInputTrace {
+    packets: Vec<Vec<u8>>,
+    acknowledged: u64,
+}
+fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>) -> (String, mpsc::Receiver<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
@@ -336,6 +341,7 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Vec<V
                 (13, Box::new(stderr) as Box<dyn Read + Send>),
             ] {
                 let out = out.clone();
+                let trace = trace.clone();
                 thread::spawn(move || {
                     let mut data = [0; 4096];
                     let mut frames = arterm::wire::Frames::default();
@@ -347,6 +353,9 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Vec<V
                         if id == 12 {
                             frames.push(&data[..n]).unwrap();
                             while let Some(frame) = frames.next().unwrap() {
+                                if get(&frame, "type").as_str() == Some("InputAck") {
+                                    if let Some(trace) = &trace { trace.lock().unwrap().acknowledged += 1; }
+                                }
                                 if get(&frame, "type").as_str() == Some("SessionExited") {
                                     // VS Code pumps each stream independently of its spawn result.
                                     send(&out, map(vec![
@@ -391,7 +400,7 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Vec<V
                                 if get(&frame, "type").as_str() == Some("Input") {
                                     let bytes = arterm::wire::binary(get(&frame, "body"), "bytes").unwrap();
                                     let mut trace = trace.lock().unwrap();
-                                    if trace.len() < 32 { trace.push(bytes.into_iter().take(512).collect()); }
+                                    if trace.packets.len() < 32 { trace.packets.push(bytes.into_iter().take(512).collect()); }
                                 }
                             }
                         }
@@ -434,18 +443,26 @@ fn interactive_win32_keyup_preserves_command_readiness() {
     struct Interactive(Box<dyn portable_pty::Child + Send + Sync>);
     impl Drop for Interactive { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
     let fixture = Fixture::new();
-    let trace = Arc::new(Mutex::new(Vec::new()));
+    let trace = Arc::new(Mutex::new(SyntheticInputTrace::default()));
     let (address, _) = relay_traced(fixture.home.clone(), 2, Some(trace.clone()));
     for reference in [Uuid::now_v7().to_string(), "interactive-named".into()] {
+        *trace.lock().unwrap() = SyntheticInputTrace::default();
         let pair = native_pty_system().openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
-        let mut command = CommandBuilder::new(client_executable());
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let mut command = CommandBuilder::new("powershell.exe");
         command.env("VSTERM_REMOTE_HOME", &fixture.home);
-        command.args(["connect", "fixture", &reference, "--address", &address, "--retries", "0", "--shell", &test_shell()]);
+        // A parent terminal can enable focus reports before arTerm starts. This
+        // negotiation never traverses the remote broker's output stream.
+        command.args(["-NoLogo", "-NoProfile", "-Command", &format!(
+            "[Console]::Write(([char]27+'[?1004h')); & {} connect fixture {} --address {} --retries 0 --shell {}; exit $LASTEXITCODE",
+            quote(client_executable()), quote(&reference), quote(&address), quote(&test_shell()))]);
         let mut client = Interactive(pair.slave.spawn_command(command).unwrap());
         drop(pair.slave);
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let mut reader = pair.master.try_clone_reader().unwrap();
         let terminal_writer = writer.clone();
+        let focus_reporting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let terminal_focus = focus_reporting.clone();
         let reader_thread = thread::spawn(move || {
             let mut terminal = vt100::Parser::new(40, 120, 0);
             let mut tail = Vec::new();
@@ -453,9 +470,11 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             while let Ok(n) = reader.read(&mut bytes) {
                 if n == 0 { break; }
                 terminal.process(&bytes[..n]);
+                let previous = tail.len();
                 tail.extend_from_slice(&bytes[..n]);
                 for query in [b"\x1b[6n".as_slice(), b"\x1b[c", b"\x1b[>c"] {
-                    let count = tail.windows(query.len()).filter(|window| *window == query).count();
+                    let count = tail.windows(query.len()).enumerate()
+                        .filter(|(index, window)| *index + query.len() > previous && *window == query).count();
                     for _ in 0..count {
                         let (row, col) = terminal.screen().cursor_position();
                         let response = match query {
@@ -466,7 +485,11 @@ fn interactive_win32_keyup_preserves_command_readiness() {
                         if terminal_writer.lock().unwrap().write_all(response.as_bytes()).is_err() { return; }
                     }
                 }
-                if tail.len() > 2 { tail.drain(..tail.len() - 2); }
+                for (index, mode) in tail.windows(8).enumerate() {
+                    if index + 8 > previous && mode == b"\x1b[?1004h" { terminal_focus.store(true, std::sync::atomic::Ordering::Release); }
+                    if index + 8 > previous && mode == b"\x1b[?1004l" { terminal_focus.store(false, std::sync::atomic::Ordering::Release); }
+                }
+                if tail.len() > 7 { tail.drain(..tail.len() - 7); }
             }
         });
         let control = |args: &[&str]| Command::new(controller_executable())
@@ -486,6 +509,20 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             }
             thread::sleep(Duration::from_millis(20));
         }
+        assert!(focus_reporting.load(std::sync::atomic::Ordering::Acquire), "parent must enable terminal focus reporting");
+        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
+        let traffic_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = trace.lock().unwrap();
+            if observed.packets.iter().any(|bytes| bytes.windows(3).any(|v| v == b"\x1b[O"))
+                && observed.acknowledged >= observed.packets.len() as u64 { break; }
+            assert!(Instant::now() < traffic_deadline, "startup traffic not acknowledged by host: {observed:?}");
+            drop(observed);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let first = control(&["send", "fixture", &reference, "--command", "Get-Date", "--wait", "--timeout", "10s", "--json"]);
+        assert!(first.status.success(), "first command without manual input: {} {}; synthetic input={:?}",
+            String::from_utf8_lossy(&first.stdout), String::from_utf8_lossy(&first.stderr), trace.lock().unwrap());
         writer.lock().unwrap().write_all(b"$InteractiveProof=41; Write-Output ('MANUAL-OK='+$InteractiveProof)\r").unwrap();
         let manual_deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -495,14 +532,17 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
             if String::from_utf8_lossy(&output.stdout).contains("MANUAL-OK=41")
                 && owners[0]["shell_status"] == "ready" { break; }
-            assert!(Instant::now() < manual_deadline, "manual interactive command did not finish: {owners}");
+            assert!(Instant::now() < manual_deadline, "manual interactive command did not finish: {owners}; synthetic input={:?}", trace.lock().unwrap());
             thread::sleep(Duration::from_millis(20));
         }
         writer.lock().unwrap().write_all(b"\x1b[16;42;0;0;0;1_").unwrap(); // Shift key release, no edit.
+        assert!(focus_reporting.load(std::sync::atomic::Ordering::Acquire), "terminal must observe focus-mode negotiation before generating focus reports");
+        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap(); // Terminal focus loss/gain, not typed text.
         thread::sleep(Duration::from_millis(250));
         let sent = control(&["send", "fixture", &reference, "--command", "$InteractiveProof++; if ($InteractiveProof -ne 42) { throw 'interactive runspace state lost' }; Get-ChildItem | Select-Object -First 1", "--wait", "--timeout", "10s", "--json"]);
         assert!(sent.status.success(), "{} {}; forwarded input={:?}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr), trace.lock().unwrap());
         writer.lock().unwrap().write_all(b"x").unwrap();
+        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let listed = control(&["list", "--client", "--json"]);
@@ -527,6 +567,7 @@ fn interactive_win32_keyup_preserves_command_readiness() {
         }
         let busy = control(&["send", "fixture", &reference, "--command", "Start-Sleep -Seconds 2", "--json"]);
         assert!(busy.status.success(), "{}", String::from_utf8_lossy(&busy.stdout));
+        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
         let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
         assert!(!rejected.status.success());
         let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();

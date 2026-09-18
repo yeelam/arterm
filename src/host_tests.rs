@@ -1,28 +1,86 @@
 use super::*;
 use std::io::{Read, Write};
+use std::os::windows::io::AsRawHandle;
 
 struct Link {
     pair: host_pipe::PipePair,
+    frames: Frames,
+    last_sent: Instant,
+    last_request: String,
+    last_received: String,
+    heartbeat: bool,
+    nonce: u64,
+    pongs: u64,
 }
 impl Link {
     fn connect(root: &Path) -> Self {
         Self {
             pair: host_pipe::connect(&pipe_name(root).unwrap(), Duration::from_secs(3)).unwrap(),
+            frames: Frames::default(),
+            last_sent: Instant::now(),
+            last_request: "connect".into(),
+            last_received: "none".into(),
+            heartbeat: true,
+            nonce: 0,
+            pongs: 0,
         }
     }
     fn send(&mut self, value: Value) {
+        let kind = text(&value, "type").unwrap();
+        if !matches!(kind, "Ping" | "Pong") { self.last_request = kind.into(); }
         self.pair
             .input
             .write_all(&wire::encode(&value).unwrap())
             .unwrap();
         self.pair.input.flush().unwrap();
+        self.last_sent = Instant::now();
     }
     fn recv(&mut self) -> Value {
-        let mut len = [0; 4];
-        self.pair.output.read_exact(&mut len).unwrap();
-        let mut bytes = vec![0; u32::from_be_bytes(len) as usize];
-        self.pair.output.read_exact(&mut bytes).unwrap();
-        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+        self.recv_result().unwrap_or_else(|error| panic!(
+            "broker receive failed after request={}, last_frame={}, heartbeats={}, pongs={}: {error:#}",
+            self.last_request, self.last_received, self.nonce, self.pongs))
+    }
+    fn recv_result(&mut self) -> Result<Value> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            ensure!(Instant::now() < deadline, "broker response deadline exceeded");
+            if self.heartbeat && self.last_sent.elapsed() >= Duration::from_secs(5) {
+                self.nonce += 1;
+                self.send(message("Ping", map(vec![("nonce", self.nonce.into()), ("sent_at_ms", now_ms().into())])));
+            }
+            if let Some(value) = self.frames.next()? {
+                let kind = text(&value, "type")?;
+                self.last_received = kind.into();
+                match kind {
+                    "Pong" => {
+                        let nonce = num(get(&value, "body")?, "nonce")?;
+                        ensure!(nonce == self.pongs + 1 && nonce <= self.nonce, "unexpected heartbeat nonce");
+                        self.pongs += 1;
+                        continue;
+                    }
+                    "Ping" => {
+                        self.send(message("Pong", map(vec![("nonce", get(get(&value, "body")?, "nonce")?.clone()),
+                            ("broker_time_ms", now_ms().into())])));
+                        continue;
+                    }
+                    _ => return Ok(value),
+                }
+            }
+            let mut available = 0;
+            let ok = unsafe { windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                self.pair.output.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(),
+                &mut available, std::ptr::null_mut()) };
+            if ok == 0 { return Err(std::io::Error::last_os_error()).context("broker output pipe closed"); }
+            if available == 0 {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            let mut bytes = [0; 8192];
+            let limit = (available as usize).min(bytes.len());
+            let count = self.pair.output.read(&mut bytes[..limit]).context("read broker frame")?;
+            ensure!(count > 0, "broker output reached EOF");
+            self.frames.push(&bytes[..count])?;
+        }
     }
     fn hello(&mut self, client: &[u8]) -> Vec<u8> {
         self.send(message(
@@ -87,8 +145,19 @@ fn input(
 }
 fn marker(link: &mut Link, id: Uuid, cursor: &mut u64, needle: &str) -> String {
     let mut all = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let v = link.recv();
+        assert!(Instant::now() < deadline, "shell marker deadline exceeded; last_frame={}, pongs={}", link.last_received, link.pongs);
+        let v = link.recv_result().unwrap_or_else(|error| {
+            let tail = &all[all.len().saturating_sub(4096)..];
+            panic!("shell marker receive failed after request={}, last_frame={}, pongs={}: {error:#}; output_tail={:?}",
+                link.last_request, link.last_received, link.pongs, String::from_utf8_lossy(tail));
+        });
+        if text(&v, "type").unwrap() == "Error" {
+            let body = get(&v, "body").unwrap();
+            panic!("broker rejected marker wait after {}: code={}, detail={}", link.last_request,
+                text(body, "code").unwrap(), text(body, "detail").unwrap());
+        }
         if text(&v, "type").unwrap() == "Output" {
             let b = get(&v, "body").unwrap();
             assert_eq!(text(b, "session_id").unwrap(), id.to_string());
@@ -96,6 +165,7 @@ fn marker(link: &mut Link, id: Uuid, cursor: &mut u64, needle: &str) -> String {
             if seq > *cursor {
                 *cursor = seq;
                 all.extend(binary(b, "bytes").unwrap());
+                assert!(all.len() <= wire::MAX_FRAME, "shell marker not found within bounded output");
             }
             let rendered = String::from_utf8_lossy(&all);
             if rendered.contains(needle) {
@@ -118,17 +188,46 @@ fn pid(text: &str, prefix: &str) -> String {
         .unwrap()
 }
 
+struct TestBroker {
+    root: PathBuf,
+    server: Option<thread::JoinHandle<Result<()>>>,
+}
+impl TestBroker {
+    fn start() -> Self {
+        let root = std::env::temp_dir().join(format!("arterm-host-liveness-test-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let server_root = root.clone();
+        let broker = Self { root, server: Some(thread::spawn(move || run_at(server_root))) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while control_at(&broker.root, "status", None, false).is_err() {
+            assert!(Instant::now() < deadline, "owned broker did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        broker
+    }
+    fn finish(&mut self) -> Result<()> {
+        let Some(server) = self.server.as_ref() else { return Ok(()) };
+        if !server.is_finished() { stop_at(&self.root, true)?; }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() {
+            ensure!(Instant::now() < deadline, "owned broker teardown timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.server.take().unwrap().join().map_err(|_| anyhow::anyhow!("owned broker panicked"))??;
+        fs::remove_dir_all(&self.root)?;
+        Ok(())
+    }
+}
+impl Drop for TestBroker {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() { eprintln!("owned broker cleanup failed: {error:#}"); }
+    }
+}
+
 #[test]
 fn real_conpty_pid_and_state_survive_pipe_disconnect() {
-    let root = std::env::temp_dir().join(format!("devbox-host-unit-{}", Uuid::now_v7()));
-    fs::create_dir_all(&root).unwrap();
-    let server_root = root.clone();
-    let server = thread::spawn(move || run_at(server_root));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while control_at(&root, "status", None, false).is_err() {
-        assert!(Instant::now() < deadline, "broker did not start");
-        thread::sleep(Duration::from_millis(25));
-    }
+    let mut fixture = TestBroker::start();
+    let root = fixture.root.clone();
     let id = Uuid::now_v7();
     let request = Uuid::now_v7();
     let client = Uuid::now_v7().as_bytes().to_vec();
@@ -142,20 +241,26 @@ fn real_conpty_pid_and_state_survive_pipe_disconnect() {
     let token = binary(body, "resume_token").unwrap();
     let attach = binary(body, "attachment_id").unwrap();
     let lease = binary(body, "lease_id").unwrap();
+    // Simulate a quiet/cold shell for longer than the production watchdog.
+    // The test peer must maintain liveness; increasing the watchdog would hide this bug.
+    let quiet_command = format!("Start-Sleep -Seconds {}; $global:KeepMe='resumable'; Write-Output ('FIRST=' + $PID + ':' + $global:KeepMe)\r\n",
+        PEER_IDLE_TIMEOUT.as_secs() + 1);
+    let quiet_started = Instant::now();
     one.send(input(
         id,
         &attach,
         &lease,
         &client,
         1,
-        b"$global:KeepMe='resumable'; Write-Output ('FIRST=' + $PID + ':' + $global:KeepMe)\r\n",
+        quiet_command.as_bytes(),
     ));
     let mut cursor = 0;
     let first = marker(&mut one, id, &mut cursor, ":resumable");
+    assert!(quiet_started.elapsed() >= PEER_IDLE_TIMEOUT, "regression did not cross the real watchdog interval");
+    assert!(one.pongs > 0, "slow marker wait must exchange real heartbeats");
     let shell_pid = pid(&first, "FIRST=");
     assert!(first.contains(&format!("FIRST={shell_pid}:resumable")));
     drop(one);
-    thread::sleep(Duration::from_millis(100));
     let mut two = Link::connect(&root);
     assert_eq!(two.hello(&client), broker);
     two.send(create(request, id, &claim, &broker));
@@ -202,10 +307,22 @@ fn real_conpty_pid_and_state_survive_pipe_disconnect() {
     assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
     assert!(control_at(&root, "stop", None, false).is_err());
     control_at(&root, "terminate", Some(&id.to_string()), false).unwrap();
-    control_at(&root, "stop", None, true).unwrap();
     drop(two);
-    server.join().unwrap().unwrap();
-    let _ = fs::remove_dir_all(&root);
+    fixture.finish().unwrap();
+}
+
+#[test]
+fn silent_peer_is_closed_at_unchanged_watchdog_without_wire_error() {
+    let mut fixture = TestBroker::start();
+    let mut link = Link::connect(&fixture.root);
+    link.heartbeat = false;
+    link.hello(Uuid::now_v7().as_bytes());
+    let started = Instant::now();
+    assert!(link.recv_result().is_err(), "idle peer must close, not send a fatal protocol Error");
+    assert!(started.elapsed() >= PEER_IDLE_TIMEOUT - Duration::from_secs(1));
+    assert!(started.elapsed() < PEER_IDLE_TIMEOUT + Duration::from_secs(10));
+    drop(link);
+    fixture.finish().unwrap();
 }
 
 #[test]

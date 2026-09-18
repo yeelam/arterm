@@ -57,6 +57,7 @@ const MAX_SESSIONS: usize = 16;
 const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPLAY_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_INPUT_QUEUE: usize = 16;
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const EXITED_HISTORY_RETENTION: Duration = Duration::from_secs(15 * 60);
 const MAX_EXITED_HISTORY: usize = 64;
 struct Job(HANDLE);
@@ -1227,7 +1228,8 @@ impl Broker {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if last_peer.elapsed() > Duration::from_secs(20) {
+            if last_peer.elapsed() > PEER_IDLE_TIMEOUT {
+                eprintln!("host connection closed: peer idle timeout after 20 seconds without a client protocol message");
                 break;
             }
             if let Some((session, attachment_id, _)) = &attached {

@@ -8,6 +8,8 @@
 //! entering nested input stops managed readiness; there is no prompt-text fallback.
 //! Raw typeahead remains usable. Managed readiness requires observed line
 //! submissions to reach prompt boundaries and no partial input to remain.
+//! Focus notifications are non-editing only while remote VT output has enabled
+//! DECSET 1004. Unsolicited focus packets and other unknown replies stay guarded.
 //! Records are never evicted within a live session: admission stops at the cap
 //! rather than forgetting an ID and executing a retry twice.
 use anyhow::{ensure, Result};
@@ -41,6 +43,10 @@ pub struct Commands {
     last_cr: bool,
     input_sequence: Vec<u8>,
     unclassified_input: bool,
+    focus_reporting: bool,
+    terminal_sequence: Vec<u8>,
+    terminal_string: bool,
+    terminal_string_escape: bool,
     active: Option<Uuid>,
     records: BTreeMap<Uuid, Record>,
     pub revision: u64,
@@ -82,6 +88,10 @@ impl Commands {
             last_cr: false,
             input_sequence: Vec::new(),
             unclassified_input: false,
+            focus_reporting: false,
+            terminal_sequence: Vec::new(),
+            terminal_string: false,
+            terminal_string_escape: false,
             active: None,
             records: BTreeMap::new(),
             revision: 0,
@@ -215,7 +225,11 @@ function global:prompt {
             let prefix = pending == b"\x1b" || pending == b"\x1b["
                 || (pending.starts_with(b"\x1b[") && pending[2..].iter().all(|b| b.is_ascii_digit() || *b == b';'));
             if prefix && pending.len() <= 128 { continue; }
-            if let Some(fields) = crate::console::console_input::win32_fields(&pending) {
+            if self.focus_reporting && matches!(pending.as_slice(), b"\x1b[I" | b"\x1b[O") {
+                // DECSET 1004 focus notifications are not keyboard edits.
+                // Preserve the original bytes for ConPTY, just as with key-up.
+                pending.clear();
+            } else if let Some(fields) = crate::console::console_input::win32_fields(&pending) {
                 if fields[3] == 1 { keys.push((fields[2], fields[5])); }
                 // Key-up still reaches ConPTY unchanged; it does not edit a shell line.
                 pending.clear();
@@ -357,13 +371,104 @@ function global:prompt {
                 output.append(&mut self.pending_marker);
             }
         }
+        self.observe_terminal_modes(&output);
         output
+    }
+    fn observe_terminal_modes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.terminal_string {
+                let ended = matches!(byte, 7 | 0x18 | 0x1a) || (self.terminal_string_escape && byte == b'\\');
+                self.terminal_string_escape = byte == 27;
+                if ended { self.terminal_string = false; self.terminal_string_escape = false; }
+                continue;
+            }
+            if byte == 27 {
+                self.terminal_sequence.clear();
+                self.terminal_sequence.push(byte);
+                continue;
+            }
+            if matches!(byte, 0x18 | 0x1a) {
+                self.terminal_sequence.clear();
+                continue;
+            }
+            if self.terminal_sequence.is_empty() {
+                continue;
+            }
+            self.terminal_sequence.push(byte);
+            if self.terminal_sequence.len() == 2 {
+                match byte {
+                    b'[' => continue,
+                    b']' | b'P' | b'X' | b'^' | b'_' => self.terminal_string = true,
+                    b'c' => self.focus_reporting = false,
+                    _ => {}
+                }
+                self.terminal_sequence.clear();
+                continue;
+            }
+            if (0x40..=0x7e).contains(&byte) {
+                if matches!(byte, b'h' | b'l') && self.terminal_sequence.starts_with(b"\x1b[?") {
+                    let parameters = &self.terminal_sequence[3..self.terminal_sequence.len() - 1];
+                    if parameters.split(|b| *b == b';').any(|p| p == b"1004") {
+                        self.focus_reporting = byte == b'h';
+                    }
+                }
+                self.terminal_sequence.clear();
+            } else if self.terminal_sequence.len() > 128 {
+                self.terminal_sequence.clear();
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn focus_notifications_require_remote_mode_and_never_clear_edits_or_busy() {
+        fn ready() -> Commands {
+            let mut commands = Commands::new();
+            commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());
+            commands
+        }
+        let mut unsolicited = ready();
+        unsolicited.input(b"\x1b[I").unwrap();
+        assert_eq!(unsolicited.readiness_reason(), "unclassified_terminal_input");
+        unsolicited.output(format!("\x1b]633;arterm;{};ready\x07", unsolicited.nonce).as_bytes());
+        assert_eq!(unsolicited.readiness_reason(), "unclassified_terminal_input",
+            "a delayed prompt marker does not prove unknown input left the edit buffer empty");
+        assert!(unsolicited.submit(Uuid::now_v7(), "must not run").is_err());
+
+        let mut commands = ready();
+        commands.output(b"\x1b]0;not a mode:\x1b[?1004h\x07");
+        commands.output(b"\x1bPignored\x1b[?1004h\x1b\\");
+        commands.output(b"\x1b[123\x1b]0;cancelled CSI then title:\x1b[?1004h\x07");
+        assert!(!commands.focus_reporting, "control strings must not enable input exceptions");
+        for byte in b"\x1b[?1004;2004h" { commands.output(&[*byte]); }
+        assert!(commands.focus_reporting);
+        commands.input(b"\x1b[").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_input_sequence");
+        commands.input(b"O\x1b[I").unwrap();
+        assert_eq!(commands.shell_status(), "ready");
+        commands.input(b"x\x1b[O\x1b[I").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        assert!(commands.submit(Uuid::now_v7(), "must not run").is_err());
+
+        let mut busy = ready();
+        busy.output(b"\x1b[?1004h");
+        busy.submit(Uuid::now_v7(), "Start-Sleep -Seconds 1").unwrap();
+        busy.input(b"\x1b[O\x1b[I").unwrap();
+        assert_eq!(busy.shell_status(), "busy");
+        assert!(busy.input(b"x").is_err());
+        assert!(busy.input(b"\x1b[0;0R").is_err(), "unrelated replies are not authorized by focus mode");
+
+        let mut disabled = ready();
+        disabled.output(b"\x1b[?1004h\x1b[?1004l");
+        disabled.input(b"\x1b[O").unwrap();
+        assert_eq!(disabled.readiness_reason(), "unclassified_terminal_input");
+        let mut reset = ready();
+        reset.output(b"\x1b[?1004h\x1bc");
+        assert!(!reset.focus_reporting);
+    }
     #[test]
     fn win32_releases_do_not_edit_but_keydown_and_unknown_replies_remain_guarded() {
         let mut commands = Commands::new();
