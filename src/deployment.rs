@@ -792,7 +792,9 @@ mod tests {
         let descendant = std::env::var_os("ARTERM_FORCE_TEST_DESCENDANT").map(|path| {
             let child_ready = PathBuf::from(&ready).with_extension("child-ready");
             let child = hung_fixture(Path::new(&path), &child_ready, None, None);
-            fs::write(PathBuf::from(&ready).with_extension("child-pid"), child.0.id().to_string()).unwrap();
+            let pending = PathBuf::from(&ready).with_extension("child-pid.tmp");
+            fs::write(&pending, child.0.id().to_string()).unwrap();
+            fs::rename(pending, PathBuf::from(&ready).with_extension("child-pid")).unwrap();
             child
         });
         fs::write(&ready, b"ready").unwrap();
