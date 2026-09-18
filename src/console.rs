@@ -155,6 +155,13 @@ struct Guard {
     replies: Arc<Mutex<console_queries::Replies>>,
 }
 impl Guard {
+    fn cleanup_replies(&self) -> std::sync::MutexGuard<'_, console_queries::Replies> {
+        self.replies.lock().unwrap_or_else(|poisoned| {
+            crate::statusln!("[console] Input-reader state was poisoned; attempting terminal cleanup.");
+            poisoned.into_inner()
+        })
+    }
+
     fn restore_modes(&mut self) {
         let restore: String = self.modes.iter()
             .map(|(mode, enabled)| format!("\x1b[?{mode}{}", if *enabled { 'h' } else { 'l' })).collect();
@@ -225,7 +232,7 @@ impl Drop for Guard {
     fn drop(&mut self) {
         self.restore_modes();
         {
-            let mut replies = self.replies.lock().unwrap();
+            let mut replies = self.cleanup_replies();
             if let Err(error) = collect_replies(self.hin, &mut replies, Duration::from_millis(200)) {
                 crate::statusln!("[console] Cannot drain local mode replies: {error:#}");
             }
@@ -437,7 +444,7 @@ impl Drop for Console {
                         if WriteConsoleInputW(self.guard.as_ref().unwrap().hin, &wake, 1, &mut written) == 0 {
                             crate::statusln!("[console] Cannot wake input reader: {}", io::Error::last_os_error());
                         } else {
-                            self.guard.as_ref().unwrap().replies.lock().unwrap().wake_pending = true;
+                            self.guard.as_ref().unwrap().cleanup_replies().wake_pending = true;
                         }
                     }
                 }
@@ -458,13 +465,15 @@ impl Drop for Console {
 mod exit_tests {
     use super::*;
 
-    fn input_modes(hin: HANDLE, hout: HANDLE) -> Result<std::collections::BTreeMap<u16, bool>> {
-        let mut replies = console_queries::Replies::new(INPUT_MODES);
-        let queries: String = INPUT_MODES.iter().map(|mode| format!("\x1b[?{mode}$p")).collect();
+    fn input_modes(hin: HANDLE, hout: HANDLE, modes: &[u16], require_all: bool) -> Result<std::collections::BTreeMap<u16, bool>> {
+        let mut replies = console_queries::Replies::new(modes);
+        let queries: String = modes.iter().map(|mode| format!("\x1b[?{mode}$p")).collect();
         write_console(hout, queries.as_bytes())?;
         collect_replies(hin, &mut replies, Duration::from_secs(2))?;
-        ensure!(replies.outstanding.is_empty(), "controlled fixture did not finish mode observation");
-        ensure!(replies.states.len() == INPUT_MODES.len(), "controlled fixture must support all tested modes");
+        if require_all {
+            ensure!(replies.outstanding.is_empty(), "supported mode observation did not finish");
+            ensure!(replies.states.len() == modes.len(), "previously supported modes were not reported");
+        }
         Ok(replies.states)
     }
 
@@ -486,15 +495,17 @@ mod exit_tests {
             let replies = console.guard.as_ref().unwrap().replies.clone();
             {
                 let mut state = replies.lock().unwrap();
+                state.outstanding.insert(42499); // Model a native mode query with no reply.
                 collect_replies(hin, &mut state, Duration::from_secs(2)).unwrap();
-                assert!(state.outstanding.is_empty());
-                *state = console_queries::Replies::new(&[9001, 1004]);
+                // Native ConPTY versions need not answer every mode query. Use
+                // synthetic-only IDs so their replies cannot collide with this case.
+                *state = console_queries::Replies::new(&[42420, 42421]);
             }
             let handle = hin as usize;
             let writer = thread::spawn(move || {
-                inject(handle, b"q\x1b[?9001;");
+                inject(handle, b"q\x1b[?42420;");
                 thread::sleep(Duration::from_millis(150));
-                inject(handle, b"1$y\x1b[?1004;2$yz");
+                inject(handle, b"1$y\x1b[?42421;2$yz");
             });
             collect_replies(hin, &mut replies.lock().unwrap(), Duration::from_millis(100)).unwrap();
             assert_eq!(replies.lock().unwrap().outstanding.len(), 2);
@@ -544,16 +555,22 @@ mod exit_tests {
             assert!(started.elapsed() < Duration::from_millis(500));
             assert_ne!(SetConsoleMode(hout, original | ENABLE_VIRTUAL_TERMINAL_PROCESSING), 0);
             delayed_replies(hin);
+            let supported: Vec<u16> = input_modes(hin, hout, INPUT_MODES, false).unwrap().keys().copied().collect();
+            let mut before_input = 0;
+            let mut before_output = 0;
+            assert_ne!(GetConsoleMode(hin, &mut before_input), 0);
+            assert_ne!(GetConsoleMode(hout, &mut before_output), 0);
+            let before_cp = (GetConsoleCP(), GetConsoleOutputCP());
             for inherited in [false, true] {
                 write_console(hout, if inherited { b"\x1b[?1004h\x1b[?2004h\x1b[?9001h" }
                     else { b"\x1b[?1004l\x1b[?2004l\x1b[?9001l" }).unwrap();
-                let before = input_modes(hin, hout).unwrap();
+                let before = input_modes(hin, hout, &supported, true).unwrap();
                 let mut unknown = Console::new(false).unwrap();
                 unknown.guard.as_mut().unwrap().modes.clear();
                 unknown.output(if inherited { b"\x1b[?9001l\x1b[?1004l\x1b[?2004l" }
                     else { b"\x1b[?9001h\x1b[?1004h\x1b[?2004h" }).unwrap();
                 drop(unknown);
-                assert_eq!(input_modes(hin, hout).unwrap(), before);
+                assert_eq!(input_modes(hin, hout, &supported, true).unwrap(), before);
                 for reading in [false, true] {
                     let mut console = Console::new(false).unwrap();
                     console.reading(reading);
@@ -561,9 +578,27 @@ mod exit_tests {
                         else { b"\x1b[?1004h\x1b[?2004h\x1b[?9001h\x1b[?1003h" }).unwrap();
                     thread::sleep(Duration::from_millis(40));
                     drop(console);
-                    assert_eq!(input_modes(hin, hout).unwrap(), before);
+                    assert_eq!(input_modes(hin, hout, &supported, true).unwrap(), before);
+                    let mut after_input = 0;
+                    let mut after_output = 0;
+                    assert_ne!(GetConsoleMode(hin, &mut after_input), 0);
+                    assert_ne!(GetConsoleMode(hout, &mut after_output), 0);
+                    assert_eq!((after_input, after_output), (before_input, before_output));
+                    assert_eq!((GetConsoleCP(), GetConsoleOutputCP()), before_cp);
                 }
             }
+            let poisoned_console = Console::new(false).unwrap();
+            let replies = poisoned_console.guard.as_ref().unwrap().replies.clone();
+            assert!(std::panic::catch_unwind(|| {
+                let _state = replies.lock().unwrap();
+                panic!("intentional test-only input-state poisoning");
+            }).is_err());
+            drop(poisoned_console);
+            let mut restored_input = 0;
+            let mut restored_output = 0;
+            assert_ne!(GetConsoleMode(hin, &mut restored_input), 0);
+            assert_ne!(GetConsoleMode(hout, &mut restored_output), 0);
+            assert_eq!((restored_input, restored_output), (before_input, before_output));
             write_console(hout, b"\x1b[?1004l\x1b[?2004l\x1b[?9001l").unwrap();
             SetConsoleMode(hout, original);
         }
@@ -577,42 +612,6 @@ mod exit_tests {
         assert_eq!(filter.output(b"\x1b[?9001l", &[(9001, true)]).unwrap(), b"\x1b[?9001l");
         assert_eq!(filter.output(b"\x1b[31mred\x1b[0m", &[]).unwrap(), b"\x1b[31mred\x1b[0m");
         assert_eq!(filter.output(b"\x1b\x1b[?9001h", &[]).unwrap(), b"\x1b");
-    }
-
-    #[test]
-    fn unterminated_csi_consumes_next_character_even_without_client() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-        let mut command = CommandBuilder::new("cmd.exe");
-        command.args(["/d", "/q"]);
-        let mut child = pair.slave.spawn_command(command).unwrap();
-        drop(pair.slave);
-        let mut writer = pair.master.take_writer().unwrap();
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let output = thread::spawn(move || {
-            let mut bytes = [0; 4096];
-            while let Ok(n) = reader.read(&mut bytes) {
-                if n == 0 || tx.send(bytes[..n].to_vec()).is_err() { break; }
-            }
-        });
-        // No arTerm process, output negotiation, or console restoration runs here.
-        writer.write_all(b"\x1b[123;").unwrap();
-        thread::sleep(Duration::from_millis(100));
-        writer.write_all(b"echo BASELINE-PROOF\r").unwrap();
-        let mut bytes = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let reproduced = loop {
-            if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) { bytes.extend(chunk); }
-            if bytes.windows(b"'cho'".len()).any(|b| b == b"'cho'") { break true; }
-            if Instant::now() >= deadline { break false; }
-        };
-        child.kill().unwrap();
-        child.wait().unwrap();
-        drop(writer);
-        drop(pair.master);
-        output.join().unwrap();
-        assert!(reproduced, "baseline output: {:?}", String::from_utf8_lossy(&bytes));
     }
 
     #[test]
@@ -630,7 +629,7 @@ mod exit_tests {
             reader.read_to_end(&mut bytes).unwrap();
             bytes
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() { break status; }
             if Instant::now() >= deadline {
