@@ -1349,10 +1349,12 @@ fn run_at_with_transport<T>(root: PathBuf, start: impl FnOnce() -> Result<T>) ->
         )?,
     )?;
     while !broker.stopping.load(Ordering::SeqCst) {
-        let pair = host_pipe::accept(&broker.pipe)?;
+        let pair = host_pipe::accept(&broker.pipe);
+        // The shutdown wakeup can close before accept completes.
         if broker.stopping.load(Ordering::SeqCst) {
             break;
         }
+        let pair = pair?;
         let broker = broker.clone();
         thread::spawn(move || {
             let mut input = pair.input;

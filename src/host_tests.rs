@@ -326,6 +326,15 @@ fn silent_peer_is_closed_at_unchanged_watchdog_without_wire_error() {
 }
 
 #[test]
+fn stop_wakeup_closing_does_not_fail_broker_shutdown() {
+    for _ in 0..32 {
+        let mut fixture = TestBroker::start();
+        fixture.finish().unwrap();
+        assert!(!fixture.root.join("host").join("broker.json").exists());
+    }
+}
+
+#[test]
 fn stop_is_successful_when_scoped_host_is_absent() {
     let root = std::env::temp_dir().join(format!("devbox-host-absent-{}", Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
