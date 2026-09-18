@@ -46,6 +46,9 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
             "Command completed successfully."
         }
         Some("completed") => "Command completed without success.",
+        Some("timeout") if response["submitted"] == false => {
+            "Readiness timed out; no command was submitted and interactive input was not changed."
+        }
         Some("timeout") => {
             "Wait timed out; the remote command was not cancelled. Query its command ID."
         }
@@ -261,6 +264,11 @@ mod tests {
         assert_eq!(human.matches("pending input").count(), 1);
         assert!(human.contains("interactive_input_pending") && human.contains("host: unknown"));
         assert!(!human.contains("secret-routing") && !human.contains('{'));
+        let timeout = json!({"status":"timeout","phase":"readiness","submitted":false});
+        let human = result(&timeout, "work", "shell", false).unwrap();
+        assert!(human.contains("no command was submitted"));
+        assert!(!human.contains("Query its command ID"));
+        assert_eq!(exit_code(&timeout), 124);
     }
 
     #[test]

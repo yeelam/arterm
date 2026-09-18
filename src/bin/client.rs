@@ -46,7 +46,7 @@ Usage:\n\
   arterm remove ALIAS\n\
   arterm connect ALIAS [REF] [--shell EXE] [--cwd PATH] [--retries 0..20]\n\
   arterm list --client [--json] | list --server MACHINE [--json]\n\
-  arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--wait --timeout 60s] [--json]\n\
+  arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--timeout 60s] [--wait] [--json]\n\
   arterm read MACHINE SESSION [--lines N | --command-id UUID] [--json]\n\
   arterm interrupt MACHINE SESSION [--json] | detach MACHINE SESSION [--json]\n\
   arterm terminate MACHINE SESSION [--json]\n\
@@ -55,6 +55,7 @@ Usage:\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
 Control commands print readable results by default; use --json for structured automation output.\n\
 Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
+Send waits up to 30s for readiness by default; --timeout overrides it. --wait requires --timeout and shares its budget with completion.\n\
 Command IDs are retained for the session lifetime; capacity is 256, with no silent eviction or replacement.\n\
 Local IPC requires OS trust, the pinned certificate, and byte-identical client builds; cross-elevation is rejected.\n\
 Ctrl+] detaches without terminating the remote session.",
@@ -484,7 +485,7 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
         "interrupt" => Operation::Interrupt,
         "send" => {
             ensure!(command.is_some(), "send requires --command");
-            ensure!(wait == timeout.is_some(), "--wait requires explicit --timeout; --timeout requires --wait");
+            ensure!(!wait || timeout.is_some(), "--wait requires explicit --timeout");
             ensure!(!wait || command.is_some(), "--wait is only valid with --command");
             ensure!(command_id.is_none() || command.is_some(), "--command-id is only valid with --command");
             Operation::Send { command: command.unwrap(), timeout_ms: timeout }
@@ -503,13 +504,26 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
     ensure!(matches.len() == 1,
         "no unique active managed local client for {machine} {}; connect explicitly (an older unmanaged client cannot be controlled)",
         reference.as_str());
-    let operation_id = command_id.unwrap_or_else(Uuid::now_v7);
+    let operation_id = if verb == "send" { command_id.unwrap_or_else(Uuid::now_v7) } else { Uuid::now_v7() };
+    let action = if let Operation::Send { command, timeout_ms } = action {
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
+            let response = serde_json::json!({"status":"timeout","phase":"readiness","command_id":operation_id,"submitted":false,"cancelled":false});
+            println!("{}", client_output::result(&response, machine, reference.as_str(), json)?);
+            return Ok(124);
+        }
+        Operation::Send { command, timeout_ms: remaining.map(|remaining| remaining.as_millis().max(1) as u64).or(timeout_ms) }
+    } else { action };
     let mut response = local_control::request_with_id(&matches[0], action, operation_id)
         .with_context(|| format!("local request failed; command/operation ID {operation_id}; query rather than resubmit"))?;
+    if verb == "send" && response["status"] == "ok" && response["host"]["lookup"] == "unknown" {
+        response["status"] = "unknown".into();
+        response["error"] = "broker has no command record; the request was not resubmitted".into();
+    }
     if wait && (response["status"] == "accepted" || response["status"] == "ok") {
         let remaining = deadline.unwrap().saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            response = serde_json::json!({"status":"timeout","command_id":operation_id,"cancelled":false});
+            response = serde_json::json!({"status":"timeout","phase":"completion","command_id":operation_id,"submitted":true,"cancelled":false});
         } else {
             response = local_control::request(&matches[0], Operation::Wait {
                 command_id: operation_id, timeout_ms: remaining.as_millis().max(1).try_into().context("timeout overflow")?,

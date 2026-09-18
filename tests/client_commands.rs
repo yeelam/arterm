@@ -82,7 +82,6 @@ fn help_version_and_validation_do_not_require_setup() {
         vec!["send", "work", "session"],
         vec!["send", "work", "session", "--command", "x", "--file", "x"],
         vec!["send", "work", "session", "--command", "x", "--wait"],
-        vec!["send", "work", "session", "--command", "x", "--timeout", "60s"],
         vec!["send", "work", "session", "--command", "x", "--wait", "--timeout", "0s"],
         vec!["send", "work", "session", "--file", "x", "--wait", "--timeout", "60s"],
         vec!["read", "work", "session", "--lines", "0"],

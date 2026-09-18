@@ -1069,6 +1069,13 @@ impl Engine {
                         _ => bail!("unexpected engine control operation"),
                     };
                     fields.push(("command_id", s(&id.to_string())));
+                    if control.submission.as_ref().is_some_and(|submission| !submission.dispatch()) {
+                        terminal.command_event("CommandNotSubmitted", &map(vec![
+                            ("command_id", s(&control.operation_id.to_string())),
+                            ("code", s("caller left or readiness deadline expired before dispatch")),
+                        ]));
+                        continue;
+                    }
                     if link.send(&message(kind, map(fields))).is_err() {
                         terminal.reading(false);
                         return Ok(End::Disconnected);

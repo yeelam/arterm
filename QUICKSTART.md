@@ -181,8 +181,15 @@ arterm.exe send my-devbox MyWork --command '$work = Get-Location; $work' --wait 
 arterm.exe read my-devbox MyWork --lines 20
 ```
 
-Omit both `--wait` and `--timeout` to return on acceptance instead of waiting.
-Submit another command only after the shell is ready.
+Omit `--wait` to return on acceptance rather than completion. A send waits up
+to 30 seconds for safe readiness by default; use `--timeout 5s` to choose a
+different readiness budget. Busy or initializing sessions can become ready
+during this wait; no command is inserted into pending interactive input.
+Startup support requires an observed, correlated shell integration ready marker,
+not VT capability traffic. If that marker never arrives, the finite readiness
+timeout reports `IntegrationNotEstablished` with `submitted: false`; unknown
+startup input is not classified as a busy managed command. Explicitly unsupported
+sessions fail immediately instead of consuming the readiness budget.
 
 Machine always precedes session. Plain `list` lists registered machines;
 `list --client` lists active managed local connections; `list --server MACHINE`
@@ -220,15 +227,20 @@ query's process exit code.
 <summary>Waiting, idempotency, shell support, and advanced limits</summary>
 
 `--wait` requires an explicit `--timeout` in positive, finite whole seconds
-(for example, `60s`); `--timeout` also requires `--wait`. Waiting returns early
+(for example, `60s`). With `--wait`, that one budget covers readiness,
+submission, and completion. Without `--wait`, it bounds readiness and acceptance.
+Waiting returns early
 when the matching real completion has arrived and its preceding output has
 been delivered, not after sleeping for the entire timeout.
 
 Acceptance, completion, and success are distinct. Records expose `state`,
 `succeeded`, and nullable `exit_code`; a PowerShell command need not have a
 native exit code. A completed wait exits 0 for success or 1 otherwise; timeout
-exits 124, and an unknown outcome exits 6. **Timeout or waiter exit does not
-cancel the remote command.** Query its ID after uncertainty rather than
+exits 124, and an unknown outcome exits 6. A pre-submission timeout reports
+`phase: readiness`, `submitted: false`, and discards the request. A caller
+that disconnects while awaiting readiness cannot leave work to execute later.
+Once dispatch starts, **timeout or waiter exit does not cancel the remote
+command.** Query its ID after uncertainty rather than
 blindly resending. Reattach first if the owner has exited.
 
 For retry correlation,
@@ -245,8 +257,11 @@ managed execution before command bytes are sent. Completion is correlated
 through adapter events, never inferred from visible prompt text, idle time,
 or input acknowledgments.
 
-Only one managed command runs at a time. Busy or partial human input rejects
-new sends, and managed execution does not interleave human command bytes.
+Only one managed command runs at a time. Sends wait for busy/initializing
+sessions and partial human input to reach a safe prompt, up to the deadline.
+They never clear the line or interleave command bytes. At most four readiness
+or completion waiters are admitted per owner, leaving other controls and
+interactive/protocol processing available.
 Replacing the adapter's prompt or entering nested input can prevent readiness
 or completion reporting; do not treat silence as success.
 

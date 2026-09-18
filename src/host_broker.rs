@@ -1081,14 +1081,19 @@ impl Broker {
                                 }
                                 if seq == st.input_committed + 1 {
                                     if let Some(commands) = &mut st.commands {
-                                        if commands.input(&bytes).is_err() {
+                                        if let Err(error) = commands.input(&bytes) {
+                                            let detail = if commands.input_ready() {
+                                                "human input rejected while managed command owns input"
+                                            } else {
+                                                "shell integration has not emitted its first supported ready marker; input was not injected"
+                                            };
                                             drop(st);
                                             send(&mut output, message(
                                                 if command_capable { "InputRejected" } else { "Error" }, map(vec![
                                                 ("session_id", s(&session.id.to_string())),
                                                 ("input_seq", seq.into()),
-                                                ("code", s("CommandBusy")),
-                                                ("detail", s("human input rejected while managed command owns input")),
+                                                ("code", s(&error.to_string())),
+                                                ("detail", s(detail)),
                                             ])))?;
                                             continue;
                                         }

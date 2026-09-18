@@ -169,6 +169,7 @@ function global:prompt {
             ensure!(record.request_hash == hash, "CommandIdConflict");
             return Ok((record.clone(), None));
         }
+        ensure!(self.initialized, "IntegrationNotEstablished");
         ensure!(self.ready && self.active.is_none(), "CommandBusy");
         // Never evict deduplication identities then accidentally execute them again.
         ensure!(self.records.len() < MAX_RECORDS, "CommandHistoryFull");
@@ -230,7 +231,10 @@ function global:prompt {
                 keys.extend(pending.drain(..).map(|byte| (u32::from(byte), 1)));
             }
         }
-        ensure!((keys.is_empty() && pending.is_empty()) || (self.initialized && self.active.is_none()), "CommandBusy");
+        if !keys.is_empty() || !pending.is_empty() {
+            ensure!(self.initialized, "IntegrationNotEstablished");
+            ensure!(self.active.is_none(), "CommandBusy");
+        }
         self.input_sequence = pending;
         self.unclassified_input = unclassified;
         for (key, mut repeat) in keys {
@@ -474,7 +478,11 @@ mod tests {
         let mut commands = Commands::new();
         let fake = b"\x1b]633;D;0\x07";
         assert_eq!(commands.output(fake), fake);
-        assert!(commands.submit(Uuid::now_v7(), "x").is_err());
+        commands.output(b"\x1b[?1004h\x1b[6n\x1b[?1;2c");
+        assert!(!commands.input_ready(), "VT capability is not shell integration");
+        assert_eq!(commands.readiness_reason(), "initializing");
+        assert_eq!(commands.input(b"\x1b[?99z").unwrap_err().to_string(), "IntegrationNotEstablished");
+        assert_eq!(commands.submit(Uuid::now_v7(), "x").unwrap_err().to_string(), "IntegrationNotEstablished");
         commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());
         commands.input(b"x").unwrap();
         commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());

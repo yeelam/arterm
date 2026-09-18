@@ -46,7 +46,7 @@ fn send(socket: &Arc<Mutex<TcpStream>>, value: Value) {
 }
 pub(crate) struct Fixture {
     pub(crate) home: PathBuf,
-    host: Child,
+    pub(crate) host: Child,
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
@@ -279,6 +279,16 @@ struct SyntheticInputTrace {
     acknowledged: u64,
 }
 fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>) -> (String, mpsc::Receiver<TcpStream>) {
+    relay_with_creation_gate(home, attachments, trace, None)
+}
+#[derive(Default)]
+struct CreationGate {
+    frame: &'static str,
+    observed: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+}
+fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>,
+    gate: Option<Arc<CreationGate>>) -> (String, mpsc::Receiver<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
@@ -288,6 +298,7 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Synth
             let home = home.clone();
             let tx = tx.clone();
             let trace = trace.clone();
+            let gate = gate.clone();
             thread::spawn(move || {
             incoming
                 .set_read_timeout(Some(Duration::from_secs(45)))
@@ -342,6 +353,7 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Synth
             ] {
                 let out = out.clone();
                 let trace = trace.clone();
+                let gate = gate.clone();
                 thread::spawn(move || {
                     let mut data = [0; 4096];
                     let mut frames = arterm::wire::Frames::default();
@@ -353,6 +365,17 @@ fn relay_traced(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<Synth
                         if id == 12 {
                             frames.push(&data[..n]).unwrap();
                             while let Some(frame) = frames.next().unwrap() {
+                                if let Some(gate) = &gate {
+                                    if get(&frame, "type").as_str() == Some(gate.frame) {
+                                        use std::sync::atomic::Ordering;
+                                        gate.observed.store(true, Ordering::Release);
+                                        let deadline = Instant::now() + Duration::from_secs(15);
+                                        while !gate.release.load(Ordering::Acquire) {
+                                            assert!(Instant::now() < deadline, "owned {} gate was not released", gate.frame);
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                    }
+                                }
                                 if get(&frame, "type").as_str() == Some("InputAck") {
                                     if let Some(trace) = &trace { trace.lock().unwrap().acknowledged += 1; }
                                 }
@@ -551,9 +574,10 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             assert!(Instant::now() < deadline, "{owners}");
             thread::sleep(Duration::from_millis(20));
         }
-        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
-        assert!(!rejected.status.success());
+        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--timeout", "1s", "--json"]);
+        assert_eq!(rejected.status.code(), Some(124));
         let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["submitted"], false);
         assert_eq!(rejected["readiness_reason"], "partial_human_input");
         assert_eq!(rejected["command_execution"], true);
         assert_eq!(rejected["command_capability"], true);
@@ -565,19 +589,151 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             if owners[0]["shell_status"] == "ready" { break; }
             assert!(Instant::now() < deadline, "clear interactive line: {owners}; input={:?}", trace.lock().unwrap());
         }
-        let busy = control(&["send", "fixture", &reference, "--command", "Start-Sleep -Seconds 2", "--json"]);
+        let busy_id = Uuid::now_v7().to_string();
+        let busy = control(&["send", "fixture", &reference, "--command",
+            "while ($true) { Start-Sleep -Milliseconds 100 }", "--command-id", &busy_id, "--json"]);
         assert!(busy.status.success(), "{}", String::from_utf8_lossy(&busy.stdout));
+        let running_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let query = control(&["read", "fixture", &reference, "--command-id", &busy_id, "--json"]);
+            assert!(query.status.success(), "{} {}", String::from_utf8_lossy(&query.stdout), String::from_utf8_lossy(&query.stderr));
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "running" { break; }
+            assert!(Instant::now() < running_deadline, "busy command never started: {query}");
+            thread::sleep(Duration::from_millis(20));
+        }
         writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
-        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--json"]);
-        assert!(!rejected.status.success());
+        let rejected = control(&["send", "fixture", &reference, "--command", "Get-Date", "--timeout", "1s", "--json"]);
+        assert_eq!(rejected.status.code(), Some(124));
         let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
         assert_eq!(rejected["shell_status"], "busy");
-        assert!(control(&["interrupt", "fixture", &reference, "--json"]).status.success());
+        assert_eq!(rejected["phase"], "readiness");
+        assert_eq!(rejected["submitted"], false);
+        let interrupted = control(&["interrupt", "fixture", &reference, "--json"]);
+        assert!(interrupted.status.success(), "interrupt: {} {}",
+            String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
+        let completion_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let query = control(&["read", "fixture", &reference, "--command-id", &busy_id, "--json"]);
+            assert!(query.status.success(), "{} {}", String::from_utf8_lossy(&query.stdout), String::from_utf8_lossy(&query.stderr));
+            let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+            if query["record"]["state"] == "completed" {
+                assert_eq!(query["record"]["interrupt_requested"], true);
+                break;
+            }
+            assert!(Instant::now() < completion_deadline, "interrupted command did not complete: {query}");
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(control(&["detach", "fixture", &reference]).status.success());
         client.0.wait().unwrap();
         drop(writer);
         drop(pair.master);
         reader_thread.join().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
+    use std::sync::atomic::Ordering;
+    struct Pending(Option<Child>);
+    impl Pending {
+        fn output(mut self) -> std::process::Output { self.0.take().unwrap().wait_with_output().unwrap() }
+    }
+    impl Drop for Pending {
+        fn drop(&mut self) { if let Some(child) = &mut self.0 { let _ = child.kill(); let _ = child.wait(); } }
+    }
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release { fn drop(&mut self) { self.0.release.store(true, Ordering::Release); } }
+    for frame in ["HelloOk", "SessionCreated"] {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame, ..CreationGate::default() });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 1, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("ReadyWait"), &address);
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+    let spawn = |args: &[&str]| Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let inspect = || {
+        let output = control(&["list","--client","--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "{frame} handshake was not observed");
+        thread::sleep(Duration::from_millis(10));
+    }
+    if frame == "HelloOk" {
+        let owners = inspect();
+        assert_eq!(owners[0]["connection_state"], "connecting");
+        assert_eq!(owners[0]["command_capability"], false);
+        assert!(owners[0]["command_execution"].is_null());
+        let started = Instant::now();
+        let expired = control(&["send","fixture","readywait","--command","$RunCount=999","--timeout","1s","--json"]);
+        assert_eq!(expired.status.code(), Some(124), "pre-HelloOk: {} {}", String::from_utf8_lossy(&expired.stdout), String::from_utf8_lossy(&expired.stderr));
+        assert!(started.elapsed() >= Duration::from_millis(900) && started.elapsed() < Duration::from_secs(3));
+        let expired: serde_json::Value = serde_json::from_slice(&expired.stdout).unwrap();
+        assert_eq!(expired["phase"], "readiness");
+        assert_eq!(expired["submitted"], false);
+    }
+    let initial = spawn(&["send","fixture","readywait","--command","$RunCount=1","--wait","--timeout","10s","--json"]);
+    while inspect()[0]["control_waiters"].as_u64().unwrap() == 0 {
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(inspect()[0]["connection_state"], "connecting");
+    assert!(control(&["read","fixture","readywait","--json"]).status.success());
+    gate.release.store(true, Ordering::Release);
+    let initial = initial.output();
+    assert!(initial.status.success(), "{} {}", String::from_utf8_lossy(&initial.stdout), String::from_utf8_lossy(&initial.stderr));
+
+    let first = control(&["send","fixture","readywait","--command","Start-Sleep -Seconds 3; $RunCount++","--json"]);
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stdout));
+    let second = spawn(&["send","fixture","readywait","--command","$RunCount++","--wait","--timeout","10s","--json"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inspect()[0]["control_waiters"].as_u64().unwrap() == 0 {
+        assert!(Instant::now() < deadline);
+    }
+    assert!(control(&["read","fixture","readywait","--json"]).status.success(), "waiting blocked other controls");
+    let second = second.output();
+    assert!(second.status.success(), "{} {}", String::from_utf8_lossy(&second.stdout), String::from_utf8_lossy(&second.stderr));
+
+    owner.input.write_all(b"$Partial='").unwrap();
+    owner.input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inspect()[0]["readiness_reason"] != "partial_human_input" { assert!(Instant::now() < deadline); }
+    let expired = control(&["send","fixture","readywait","--command","$RunCount=999","--timeout","1s","--json"]);
+    assert_eq!(expired.status.code(), Some(124), "{}", String::from_utf8_lossy(&expired.stdout));
+    let expired: serde_json::Value = serde_json::from_slice(&expired.stdout).unwrap();
+    assert_eq!(expired["phase"], "readiness");
+    assert_eq!(expired["submitted"], false);
+    owner.command("kept'; Write-Output ('PARTIAL='+$Partial)");
+    owner.wait_for(|out, _| out.contains("PARTIAL=kept"));
+    let query = control(&["read","fixture","readywait","--command-id",expired["command_id"].as_str().unwrap(),"--json"]);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&query.stdout).unwrap()["host"]["lookup"], "unknown");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inspect()[0]["shell_status"] != "ready" { assert!(Instant::now() < deadline); }
+    owner.input.write_all(b"$Cancel='").unwrap();
+    owner.input.flush().unwrap();
+    while inspect()[0]["readiness_reason"] != "partial_human_input" { assert!(Instant::now() < deadline); }
+    let abandoned_id = Uuid::now_v7().to_string();
+    let mut abandoned = spawn(&["send","fixture","readywait","--command","$RunCount=888","--command-id",&abandoned_id,"--json"]);
+    while inspect()[0]["control_waiters"].as_u64().unwrap() == 0 { assert!(Instant::now() < deadline); }
+    abandoned.0.as_mut().unwrap().kill().unwrap();
+    abandoned.0.as_mut().unwrap().wait().unwrap();
+    while inspect()[0]["control_waiters"].as_u64().unwrap() != 0 { assert!(Instant::now() < deadline); }
+    owner.command("kept'; Write-Output ('CANCEL='+$Cancel)");
+    owner.wait_for(|out, _| out.contains("CANCEL=kept"));
+    let query = control(&["read","fixture","readywait","--command-id",&abandoned_id,"--json"]);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&query.stdout).unwrap()["host"]["lookup"], "unknown");
+    let proof = control(&["send","fixture","readywait","--command",
+        "if ($RunCount -ne 3 -or $Partial -ne 'kept' -or $Cancel -ne 'kept') { throw 'queued or partial input was changed' }",
+        "--wait","--timeout","10s","--json"]);
+    assert!(proof.status.success(), "{} {}", String::from_utf8_lossy(&proof.stdout), String::from_utf8_lossy(&proof.stderr));
+    owner.detach();
     }
 }
 
@@ -806,7 +962,9 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
             if query["record"]["state"] == "running" { break; }
             assert!(Instant::now() < deadline);
         }
-        assert!(!control(&["send", "fixture", "automation", "--command", "$Counter=999", "--json"]).status.success());
+        let timed_busy = control(&["send", "fixture", "automation", "--command", "$Counter=999", "--timeout", "1s", "--json"]);
+        assert_eq!(timed_busy.status.code(), Some(124));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&timed_busy.stdout).unwrap()["submitted"], false);
         let interrupted = control(&["interrupt", "fixture", "automation"]);
         assert!(interrupted.status.success(), "{} {}", String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
         assert!(String::from_utf8_lossy(&interrupted.stdout).contains("Interrupt requested"));

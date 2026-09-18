@@ -16,7 +16,7 @@ use std::{
     os::windows::io::{AsHandle, AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread,
@@ -34,6 +34,7 @@ const VERSION: u32 = 1;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const HISTORY: usize = 2000;
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+pub const READINESS_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -226,6 +227,60 @@ struct Shared {
 pub struct ControlMessage {
     pub operation_id: Uuid,
     pub action: Operation,
+    pub submission: Option<Arc<Submission>>,
+}
+pub struct Submission {
+    state: AtomicU8,
+    deadline: Instant,
+    caller_pipe: Option<File>,
+}
+impl Submission {
+    pub fn dispatch(&self) -> bool {
+        if Instant::now() >= self.deadline {
+            self.cancel_pending();
+            return false;
+        }
+        if let Some(pipe) = &self.caller_pipe {
+            let mut available = 0;
+            if unsafe {
+                PeekNamedPipe(
+                    pipe.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                self.cancel_pending();
+                return false;
+            }
+        }
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    fn cancel_pending(&self) -> bool {
+        self.state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            || self.state.load(Ordering::Acquire) == 2
+    }
+}
+struct PendingSubmission(Option<Arc<Submission>>);
+impl Drop for PendingSubmission {
+    fn drop(&mut self) {
+        if let Some(submission) = &self.0 {
+            submission.cancel_pending();
+        }
+    }
+}
+struct WaitSlot<'a>(&'a AtomicUsize);
+impl Drop for WaitSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 #[derive(Default)]
 struct ControlState {
@@ -239,6 +294,8 @@ struct ControlState {
     host_version: Option<String>,
     readiness_reason: Option<String>,
     delivered: u64,
+    submitting: Option<Uuid>,
+    capability_known: bool,
 }
 pub struct Owner {
     pub identity: Identity,
@@ -279,7 +336,8 @@ impl Owner {
             detach: AtomicBool::new(false),
             stop: Arc::new(AtomicBool::new(false)),
             control: Mutex::new(ControlState {
-                shell_status: "unsupported".into(),
+                shell_status: "not_ready".into(),
+                readiness_reason: Some("initializing".into()),
                 ..ControlState::default()
             }),
             changed: Condvar::new(),
@@ -428,6 +486,8 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         if state != "connected" {
             let mut control = self.shared.control.lock().unwrap();
             control.supported = false;
+            control.capability_known = false;
+            control.submitting = None;
             control.queue.clear();
         }
         self.shared.changed.notify_all();
@@ -442,7 +502,9 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         self.shared.control.lock().unwrap().queue.pop_front()
     }
     fn command_capability(&mut self, supported: bool) {
-        self.shared.control.lock().unwrap().supported = supported;
+        let mut control = self.shared.control.lock().unwrap();
+        control.supported = supported;
+        control.capability_known = true;
         self.shared.changed.notify_all();
     }
     fn command_context(&mut self, enabled: bool, host_version: Option<&str>) {
@@ -450,7 +512,14 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         control.creation_enabled = Some(enabled);
         control.host_version = host_version.map(str::to_owned);
         control.shell_status = if enabled { "not_ready" } else { "unsupported" }.into();
-        control.readiness_reason = Some(if enabled { "initializing" } else { "integration_disabled" }.into());
+        control.readiness_reason = Some(
+            if enabled {
+                "initializing"
+            } else {
+                "integration_disabled"
+            }
+            .into(),
+        );
         self.shared.changed.notify_all();
     }
     fn command_output_progress(&mut self, seq: u64) {
@@ -463,9 +532,14 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         if let Some(status) = value["shell_status"].as_str() {
             control.shell_status = status.into();
         }
-        if let Some(reason) = value["readiness_reason"].as_str() { control.readiness_reason = Some(reason.into()); }
-        else if value.get("shell_status").is_some() { control.readiness_reason = None; }
-        if let Some(enabled) = value["command_execution"].as_bool() { control.creation_enabled = Some(enabled); }
+        if let Some(reason) = value["readiness_reason"].as_str() {
+            control.readiness_reason = Some(reason.into());
+        } else if value.get("shell_status").is_some() {
+            control.readiness_reason = None;
+        }
+        if let Some(enabled) = value["command_execution"].as_bool() {
+            control.creation_enabled = Some(enabled);
+        }
         let barrier = value["after_output_seq"].as_u64().unwrap_or(0);
         if let Some(records) = value["records"].as_array() {
             for record in records {
@@ -484,6 +558,17 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
             .or_else(|| value["command_id"].as_str())
             .and_then(|id| Uuid::parse_str(id).ok())
         {
+            if control.submitting == Some(id)
+                && matches!(
+                    kind,
+                    "CommandAccepted" | "CommandRejected" | "CommandNotSubmitted"
+                )
+            {
+                control.submitting = None;
+            }
+            if kind == "CommandNotSubmitted" {
+                control.submitted.remove(&id);
+            }
             control
                 .replies
                 .insert(id, json!({"kind":kind, "body":value}));
@@ -521,34 +606,45 @@ fn readiness_error(control: &ControlState) -> String {
         (_, Some("partial_input_sequence")) => "an incomplete terminal input sequence is pending; wait for it to finish",
         (_, Some("unclassified_terminal_input")) => "terminal control/editing input could not be classified; inspect the owning terminal and shell integration; this is not proof that a person typed a partial command",
         (_, Some("human_command_pending")) => "an interactive invocation has not returned to an integrated prompt",
-        (_, Some("initializing")) => "shell integration has not emitted its first ready event; inspect shell startup/profile compatibility",
+        (_, Some("initializing")) => "IntegrationNotEstablished: shell integration has not emitted its first ready event; VT traffic is not evidence of support; inspect shell startup/profile compatibility",
         _ => "the host has not reported a safe prompt; inspect the owning terminal and shell/profile integration",
     };
-    format!("shell_status={}, reason={}: {hint}; no command input was sent",
-        control.shell_status, control.readiness_reason.as_deref().unwrap_or("unreported"))
+    format!(
+        "shell_status={}, reason={}: {hint}; no command input was sent",
+        control.shell_status,
+        control.readiness_reason.as_deref().unwrap_or("unreported")
+    )
 }
 
-fn command_rpc(shared: &Shared, operation_id: Uuid, action: Operation) -> Result<Value> {
+fn command_rpc(
+    shared: &Shared,
+    operation_id: Uuid,
+    action: Operation,
+    pipe: &File,
+    caller_alive: &dyn Fn() -> Result<()>,
+) -> Result<Value> {
+    let occupied = if matches!(&action, Operation::Send { .. } | Operation::Wait { .. }) {
+        Some(shared.waiters.fetch_add(1, Ordering::AcqRel))
+    } else {
+        None
+    };
+    let _slot = occupied.map(|_| WaitSlot(&shared.waiters));
+    ensure!(
+        occupied.is_none_or(|n| n < 4),
+        "waiter capacity reached; query or retry explicitly"
+    );
     let mut control = shared.control.lock().unwrap();
     if let Operation::Wait {
         command_id,
         timeout_ms,
     } = action
     {
-        struct Slot<'a>(&'a AtomicUsize);
-        impl Drop for Slot<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let occupied = shared.waiters.fetch_add(1, Ordering::AcqRel);
-        let _slot = Slot(&shared.waiters);
-        ensure!(occupied < 4, "waiter capacity reached; query by command ID");
         ensure!(timeout_ms > 0, "wait timeout must be positive");
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(timeout_ms))
             .context("timeout overflow")?;
         loop {
+            caller_alive()?;
             if let Some(record) = control.records.get(&command_id) {
                 if record["state"] == "unknown" {
                     return Ok(json!({"status":"unknown","command_id":command_id,"record":record}));
@@ -567,74 +663,171 @@ fn command_rpc(shared: &Shared, operation_id: Uuid, action: Operation) -> Result
             let now = Instant::now();
             if now >= deadline {
                 return Ok(
-                    json!({"status":"timeout","command_id":command_id,"cancelled":false,
+                    json!({"status":"timeout","phase":"completion","command_id":command_id,"submitted":true,"cancelled":false,
                     "record":control.records.get(&command_id)}),
                 );
             }
             control = shared
                 .changed
-                .wait_timeout(control, deadline - now)
+                .wait_timeout(control, (deadline - now).min(Duration::from_millis(100)))
                 .unwrap()
                 .0;
         }
     }
-    let connected = *shared.state.lock().unwrap() == "connected";
-    ensure!(connected, "local connection is not connected; wait for reconnection before control operations");
-    ensure!(control.supported, "remote host does not advertise command-execution-v1; update the remote host, then use a new compatible session (existing sessions are not retrofitted)");
+    let command_id = match &action {
+        Operation::CommandStatus { command_id } => *command_id,
+        _ => operation_id,
+    };
+    let id = operation_id;
+    let mut actual = action.clone();
+    let mut submission = None;
+    let mut send_deadline = None;
+    if let Operation::Send {
+        command,
+        timeout_ms,
+    } = &action
+    {
+        let budget = timeout_ms.unwrap_or(READINESS_TIMEOUT_MS);
+        ensure!(budget > 0, "readiness timeout must be positive");
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(budget))
+            .context("timeout overflow")?;
+        send_deadline = Some(deadline);
+        let hash = format!("{:x}", Sha256::digest(command.as_bytes()));
+        loop {
+            caller_alive()?;
+            ensure!(
+                !shared.stop.load(Ordering::Acquire) && !shared.detach.load(Ordering::Acquire),
+                "local session is stopping; command was not submitted"
+            );
+            let connection = shared.state.lock().unwrap().clone();
+            ensure!(
+                matches!(connection.as_str(), "connecting" | "connected"),
+                "connection changed before submission; command was not submitted"
+            );
+            if control.capability_known {
+                ensure!(control.supported, "remote host does not advertise command-execution-v1; update the remote host (existing sessions are not retrofitted)");
+            }
+            ensure!(control.creation_enabled != Some(false),
+                "session was created without command integration; use a new supported PowerShell session after updating the remote host; saved identity was not changed");
+            ensure!(
+                !(control.capability_known || control.creation_enabled.is_some())
+                    || control.shell_status != "unsupported",
+                "{}", readiness_error(&control)
+            );
+            if let Some(previous) = control.submitted.get(&id) {
+                ensure!(*previous == hash, "command ID conflicts with prior text");
+                actual = Operation::CommandStatus { command_id: id };
+                break;
+            }
+            if connection == "connected"
+                && control.supported
+                && control.shell_status == "ready"
+                && control.submitting.is_none()
+            {
+                if Instant::now() >= deadline {
+                    return Ok(
+                        json!({"status":"timeout","phase":"readiness","command_id":id,"submitted":false,"cancelled":false}),
+                    );
+                }
+                ensure!(
+                    control.queue.len() < 16 && control.replies.len() < 512,
+                    "local command capacity reached"
+                );
+                ensure!(
+                    control.submitted.len() < 256,
+                    "local command identity capacity reached"
+                );
+                caller_alive()?; // Last check at the admission boundary.
+                let ticket = Arc::new(Submission {
+                    state: AtomicU8::new(0),
+                    deadline,
+                    caller_pipe: Some(pipe.try_clone()?),
+                });
+                submission = Some(ticket);
+                control.submitted.insert(id, hash);
+                control.submitting = Some(id);
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(
+                    json!({"status":"timeout","phase":"readiness","command_id":id,"submitted":false,
+                    "cancelled":false,"error":readiness_error(&control)}),
+                );
+            }
+            control = shared
+                .changed
+                .wait_timeout(control, (deadline - now).min(Duration::from_millis(100)))
+                .unwrap()
+                .0;
+        }
+    }
+    ensure!(
+        *shared.state.lock().unwrap() == "connected" && control.supported,
+        "local session is disconnected or host lacks command-execution-v1"
+    );
     ensure!(
         control.queue.len() < 16 && control.replies.len() < 512,
         "local command capacity reached"
     );
-    let id = match &action {
-        Operation::CommandStatus { command_id } => *command_id,
-        _ => operation_id,
-    };
-    let mut actual = action.clone();
-    if let Operation::Send { command, .. } = &action {
-        let hash = format!("{:x}", Sha256::digest(command.as_bytes()));
-        if let Some(previous) = control.submitted.get(&id) {
-            ensure!(*previous == hash, "command ID conflicts with prior text");
-            actual = Operation::CommandStatus { command_id: id };
-        } else {
-            ensure!(control.creation_enabled != Some(false),
-                "session was created without command integration; use a new supported PowerShell session after updating the remote host; saved identity was not changed");
-            ensure!(control.shell_status == "ready", "{}", readiness_error(&control));
-            ensure!(
-                control.submitted.len() < 256,
-                "local command identity capacity reached"
-            );
-            control.submitted.insert(id, hash);
-        }
-    }
+    let _pending = PendingSubmission(submission.clone());
     control.replies.remove(&id);
     control.queue.push_back(ControlMessage {
         operation_id: id,
         action: actual,
+        submission: submission.clone(),
     });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = send_deadline.map_or(Instant::now() + Duration::from_secs(2), |deadline| {
+        deadline.min(Instant::now() + Duration::from_secs(2))
+    });
     loop {
+        caller_alive()?;
         if let Some(reply) = control.replies.remove(&id) {
             let kind = reply["kind"].as_str().unwrap_or("");
             let status = match kind {
                 "CommandRejected" => "rejected",
                 "CommandInterruptAccepted" | "SessionInterruptAccepted" => "interrupt_requested",
                 "CommandStatus" => "ok",
+                "CommandNotSubmitted" => "timeout",
                 _ => "accepted",
             };
             return Ok(
-                json!({"status":status, "command_id":id, "host":reply["body"],
-                "record":control.records.get(&id), "error":reply["body"]["code"]}),
+                json!({"status":status, "command_id":command_id, "host":reply["body"],
+                "phase":if kind == "CommandNotSubmitted" { Some("readiness") } else { None },
+                "submitted":kind != "CommandNotSubmitted",
+                "record":control.records.get(&command_id), "error":reply["body"]["code"]}),
             );
         }
         let now = Instant::now();
         if now >= deadline || shared.stop.load(Ordering::Acquire) {
+            if submission
+                .as_ref()
+                .is_some_and(|ticket| ticket.cancel_pending())
+            {
+                control.queue.retain(|request| request.operation_id != id);
+                control.submitted.remove(&id);
+                if control.submitting == Some(id) {
+                    control.submitting = None;
+                }
+                shared.changed.notify_all();
+                return Ok(
+                    json!({"status":"timeout","phase":"readiness","command_id":id,"submitted":false,"cancelled":false}),
+                );
+            }
+            if send_deadline.is_some_and(|deadline| now >= deadline) {
+                return Ok(
+                    json!({"status":"timeout","phase":"acceptance","command_id":id,"submitted":true,
+                    "cancelled":false,"outcome":"unknown"}),
+                );
+            }
             return Ok(
                 json!({"status":"unknown","command_id":id,"error":"remote outcome not yet known; query this ID; do not resubmit"}),
             );
         }
         control = shared
             .changed
-            .wait_timeout(control, deadline - now)
+            .wait_timeout(control, (deadline - now).min(Duration::from_millis(100)))
             .unwrap()
             .0;
     }
@@ -699,7 +892,24 @@ fn serve(
         | Operation::Interrupt
         | Operation::CommandStatus { .. }
         | Operation::Wait { .. }) => {
-            let response = command_rpc(shared, request.operation_id, action);
+            let response = command_rpc(shared, request.operation_id, action, pipe, &|| {
+                revalidate().context("pending control caller changed or exited")?;
+                let mut available = 0;
+                ensure!(
+                    unsafe {
+                        PeekNamedPipe(
+                            pipe.as_raw_handle(),
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            &mut available,
+                            std::ptr::null_mut(),
+                        )
+                    } != 0,
+                    "pending control caller disconnected"
+                );
+                Ok(())
+            });
             match response {
                 Ok(value) => {
                     for (key, value) in value.as_object().unwrap() {
@@ -720,6 +930,7 @@ fn serve(
         result["command_execution"] = json!(control.creation_enabled);
         result["readiness_reason"] = json!(control.readiness_reason);
         result["host_version"] = json!(control.host_version);
+        result["control_waiters"] = shared.waiters.load(Ordering::Acquire).into();
     }
     result["connection_state"] = shared.state.lock().unwrap().clone().into();
     write_frame(pipe, &serde_json::to_vec(&result)?)?;
@@ -775,6 +986,10 @@ pub fn request_with_id(
     let authentication = IpcIdentity::current().context("authenticate local client program")?;
     let response_timeout = if matches!(&action, Operation::Terminate) {
         Duration::from_secs(120)
+    } else if let Operation::Send { timeout_ms, .. } = &action {
+        Duration::from_millis(timeout_ms.unwrap_or(READINESS_TIMEOUT_MS))
+            .checked_add(RPC_TIMEOUT)
+            .context("timeout overflow")?
     } else if let Operation::Wait { timeout_ms, .. } = &action {
         Duration::from_millis(*timeout_ms)
             .checked_add(RPC_TIMEOUT)
@@ -1013,18 +1228,113 @@ fn write_frame(file: &File, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn readiness_admission_expires_cancels_and_dispatches_at_most_once() {
+        assert_eq!(READINESS_TIMEOUT_MS, 30_000);
+        let cancelled = Arc::new(Submission {
+            state: AtomicU8::new(0),
+            deadline: Instant::now() + Duration::from_secs(1),
+            caller_pipe: None,
+        });
+        drop(PendingSubmission(Some(cancelled.clone())));
+        assert!(!cancelled.dispatch());
+        let expired = Submission {
+            state: AtomicU8::new(0),
+            deadline: Instant::now(),
+            caller_pipe: None,
+        };
+        assert!(!expired.dispatch());
+        let sent = Submission {
+            state: AtomicU8::new(0),
+            deadline: Instant::now() + Duration::from_secs(1),
+            caller_pipe: None,
+        };
+        assert!(sent.dispatch());
+        assert!(
+            !sent.cancel_pending(),
+            "a dispatched command must not be cancelled by waiter teardown"
+        );
+        assert!(!sent.dispatch(), "the same admission cannot execute twice");
+    }
+    #[test]
+    fn startup_without_markers_is_finite_and_unsupported_is_immediate() {
+        let root = std::env::temp_dir().join(format!("arterm-startup-{}", Uuid::now_v7()));
+        let mut owner = Owner::start(&root, "target", "machine", Uuid::now_v7(), None).unwrap();
+        let start = Instant::now();
+        let response = request(&owner.identity, Operation::Send {
+            command: "Get-Date".into(), timeout_ms: Some(50),
+        }).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(50) && start.elapsed() < Duration::from_secs(2));
+        assert_eq!(response["status"], "timeout");
+        assert_eq!(response["phase"], "readiness");
+        assert_eq!(response["submitted"], false);
+        assert_eq!(response["connection_state"], "connecting");
+        assert_eq!(response["shell_status"], "not_ready");
+        assert_eq!(response["readiness_reason"], "initializing");
+        owner.set_state("connected");
+        {
+            let mut control = owner.shared.control.lock().unwrap();
+            control.supported = true;
+            control.capability_known = true;
+            control.creation_enabled = Some(true);
+            control.shell_status = "not_ready".into();
+            control.readiness_reason = Some("initializing".into());
+        }
+        let start = Instant::now();
+        let response = request(&owner.identity, Operation::Send {
+            command: "Get-Date".into(), timeout_ms: Some(50),
+        }).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(response["status"], "timeout");
+        assert_eq!(response["phase"], "readiness");
+        assert_eq!(response["submitted"], false);
+        assert!(response["error"].as_str().unwrap().contains("IntegrationNotEstablished"));
+        {
+            let mut control = owner.shared.control.lock().unwrap();
+            assert!(control.queue.is_empty() && control.submitted.is_empty());
+            control.shell_status = "unsupported".into();
+        }
+        let start = Instant::now();
+        let response = request(&owner.identity, Operation::Send {
+            command: "Get-Date".into(), timeout_ms: Some(30_000),
+        }).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(response["status"], "rejected");
+        assert!(response["error"].as_str().unwrap().contains("no supported shell integration"));
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn readiness_diagnostics_distinguish_shell_and_input_states() {
         for (status, reason, expected) in [
             ("unsupported", None, "no supported shell integration"),
-            ("busy", Some("managed_command"), "managed command owns input"),
+            (
+                "busy",
+                Some("managed_command"),
+                "managed command owns input",
+            ),
             ("not_ready", Some("initializing"), "first ready event"),
-            ("not_ready", Some("partial_human_input"), "interactive input is pending"),
-            ("not_ready", Some("unclassified_terminal_input"), "not proof that a person typed"),
+            (
+                "not_ready",
+                Some("partial_human_input"),
+                "interactive input is pending",
+            ),
+            (
+                "not_ready",
+                Some("unclassified_terminal_input"),
+                "not proof that a person typed",
+            ),
             ("not_ready", None, "host has not reported a safe prompt"),
         ] {
-            let control = ControlState { shell_status: status.into(), readiness_reason: reason.map(str::to_owned), ..ControlState::default() };
+            let control = ControlState {
+                shell_status: status.into(),
+                readiness_reason: reason.map(str::to_owned),
+                ..ControlState::default()
+            };
             let error = readiness_error(&control);
-            assert!(error.contains(expected) && error.contains(status), "{error}");
+            assert!(
+                error.contains(expected) && error.contains(status),
+                "{error}"
+            );
         }
     }
     #[test]

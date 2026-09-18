@@ -106,11 +106,17 @@ client daemon. Local controls require that exact active owner; missing or
 ambiguous owners are errors. Authorized server inventory and termination also
 work while detached.
 
-`send` returns a command ID and acceptance, not proof of success. With `--wait`,
-it returns early on the matching real completion **after output delivery**.
-The explicit positive, finite timeout is required; exit 124 does not cancel
-the remote command, nor does exiting the waiter. Query the command ID rather
-than blindly resending. See [automation and limits](QUICKSTART.md#automation)
+`send` waits for a safe prompt for up to **30 seconds** by default, then returns
+a command ID and acceptance, not proof of success. `--timeout 5s` overrides this
+readiness budget even without `--wait`. With `--wait`, an explicit positive,
+finite timeout is required and covers readiness plus completion; it returns
+early on the matching real completion **after output delivery**.
+A readiness timeout exits 124 with `phase: readiness` and `submitted: false`;
+the command is discarded without changing partial interactive input. Exiting
+while awaiting readiness also discards the pending request. Once dispatch starts,
+timeout or waiter exit does not cancel execution. Query the command ID rather
+than blindly resending. Readiness/completion waiters are bounded and do not block
+the owner's input, heartbeat, or other controls. See [automation and limits](QUICKSTART.md#automation)
 for status, interruption, termination, and idempotency.
 
 Controls and client/server inventories print readable summaries by default.
@@ -118,7 +124,7 @@ Use `--json` on `send`, `read`, `list --client`, `list --server`, `interrupt`,
 `detach`, or `terminate` when parsing output in scripts. JSON retains the
 structured response schema and the same exit codes.
 
-If a send is rejected, the human-readable result includes readiness details;
+If readiness times out or a send is rejected, the human-readable result includes readiness details;
 `arterm list --client --json` and `send ... --json` also report
 `shell_status`, `readiness_reason`, `command_capability`, `command_execution`, and
 the remote `host_version` when reported. Connected does not imply ready: an old
@@ -128,6 +134,12 @@ An absent host version is unknown, not the local client's version. Win32 key-up
 events do not edit a line and must not block sends; key-down edits, partial
 sequences, and unclassified terminal input remain guarded. Existing sessions
 are never silently replaced or retrofitted.
+
+Support is established by the shell's correlated integration lifecycle marker,
+not arbitrary VT traffic. Startup waiting uses the same finite readiness budget;
+capability that is still unknown before the host handshake is not a rejection.
+If no first ready marker arrives, the timeout reports `IntegrationNotEstablished`
+and submits nothing. Pre-marker input is not described as a busy command.
 
 Focus-in/out notifications are treated as non-editing, including when the local
 parent terminal enabled focus reporting before arTerm started. The remote host
