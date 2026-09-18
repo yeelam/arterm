@@ -123,10 +123,10 @@ events do not edit a line and must not block sends; key-down edits, partial
 sequences, and unclassified terminal input remain guarded. Existing sessions
 are never silently replaced or retrofitted.
 
-Focus-in/out notifications are treated as non-editing only after the remote
-terminal output enables focus reporting (DECSET 1004). Disabling or resetting
-that mode restores conservative classification; arbitrary terminal replies are
-not ignored, and focus notifications never clear a pending edit or busy command.
+Focus-in/out notifications are treated as non-editing, including when the local
+parent terminal enabled focus reporting before arTerm started. The remote host
+cannot observe that local negotiation. Other unrecognized terminal input remains
+guarded, and focus notifications never clear a pending edit or busy command.
 
 For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.
