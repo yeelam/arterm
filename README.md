@@ -113,7 +113,13 @@ the remote command, nor does exiting the waiter. Query the command ID rather
 than blindly resending. See [automation and limits](QUICKSTART.md#automation)
 for status, interruption, termination, and idempotency.
 
-If a send is rejected, `arterm list --client --json` and the rejection JSON report
+Controls and client/server inventories print readable summaries by default.
+Use `--json` on `send`, `read`, `list --client`, `list --server`, `interrupt`,
+`detach`, or `terminate` when parsing output in scripts. JSON retains the
+structured response schema and the same exit codes.
+
+If a send is rejected, the human-readable result includes readiness details;
+`arterm list --client --json` and `send ... --json` also report
 `shell_status`, `readiness_reason`, `command_capability`, `command_execution`, and
 the remote `host_version` when reported. Connected does not imply ready: an old
 host, a session created without integration, startup/profile initialization,

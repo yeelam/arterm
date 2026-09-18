@@ -723,6 +723,10 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
         let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
         assert_eq!(owners.as_array().unwrap().len(), 1);
         assert_eq!(owners[0]["identity"]["session_id"], id);
+        let human = control(&["list", "--client"]);
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(human.contains("MACHINE") && human.contains("fixture") && human.contains(&id));
+        assert!(!human.contains("\"identity\""));
         let command_id = Uuid::now_v7().to_string();
         let started = Instant::now();
         let sent = control(&["send", "fixture", "automation", "--command", "$KeepMe='ipc'; $Counter=1; Write-Output ('CONTROL='+$PID+':ipc')",
@@ -731,6 +735,10 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
         assert!(started.elapsed() < Duration::from_secs(5), "wait did not return early");
         let completed: serde_json::Value = serde_json::from_slice(&sent.stdout).unwrap();
         assert_eq!(completed["status"], "completed");
+        let human = control(&["read", "fixture", "automation", "--command-id", &command_id]);
+        assert!(human.status.success());
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(human.contains("State: completed") && human.contains("Succeeded: yes"));
         let timed = control(&["send", "fixture", "automation", "--command", "Start-Sleep -Seconds 2; $Counter++",
             "--wait", "--timeout", "1s", "--json"]);
         assert_eq!(timed.status.code(), Some(124), "{} {}", String::from_utf8_lossy(&timed.stdout), String::from_utf8_lossy(&timed.stderr));
@@ -748,7 +756,22 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
         let duplicate = control(&["send", "fixture", "automation", "--command",
             "$KeepMe='ipc'; $Counter=1; Write-Output ('CONTROL='+$PID+':ipc')", "--command-id", &command_id, "--json"]);
         assert!(duplicate.status.success(), "{}", String::from_utf8_lossy(&duplicate.stdout));
-        assert!(!control(&["send", "fixture", "automation", "--command", "$Counter=999", "--command-id", &command_id, "--json"]).status.success());
+        for json in [false, true] {
+            let mut args = vec!["send", "fixture", "automation", "--command", "$Counter=999", "--command-id", &command_id];
+            if json { args.push("--json"); }
+            let rejected = control(&args);
+            assert_eq!(rejected.status.code(), Some(1));
+            assert!(rejected.stderr.is_empty(), "response error must not be duplicated on stderr");
+            if json {
+                let response: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+                assert_eq!(response["status"], "rejected");
+                assert!(response["identity"].is_object());
+            } else {
+                let human = String::from_utf8(rejected.stdout).unwrap();
+                assert!(human.contains("Operation failed.") && human.contains("command ID conflicts"));
+                assert!(human.contains("Shell:") && !human.contains("\"identity\""));
+            }
+        }
         let abandoned_id = Uuid::now_v7().to_string();
         let mut waiter = Headless(Command::new(client_executable())
             .env("VSTERM_REMOTE_HOME", &fixture.home)
@@ -784,8 +807,9 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
             assert!(Instant::now() < deadline);
         }
         assert!(!control(&["send", "fixture", "automation", "--command", "$Counter=999", "--json"]).status.success());
-        let interrupted = control(&["interrupt", "fixture", "automation", "--json"]);
+        let interrupted = control(&["interrupt", "fixture", "automation"]);
         assert!(interrupted.status.success(), "{} {}", String::from_utf8_lossy(&interrupted.stdout), String::from_utf8_lossy(&interrupted.stderr));
+        assert!(String::from_utf8_lossy(&interrupted.stdout).contains("Interrupt requested"));
         loop {
             let query = control(&["read", "fixture", "automation", "--command-id", slow_id, "--json"]);
             let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
@@ -793,15 +817,21 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
             assert!(Instant::now() < deadline);
         }
         let after_command = control(&["send", "fixture", "automation", "--command", "Write-Output ('COUNTER='+$Counter)",
-            "--wait", "--timeout", "60s", "--json"]);
+            "--wait", "--timeout", "60s"]);
         assert!(after_command.status.success(), "{} {}", String::from_utf8_lossy(&after_command.stdout), String::from_utf8_lossy(&after_command.stderr));
+        assert!(String::from_utf8_lossy(&after_command.stdout).contains("Command completed successfully."));
         let output = control(&["read", "fixture", "automation", "--lines", "20", "--json"]);
         assert!(String::from_utf8_lossy(&output.stdout).contains("COUNTER=2"), "{}", String::from_utf8_lossy(&output.stdout));
+        let plain = control(&["read", "fixture", "automation", "--lines", "20"]);
+        assert!(plain.status.success());
+        let plain = String::from_utf8(plain.stdout).unwrap();
+        assert!(plain.contains("COUNTER=2") && !plain.contains("\"output\""));
         assert!(!control(&["read", "fixture", "missing"]).status.success());
         assert!(!control(&["read", "othermachine", "automation"]).status.success());
         assert!(!control(&["connect", "fixture", "automation", "--address", &addr, "--retries", "0"]).status.success());
-        let detached = control(&["detach", "fixture", "automation", "--json"]);
+        let detached = control(&["detach", "fixture", "automation"]);
         assert!(detached.status.success(), "{}", String::from_utf8_lossy(&detached.stderr));
+        assert!(String::from_utf8_lossy(&detached.stdout).contains("remote shell retained"));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = background.0.try_wait().unwrap() { assert!(status.success()); break; }
@@ -832,6 +862,7 @@ fn named_termination_is_durable_and_never_recreates() {
         .args(["terminate", "fixture", "terminateme", "--address", &addr])
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Session terminated; exit confirmed."));
     let mut later = fixture.client("connect", Some("TerminateMe"), &addr);
     later.wait_exit(1);
     assert!(later.err.contains("session has ended"), "{}", later.err);
@@ -844,7 +875,7 @@ fn server_inventory_and_exact_termination_preserve_neighbor_session() {
     struct Process(windows_sys::Win32::Foundation::HANDLE);
     impl Drop for Process { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
     let fixture = Fixture::new();
-    let (addr, _connections) = relay(fixture.home.clone(), 10);
+    let (addr, _connections) = relay(fixture.home.clone(), 11);
     let invoke = |args: &[&str]| Command::new(client_executable())
         .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
     let inventory = || {
@@ -867,6 +898,11 @@ fn server_inventory_and_exact_termination_preserve_neighbor_session() {
     assert_eq!(list["authorization_scope"], "host-windows-owner");
     assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
     assert!(list["sessions"].as_array().unwrap().iter().any(|s| s["local_reference"] == "victim" && s["attached"] == true));
+    let human = invoke(&["list", "--server", "fixture", "--address", &addr]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Sessions on fixture") && human.contains("ATTACHED"));
+    assert!(human.contains("victim") && human.contains(&victim_id) && !human.contains("\"sessions\""));
     let ended = invoke(&["terminate", "fixture", "VICTIM", "--json"]);
     assert!(ended.status.success(), "{} {}", String::from_utf8_lossy(&ended.stdout), String::from_utf8_lossy(&ended.stderr));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&ended.stdout).unwrap()["status"], "terminated");

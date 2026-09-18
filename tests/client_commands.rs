@@ -96,6 +96,33 @@ fn help_version_and_validation_do_not_require_setup() {
 }
 
 #[test]
+fn automation_output_defaults_to_human_and_json_is_explicit() {
+    let home = std::env::temp_dir().join(format!("arterm-output-{}", Uuid::now_v7()));
+    let human = run(&home, &["list", "--client"]);
+    assert!(human.status.success());
+    assert_eq!(String::from_utf8(human.stdout).unwrap().trim(), "No active managed local connections.");
+    let json = run(&home, &["list", "--client", "--json"]);
+    assert!(json.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&json.stdout).unwrap(), serde_json::json!([]));
+    assert!(json.stderr.is_empty());
+    for args in [
+        vec!["list", "--client", "--json", "--json"],
+        vec!["list", "--server", "work", "--json", "--json"],
+        vec!["terminate", "work", "shell", "--json", "--json"],
+        vec!["send", "work", "shell", "--command", "x", "--json", "--json"],
+        vec!["read", "work", "shell", "--json", "--json"],
+        vec!["interrupt", "work", "shell", "--json", "--json"],
+        vec!["detach", "work", "shell", "--json", "--json"],
+    ] {
+        let output = run(&home, &args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    assert!(!home.exists());
+}
+
+#[test]
 #[cfg_attr(not(feature = "test-unsigned-ipc"), ignore = "requires explicit unsigned functional fixture feature")]
 fn headless_failure_preserves_final_error_with_drained_stderr() {
     let home = std::env::temp_dir().join(format!("arterm-diagnostics-{}", Uuid::now_v7()));

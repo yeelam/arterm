@@ -2,6 +2,8 @@
 mod client_config;
 #[path = "../client_protocol.rs"]
 mod client_protocol;
+#[path = "../client_output.rs"]
+mod client_output;
 
 use anyhow::{bail, ensure, Context, Result};
 use arterm::statusln as eprintln;
@@ -43,14 +45,15 @@ Usage:\n\
   arterm list\n\
   arterm remove ALIAS\n\
   arterm connect ALIAS [REF] [--shell EXE] [--cwd PATH] [--retries 0..20]\n\
-  arterm list --client [--json] | list --server MACHINE\n\
-  arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--wait --timeout 60s]\n\
+  arterm list --client [--json] | list --server MACHINE [--json]\n\
+  arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--wait --timeout 60s] [--json]\n\
   arterm read MACHINE SESSION [--lines N | --command-id UUID] [--json]\n\
-  arterm interrupt MACHINE SESSION | detach MACHINE SESSION\n\
-  arterm terminate MACHINE SESSION\n\
+  arterm interrupt MACHINE SESSION [--json] | detach MACHINE SESSION [--json]\n\
+  arterm terminate MACHINE SESSION [--json]\n\
   arterm doctor [ALIAS]\n\
   arterm --help | --version\n\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
+Control commands print readable results by default; use --json for structured automation output.\n\
 Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
 Command IDs are retained for the session lifetime; capacity is 256, with no silent eviction or replacement.\n\
 Local IPC requires OS trust, the pinned certificate, and byte-identical client builds; cross-elevation is rejected.\n\
@@ -349,17 +352,11 @@ fn run_session(
     result
 }
 
-fn terminate_session(root: &Path, args: &[String]) -> Result<()> {
+fn terminate_session(root: &Path, args: &[String]) -> Result<u32> {
     ensure!(args.len() >= 2, "terminate requires MACHINE SESSION");
     let alias = &args[0];
     let reference = SessionReference::parse(&args[1])?;
-    let extra = args
-        .iter()
-        .skip(2)
-        .filter(|arg| arg.as_str() != "--json")
-        .cloned()
-        .collect::<Vec<_>>();
-    let flags = parse_connection_flags(&extra, false)?;
+    let (flags, json) = output_connection_flags(&args[2..])?;
     ensure!(
         flags.retries.is_none(),
         "terminate does not accept --retries"
@@ -372,10 +369,8 @@ fn terminate_session(root: &Path, args: &[String]) -> Result<()> {
     ensure!(owners.len() <= 1, "multiple local owners match the session");
     if let Some(owner) = owners.first() {
         let response = local_control::request(owner, Operation::Terminate)?;
-        println!("{}", serde_json::to_string(&response)?);
-        ensure!(matches!(response["status"].as_str(), Some("terminated" | "termination_accepted")),
-            "termination failed: {}", response["error"]);
-        return Ok(());
+        println!("{}", client_output::result(&response, alias, reference.as_str(), json)?);
+        return Ok(if matches!(response["status"].as_str(), Some("terminated" | "termination_accepted")) { 0 } else { 1 });
     }
     let (store, mut state) = Store::resolve(&client_config::state_dir(root, &target), &target.target_id, &reference, false, None, None)?;
     let id = state.id;
@@ -383,8 +378,29 @@ fn terminate_session(root: &Path, args: &[String]) -> Result<()> {
     let confirmed = client_protocol::terminate(&mut link, &state)?;
     state.ended = true;
     store.save(&state)?;
-    println!("{}", serde_json::json!({"status":if confirmed {"terminated"} else {"termination_accepted"}, "session_id":id}));
-    Ok(())
+    let response = serde_json::json!({"status":if confirmed {"terminated"} else {"termination_accepted"}, "session_id":id});
+    println!("{}", client_output::result(&response, alias, reference.as_str(), json)?);
+    Ok(0)
+}
+
+fn output_connection_flags(args: &[String]) -> Result<(ConnectionFlags, bool)> {
+    let mut json = false;
+    let mut options = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--json" {
+            ensure!(!json, "duplicate option: --json");
+            json = true;
+        } else {
+            options.push(args[index].clone());
+            if matches!(args[index].as_str(), "--address" | "--retries") {
+                let flag = args[index].clone();
+                options.push(value(args, &mut index, &flag)?);
+            }
+        }
+        index += 1;
+    }
+    Ok((parse_connection_flags(&options, false)?, json))
 }
 
 fn doctor(root: &Path, args: &[String]) -> Result<()> {
@@ -507,17 +523,12 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
             for line in lines { println!("{}", line.as_str().unwrap_or("")); }
         }
         if response["output"]["truncated"] == true { eprintln!("[read] Output truncated to retained/requested lines."); }
+        if response["output"]["replay_gap"] == true { eprintln!("[read] Replay gap; output may be incomplete."); }
+        if response["output"]["alternate_screen"] == true { eprintln!("[read] Alternate screen snapshot."); }
     } else {
-        println!("{}", serde_json::to_string(&response)?);
+        println!("{}", client_output::result(&response, machine, reference.as_str(), false)?);
     }
-    if response["status"] == "timeout" { return Ok(124); }
-    if response["status"] == "unknown" { return Ok(6); }
-    if response["status"] == "completed" {
-        return Ok(if response["record"]["succeeded"] == true { 0 } else { 1 });
-    }
-    ensure!(matches!(response["status"].as_str(), Some("ok" | "accepted" | "detach_requested" | "interrupt_requested")),
-        "local operation failed: {}", response["error"]);
-    Ok(0)
+    Ok(client_output::exit_code(&response))
 }
 
 fn command(args: &[String]) -> Result<u32> {
@@ -557,15 +568,14 @@ fn command(args: &[String]) -> Result<u32> {
             for identity in local_control::discover(&root)? {
                 connections.push(local_control::request(&identity, Operation::Inspect)?);
             }
-            println!("{}", serde_json::to_string(&connections)?);
+            println!("{}", client_output::clients(&connections, args.len() == 3)?);
             Ok(0)
         }
         Some("list") if args.get(1).map(String::as_str) == Some("--server") => {
             ensure!(args.len() >= 3, "list --server requires MACHINE");
             let machine = &args[2];
             client_config::validate_alias(machine)?;
-            let options = args[3..].iter().filter(|arg| arg.as_str() != "--json").cloned().collect::<Vec<_>>();
-            let flags = parse_connection_flags(&options, false)?;
+            let (flags, json) = output_connection_flags(&args[3..])?;
             ensure!(flags.retries.is_none() && !flags.stdio, "invalid server inventory options");
             let config = client_config::load(&root)?;
             let target = client_config::target(&config, machine)?;
@@ -589,7 +599,7 @@ fn command(args: &[String]) -> Result<u32> {
                 session["has_local_recovery_record"] = dir.join(format!("{id}.dpapi")).is_file().into();
             }
             inventory["machine"] = machine.clone().into();
-            println!("{}", serde_json::to_string(&inventory)?);
+            println!("{}", client_output::server(&inventory, json)?);
             Ok(0)
         }
         Some("list") => {
@@ -614,10 +624,7 @@ fn command(args: &[String]) -> Result<u32> {
             }
         }
         Some("read" | "detach" | "interrupt" | "send") => local_command(&root, args),
-        Some("terminate") => {
-            terminate_session(&root, &args[1..])?;
-            Ok(0)
-        }
+        Some("terminate") => terminate_session(&root, &args[1..]),
         Some("doctor") => {
             doctor(&root, &args[1..])?;
             Ok(0)

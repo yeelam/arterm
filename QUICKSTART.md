@@ -146,7 +146,15 @@ or fail. A detached session must be reattached before using those controls.
 `list --server` and `terminate` do not need an active local owner, but still
 require authorization; termination needs the saved session credential.
 
-`send` returns JSON with a command ID and acceptance. Save that ID. `read`
+Controls and client/server inventories use readable summaries and tables by
+default. Add `--json` to `send`, `read`, `list --client`, `list --server`,
+`interrupt`, `detach`, or `terminate` for the existing structured response
+schema. Scripts parsing output must explicitly request `--json`. Exit codes
+are the same in both modes. Response failures are printed once, in the selected
+format; argument, setup, and transport failures still report diagnostics on
+stderr and exit 1 (they have no structured response).
+
+`send` returns a command ID and acceptance. Save that ID. `read`
 without options prints the last **20** retained logical lines; `--lines N`
 accepts 1..2000. Add `--json` to inspect truncation, replay gaps, and alternate
 screen metadata. Output is a bounded terminal snapshot, not a complete log.
