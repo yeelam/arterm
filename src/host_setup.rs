@@ -49,10 +49,11 @@ enum AuthState {
 
 #[derive(Debug)]
 struct SetupArgs {
-    name: String,
+    name: Option<String>,
     code_path: Option<PathBuf>,
     no_download: bool,
     accept_server_license_terms: bool,
+    terminate_sessions: bool,
 }
 
 pub fn handle(args: &[String]) -> Result<Option<i32>> {
@@ -159,7 +160,6 @@ pub fn start_tunnel() -> Result<Option<Child>> {
 }
 
 fn setup(args: SetupArgs) -> Result<()> {
-    validate_name(&args.name)?;
     require_user_session()?;
     if let Some(path) = &args.code_path {
         ensure!(
@@ -168,15 +168,16 @@ fn setup(args: SetupArgs) -> Result<()> {
         );
     }
     let root = deployment::data_root()?;
+    let existing = load_config(&root)?;
+    let (name, code_path) = setup_defaults(&args, existing.as_ref())?;
     let host = host_dir(&root);
     let cli_data = code_data_dir(&root);
     fs::create_dir_all(&host)?;
     fs::create_dir_all(&cli_data)?;
     let code =
-        deployment::ensure_dependency(Role::Host, args.code_path.as_deref(), args.no_download)?;
-    let existing = load_config(&root)?;
+        deployment::ensure_dependency(Role::Host, code_path.as_deref(), args.no_download)?;
     let acceptance_is_current = existing.as_ref().is_some_and(|config| {
-        config.accepted_server_license_terms && config.name == args.name && config.code_path == code
+        config.accepted_server_license_terms && config.name == name && config.code_path == code
     });
     if !acceptance_is_current {
         accept_license(args.accept_server_license_terms)?;
@@ -184,17 +185,20 @@ fn setup(args: SetupArgs) -> Result<()> {
 
     let proposed = SetupConfig {
         schema: SCHEMA,
-        name: args.name,
+        name,
         code_path: code,
         accepted_server_license_terms: true,
     };
     validate_config(&proposed)?;
 
-    if existing.as_ref() != Some(&proposed) && host_is_running()? {
-        bail!("host is running; stop it before changing setup configuration");
-    }
+    prepare_setup_host(
+        existing.as_ref() != Some(&proposed),
+        args.terminate_sessions,
+        host_is_running,
+        || deployment::stop_host_command(&current_exe()?, true),
+    )?;
     login_if_needed(&proposed.code_path, &cli_data)?;
-    save_config(&root, &proposed)?;
+    save_config_if_changed(&root, &proposed)?;
 
     let exe = current_exe()?;
     deployment::set_startup(Some(&exe)).context("register per-user host startup")?;
@@ -202,6 +206,31 @@ fn setup(args: SetupArgs) -> Result<()> {
         spawn_host(&exe, &host)?;
     }
     report_registration(&proposed, &root, &exe);
+    Ok(())
+}
+
+fn setup_defaults(args: &SetupArgs, existing: Option<&SetupConfig>) -> Result<(String, Option<PathBuf>)> {
+    if let Some(config) = existing {
+        validate_config(config)?;
+    }
+    let name = args.name.clone().or_else(|| existing.map(|c| c.name.clone()))
+        .context("first setup requires --name <lowercase-name>")?;
+    validate_name(&name)?;
+    let code_path = args.code_path.clone().or_else(|| existing.map(|c| c.code_path.clone()));
+    Ok((name, code_path))
+}
+
+fn prepare_setup_host(
+    changed: bool,
+    terminate_sessions: bool,
+    running: impl FnOnce() -> Result<bool>,
+    stop: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if terminate_sessions {
+        stop()?;
+    } else if changed && running()? {
+        bail!("host is running; changing setup requires stopping it first or --terminate-sessions (ends all scoped sessions)");
+    }
     Ok(())
 }
 
@@ -355,6 +384,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs> {
     let mut code_path = None;
     let mut no_download = false;
     let mut accept_server_license_terms = false;
+    let mut terminate_sessions = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -370,15 +400,17 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs> {
             }
             "--no-download" => no_download = true,
             "--accept-server-license-terms" => accept_server_license_terms = true,
+            "--terminate-sessions" => terminate_sessions = true,
             other => bail!("unknown setup argument: {other}"),
         }
         index += 1;
     }
     Ok(SetupArgs {
-        name: name.context("setup requires --name <lowercase-name>")?,
+        name,
         code_path,
         no_download,
         accept_server_license_terms,
+        terminate_sessions,
     })
 }
 
@@ -722,6 +754,13 @@ fn save_config(root: &Path, config: &SetupConfig) -> Result<()> {
     result
 }
 
+fn save_config_if_changed(root: &Path, config: &SetupConfig) -> Result<()> {
+    if load_config(root)?.as_ref() != Some(config) {
+        save_config(root, config)?;
+    }
+    Ok(())
+}
+
 fn check_session(root: &Path, problems: &mut Vec<String>) {
     let mut session = 0;
     let found = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0;
@@ -841,7 +880,7 @@ fn ensure_help_only(args: &[String], print_help: fn()) -> Result<()> {
 
 fn print_setup_help() {
     println!(
-        "arterm-host setup --name <lowercase-name> [--code-path <absolute-code-tunnel.exe>] [--no-download] [--accept-server-license-terms]\nConfigures an isolated GitHub-backed VS Code tunnel, per-user startup, and the native host."
+        "arterm-host setup [--name <lowercase-name>] [--code-path <absolute-code-tunnel.exe>] [--no-download] [--accept-server-license-terms] [--terminate-sessions]\nExisting name and Code CLI path are retained unless explicitly supplied. First setup requires --name.\n--terminate-sessions stops the host for this user, Windows logon session and data root, ending ALL its live sessions before restarting. No other hosts are killed.\nConfigures an isolated GitHub-backed VS Code tunnel, per-user startup, and the native host."
     );
 }
 
@@ -862,6 +901,90 @@ fn print_doctor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_preserves_saved_defaults_and_state_on_repeated_runs() {
+        let root = std::env::temp_dir().join(format!("arterm-setup-preserve-{}", uuid::Uuid::now_v7()));
+        let config = SetupConfig {
+            schema: SCHEMA,
+            name: "registered-box".into(),
+            code_path: PathBuf::from(r"C:\custom-tools\code-tunnel.exe"),
+            accepted_server_license_terms: true,
+        };
+        save_config(&root, &config).unwrap();
+        // Unchanged setup must retain the original bytes, not merely equivalent JSON.
+        let original = format!("{}\n", String::from_utf8(fs::read(config_path(&root)).unwrap()).unwrap());
+        fs::write(config_path(&root), &original).unwrap();
+        let files = [
+            r"code-cli\code_tunnel.json", r"code-cli\token.json",
+            r"client\config.json", r"client\sessions\target-id\saved.dpapi",
+            r"client\sessions\target-id\ref-work.json", r"host\requests\saved.dpapi",
+            r"identity.cer",
+        ];
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.as_bytes()).unwrap();
+        }
+        for _ in 0..2 {
+            let args = parse_setup_args(&[]).unwrap();
+            let existing = load_config(&root).unwrap().unwrap();
+            let (name, path) = setup_defaults(&args, Some(&existing)).unwrap();
+            assert_eq!(name, config.name);
+            assert_eq!(path.as_ref(), Some(&config.code_path));
+            assert!(!args.terminate_sessions);
+            save_config_if_changed(&root, &existing).unwrap();
+            assert_eq!(fs::read(config_path(&root)).unwrap(), original.as_bytes());
+            for file in files {
+                assert_eq!(fs::read(root.join(file)).unwrap(), file.as_bytes());
+            }
+        }
+        let args = parse_setup_args(&["--name".into(), "explicit-name".into()]).unwrap();
+        let (name, path) = setup_defaults(&args, Some(&config)).unwrap();
+        assert_eq!(name, "explicit-name");
+        assert_eq!(path.as_ref(), Some(&config.code_path));
+        let args = parse_setup_args(&["--code-path".into(), r"C:\other\code-tunnel.exe".into()]).unwrap();
+        let (name, path) = setup_defaults(&args, Some(&config)).unwrap();
+        assert_eq!(name, config.name);
+        assert_eq!(path, Some(PathBuf::from(r"C:\other\code-tunnel.exe")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_saved_setup_is_reported_without_resetting_state() {
+        let root = std::env::temp_dir().join(format!("arterm-invalid-setup-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(host_dir(&root)).unwrap();
+        let bytes = b"{not valid setup";
+        fs::write(config_path(&root), bytes).unwrap();
+        assert!(load_config(&root).is_err());
+        assert_eq!(fs::read(config_path(&root)).unwrap(), bytes);
+        let config = SetupConfig {
+            schema: SCHEMA + 1,
+            name: "retained-name".into(),
+            code_path: PathBuf::from(r"C:\saved\code-tunnel.exe"),
+            accepted_server_license_terms: true,
+        };
+        assert!(setup_defaults(&parse_setup_args(&[]).unwrap(), Some(&config)).is_err());
+        assert_eq!(fs::read(config_path(&root)).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_shutdown_is_opt_in_and_failures_abort() {
+        use std::cell::Cell;
+        let stops = Cell::new(0);
+        let stop = || { stops.set(stops.get() + 1); Ok(()) };
+        prepare_setup_host(false, false, || Ok(true), stop).unwrap();
+        assert!(prepare_setup_host(true, false, || Ok(true), stop).is_err());
+        prepare_setup_host(true, false, || Ok(false), stop).unwrap();
+        assert_eq!(stops.get(), 0);
+        let args = parse_setup_args(&["--terminate-sessions".into()]).unwrap();
+        prepare_setup_host(false, args.terminate_sessions, || Ok(true), stop).unwrap();
+        assert_eq!(stops.get(), 1);
+        assert!(prepare_setup_host(true, true, || Ok(true), || bail!("mock stop failure")).is_err());
+        assert!(prepare_setup_host(true, false, || bail!("mock status failure"), stop).is_err());
+        assert_eq!(stops.get(), 1);
+    }
 
     #[test]
     fn successful_status_exit_does_not_imply_a_running_tunnel() {
@@ -918,7 +1041,7 @@ mod tests {
 
     #[test]
     fn setup_parser_requires_name_and_absolute_code_path() {
-        assert!(parse_setup_args(&[]).is_err());
+        assert!(setup_defaults(&parse_setup_args(&[]).unwrap(), None).is_err());
         let parsed = parse_setup_args(&[
             "--name".into(),
             "box-1".into(),
@@ -928,7 +1051,7 @@ mod tests {
             "--accept-server-license-terms".into(),
         ])
         .unwrap();
-        assert_eq!(parsed.name, "box-1");
+        assert_eq!(parsed.name.as_deref(), Some("box-1"));
         assert!(parsed.code_path.unwrap().is_absolute());
         assert!(parsed.no_download);
         assert!(parsed.accept_server_license_terms);

@@ -47,6 +47,44 @@ arterm-host.exe setup --name my-devbox --code-path 'C:\Tools\code-tunnel.exe' --
 `--no-download` prevents dependency installation, not license or sign-in prompts.
 Do not change a running host's configuration while it has live sessions.
 
+### Upgrade without registering again
+
+Rerun `arTerm-Host-Setup.exe` to update the binaries, then run `arterm-host start`.
+The installer does not reset setup, tunnel identity, registered client boxes,
+protected credentials, named session references, or certificates. Uninstall also
+retains user data. Keep the same Windows user and `VSTERM_REMOTE_HOME` (default:
+`%LOCALAPPDATA%\VsTerm`); another user/root reads different state, not a migration.
+Do not remove that directory or register the box again just to upgrade.
+
+Repeated `arterm-host setup` retains the saved name and Code CLI path; `--name`
+is required only for first setup. Explicit name/path arguments reconfigure them.
+Setup does not reset the isolated tunnel sign-in.
+
+By default, an upgrade refuses to stop a host with live sessions; unchanged
+runtime setup leaves the running host alone. To deliberately end its sessions:
+
+```powershell
+.\arTerm-Host-Setup.exe /terminate-sessions
+arterm-host start
+# Or, to stop and restart as part of runtime setup:
+arterm-host setup --terminate-sessions
+```
+
+**These flags end ALL live sessions of the scoped host, including detached shells;
+their running state cannot be recovered.** Saved references and credentials are
+retained, but ended sessions need new references. Shutdown uses the existing
+control command scoped to the current Windows user, logon session and data root,
+not process-name or all-user kills. Hosts in other logons/roots are not stopped;
+if they hold installed executables open, the upgrade fails rather than killing them.
+Setup waits at most 20 seconds for each stop command and installer upgrades wait
+up to 10 seconds for executable release. An unresponsive host cancels the operation;
+there is no forced-kill fallback. A timed-out stop request may still finish later:
+check host status before retrying. This retains the existing scoped host control
+boundary; it does not add pipe image attestation.
+`/terminate-sessions` also applies to host `/uninstall`. No certificate trust or
+authentication policy is changed. Live installer/sign-in E2E requires a dedicated
+machine; temporary-fixture tests do not exercise it.
+
 ## Notebook: install and configure the client
 
 From the extracted download:

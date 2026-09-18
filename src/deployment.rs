@@ -7,10 +7,12 @@ use std::{
     os::windows::ffi::OsStrExt,
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, ERROR_SUCCESS},
     Security::Cryptography::{CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE},
     Security::WinTrust::*,
     Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
@@ -87,14 +89,51 @@ fn require_closed_runtimes(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn stop_installed_host(paths: &[PathBuf]) -> Result<()> {
+pub(crate) fn stop_host_command(path: &Path, terminate_sessions: bool) -> Result<()> {
+    let mut command = Command::new(path);
+    command.args(host_stop_args(terminate_sessions)).stdin(Stdio::null());
+    let mut child = command.spawn().context("start scoped host stop command")?;
+    // Dropping Child does not kill it. A timed-out request can still finish later.
+    wait_for_shutdown(Duration::from_secs(20), || {
+        let Some(status) = child.try_wait()? else { return Ok(false); };
+        ensure!(
+            status.success(),
+            "host has live sessions or cannot be stopped; setup/update/uninstall cancelled (explicit --terminate-sessions or installer /terminate-sessions ends scoped sessions)"
+        );
+        Ok(true)
+    }).context("host has live sessions or scoped stop did not complete; no process was forcibly killed; a pending request may still complete, check host status before retrying")
+}
+
+fn wait_for_shutdown(timeout: Duration, mut stopped: impl FnMut() -> Result<bool>) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stopped()? {
+            return Ok(());
+        }
+        ensure!(Instant::now() < deadline, "timed out waiting for graceful host shutdown; operation cancelled");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn host_stop_args(terminate_sessions: bool) -> Vec<&'static str> {
+    if terminate_sessions { vec!["stop", "--terminate-sessions"] } else { vec!["stop"] }
+}
+
+fn stop_installed_host(paths: &[PathBuf], terminate_sessions: bool) -> Result<()> {
     ensure!(!paths.is_empty(), "installed host executable is missing");
     for path in paths {
-        ensure!(
-            Command::new(path).arg("stop").status()?.success(),
-            "host has live sessions or cannot be stopped; update/uninstall cancelled"
-        );
+        stop_host_command(path, terminate_sessions)?;
     }
+    // Older installed stop commands acknowledge before the executable is released.
+    wait_for_shutdown(Duration::from_secs(10), || match require_closed_runtimes(paths) {
+        Ok(()) => Ok(true),
+        Err(error) if error.downcast_ref::<io::Error>().is_some_and(|e| {
+            e.raw_os_error().is_some_and(|code| {
+                code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_LOCK_VIOLATION as i32
+            })
+        }) => Ok(false),
+        Err(error) => Err(error),
+    })?;
     Ok(())
 }
 
@@ -507,11 +546,11 @@ pub fn write_payload(dir: &Path, role: Role, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn uninstall(dir: &Path, role: Role) -> Result<()> {
+fn uninstall(dir: &Path, role: Role, terminate_sessions: bool) -> Result<()> {
     verify_install_owner(dir, role)?;
     let existing = installed_runtimes(dir, role)?;
     if role == Role::Host {
-        stop_installed_host(&existing)?;
+        stop_installed_host(&existing, terminate_sessions)?;
         set_startup(None)?;
     }
     require_closed_runtimes(&existing)?;
@@ -586,14 +625,13 @@ pub fn installer(role: Role, payload: &[u8]) -> Result<()> {
 
 pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "/?") {
-        println!("arTerm {} installer\n/quiet /no-download /log <absolute-path> /uninstall\n\
-            Per-user installation. Signing credentials are not bundled. Login occurs in setup, never in the installer.",
-            role_name(role));
+        println!("{}", installer_help(role));
         return Ok(());
     }
     let mut quiet = false;
     let mut no_download = false;
     let mut remove = false;
+    let mut terminate_sessions = false;
     let mut log = None;
     let mut i = 0;
     while i < args.len() {
@@ -601,6 +639,10 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
             "/quiet" => quiet = true,
             "/no-download" => no_download = true,
             "/uninstall" => remove = true,
+            "/terminate-sessions" => {
+                ensure!(role == Role::Host, "/terminate-sessions is host-only");
+                terminate_sessions = true;
+            }
             "/log" => {
                 i += 1;
                 let path = PathBuf::from(args.get(i).context("/log requires a path")?);
@@ -614,27 +656,25 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
     let dir = install_dir(role)?;
     let result = (|| -> Result<()> {
         if remove {
-            return uninstall(&dir, role);
+            return uninstall(&dir, role, terminate_sessions);
         }
         ensure_dependency(role, None, no_download || quiet)?;
         let existing = installed_runtimes(&dir, role)?;
         if role == Role::Host && !existing.is_empty() {
             verify_install_owner(&dir, role)?;
-            stop_installed_host(&existing)?;
+            stop_installed_host(&existing, terminate_sessions)?;
         }
         write_payload(&dir, role, payload)?;
         update_path(&dir, true)?;
         register_uninstall(&dir, role)?;
         println!(
-            "Installed {} to {}. Open a new terminal and run {} setup{}.",
+            "Installed {} to {}. Existing user configuration and credentials were retained. Open a new terminal and run {} {}.",
             role_name(role),
             dir.display(),
             exe_name(role),
-            if role == Role::Host {
-                " --name <your-box-name>"
-            } else {
-                ""
-            }
+            if role == Role::Host && data_root()?.join("host").join("setup.json").try_exists()? {
+                "start (already configured; no registration required)"
+            } else if role == Role::Host { "setup --name <your-box-name>" } else { "setup" }
         );
         println!("No account was signed in and no existing vendor tunnel was changed.");
         Ok(())
@@ -655,9 +695,81 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
     result
 }
 
+fn installer_help(role: Role) -> String {
+    let host = if role == Role::Host {
+        "\n/terminate-sessions explicitly ends ALL sessions of the current user/logon/data-root host before update/uninstall.\nGraceful scoped shutdown only; unresponsive hosts fail the operation without forced kills."
+    } else { "" };
+    format!("arTerm {} installer\n/quiet /no-download /log <absolute-path> /uninstall{host}\n\
+        Existing configuration and credentials are retained.\n\
+        Per-user installation. Signing credentials are not bundled. Login occurs in setup, never in the installer.",
+        role_name(role))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graceful_shutdown_wait_is_bounded_and_propagates_failures() {
+        let mut polls = 0;
+        wait_for_shutdown(Duration::from_secs(1), || {
+            polls += 1;
+            Ok(polls == 2)
+        }).unwrap();
+        assert_eq!(polls, 2);
+        let error = wait_for_shutdown(Duration::ZERO, || Ok(false)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let error = wait_for_shutdown(Duration::from_secs(1), || bail!("mock refused live sessions")).unwrap_err();
+        assert!(error.to_string().contains("mock refused live sessions"));
+        wait_for_shutdown(Duration::ZERO, || Ok(true)).unwrap();
+    }
+
+    #[test]
+    fn installer_help_documents_actual_host_only_switch_and_scope() {
+        let help = installer_help(Role::Host);
+        assert!(help.contains("/terminate-sessions"));
+        assert!(!help.contains("--terminate-sessions"));
+        assert!(help.contains("current user/logon/data-root"));
+        assert!(help.contains("without forced kills"));
+        assert!(!installer_help(Role::Client).contains("/terminate-sessions"));
+    }
+
+    #[test]
+    fn host_shutdown_arguments_require_explicit_termination() {
+        assert_eq!(host_stop_args(false), ["stop"]);
+        assert_eq!(host_stop_args(true), ["stop", "--terminate-sessions"]);
+        assert!(installer_with_args(Role::Client, b"MZtest", &["/terminate-sessions".into()]).is_err());
+        for switch in ["/terminate-sessions", "/TERMINATE-SESSIONS"] {
+            let error = installer_with_args(Role::Host, b"MZtest",
+                &[switch.into(), "/invalid-before-any-install".into()]).unwrap_err();
+            assert!(error.to_string().contains("unknown installer parameter: /invalid-before-any-install"));
+        }
+        assert!(installer_with_args(Role::Host, b"MZtest", &["--terminate-sessions".into()]).is_err());
+    }
+
+    #[test]
+    fn repeated_host_payload_upgrade_preserves_all_adjacent_state() {
+        let root = std::env::temp_dir().join(format!("arterm-upgrade-preserve-{}", uuid::Uuid::now_v7()));
+        let files = [
+            r"host\setup.json", r"code-cli\code_tunnel.json", r"code-cli\token.json",
+            r"client\config.json", r"client\sessions\target-id\saved.dpapi",
+            r"client\sessions\target-id\ref-work.json", r"host\requests\saved.dpapi", r"identity.cer",
+        ];
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.as_bytes()).unwrap();
+        }
+        for payload in [b"MZinitial".as_slice(), b"MZupgrade", b"MZupgrade"] {
+            write_payload(&root, Role::Host, payload).unwrap();
+            for file in files {
+                assert_eq!(fs::read(root.join(file)).unwrap(), file.as_bytes());
+            }
+            assert_eq!(fs::read(root.join(exe_name(Role::Host))).unwrap(), payload);
+            assert_eq!(fs::read(root.join(legacy_exe_name(Role::Host))).unwrap(), payload);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn install_owners_accept_only_exact_current_or_legacy_publisher_and_role() {
         let root = std::env::temp_dir().join(format!("arterm-owner-test-{}", uuid::Uuid::now_v7()));

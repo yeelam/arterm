@@ -8,7 +8,7 @@ use std::time::Duration;
 
 fn usage() {
     eprintln!("arTerm host\n\
-arterm-host setup --name NAME [--code-path PATH] [--no-download] [--accept-server-license-terms]\n\
+arterm-host setup [--name NAME] [--code-path PATH] [--no-download] [--accept-server-license-terms] [--terminate-sessions]\n\
 arterm-host login | start | doctor | status | sessions\n\
 arterm-host terminate <session-id> --yes\n\
 arterm-host stop [--terminate-sessions]\n\

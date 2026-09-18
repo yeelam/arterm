@@ -1410,7 +1410,14 @@ fn stop_at(root: &Path, terminate_sessions: bool) -> Result<()> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("host command failed")
             );
-            Ok(())
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(_stopped) = acquire(root, &pipe) {
+                    return Ok(());
+                }
+                ensure!(Instant::now() < deadline, "host accepted stop but did not exit; update cancelled");
+                thread::sleep(Duration::from_millis(50));
+            }
         }
         Err(control_error) => match acquire(root, &pipe) {
             Ok(_not_running) => Ok(()),

@@ -335,6 +335,16 @@ fn stop_wakeup_closing_does_not_fail_broker_shutdown() {
 }
 
 #[test]
+fn setup_scope_routes_distinct_data_roots_without_starting_a_host() {
+    let root = std::env::temp_dir().join(format!("arterm-setup-scope-{}", Uuid::now_v7()));
+    let one = pipe_name(&root.join("one")).unwrap();
+    let two = pipe_name(&root.join("two")).unwrap();
+    assert_ne!(one, two);
+    assert_eq!(one, pipe_name(&root.join("one")).unwrap());
+    assert!(!root.exists());
+}
+
+#[test]
 fn stop_is_successful_when_scoped_host_is_absent() {
     let root = std::env::temp_dir().join(format!("devbox-host-absent-{}", Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
