@@ -21,6 +21,11 @@ organizational network policy.
   command from the same Windows user account with its local recovery data intact.
 - **Automation alongside a human:** send a command, wait for its correlated
   completion, or read output without creating a second remote shell.
+- **Files and folders:** send or receive either through the existing connected
+  session, with SHA-256 verification and unique TEMP destinations. Directories
+  are automatically packed, transferred, and extracted; ordinary ZIP files stay files.
+  **Development release gate:** independent archive review remains blocked;
+  this integration is not release-qualified.
 
 **Limit:** the remote host must stay running and logged in. Remote Windows
 reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.

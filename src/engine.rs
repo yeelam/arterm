@@ -46,6 +46,8 @@ pub struct Engine {
     command_capable: bool,
     active_command: Option<uuid::Uuid>,
     command_input_ready: bool,
+    transfer_admission: crate::transfer_admission::Admission,
+    transfer_capable: bool,
 }
 
 #[cfg(test)]
@@ -571,6 +573,8 @@ impl Engine {
             command_capable: false,
             active_command: None,
             command_input_ready: false,
+            transfer_admission: crate::transfer_admission::Admission::default(),
+            transfer_capable: false,
         }
     }
     /// Explicit GUID resume may attach to an older host with an existing credential.
@@ -580,6 +584,17 @@ impl Engine {
         let mut engine = Self::new(state);
         engine.allow_legacy_resume = allow_legacy_resume;
         engine
+    }
+    pub fn transfer_admission(&self) -> crate::transfer_admission::Admission {
+        self.transfer_admission.clone()
+    }
+    fn admit_transfers(&self) -> Result<()> {
+        if self.transfer_capable {
+            self.transfer_admission.publish(&self.state,
+                self.attachment.as_deref().context("missing attachment")?,
+                self.lease.as_deref().context("missing writer lease")?)?;
+        }
+        Ok(())
     }
     fn base(&self) -> Vec<(&'static str, Value)> {
         vec![("session_id", s(&self.state.id.to_string()))]
@@ -709,12 +724,14 @@ impl Engine {
         terminal: &mut impl Terminal,
         save: &mut impl FnMut(&State) -> Result<()>,
     ) -> Result<End> {
+        let _transfer_scope = self.transfer_admission.connection_scope();
         ensure!(!self.state.ended, "session has ended; choose a NEW reference");
         terminal.reading(false);
         self.attachment = None;
         self.lease = None;
         self.pending_sent = false;
         self.command_input_ready = false;
+        self.transfer_capable = false;
         self.credit = 0;
         let mut phase = "hello";
         terminal.connection_state("connecting");
@@ -788,6 +805,8 @@ impl Engine {
                             .as_array()
                             .context("invalid capabilities")?;
                         self.command_capable = caps.iter().any(|v| v.as_str() == Some(crate::shell_integration::CAPABILITY));
+                        self.transfer_capable = [crate::transfer_admission::CAPABILITY, crate::transfer_payload::METADATA_CAPABILITY]
+                            .iter().all(|cap| caps.iter().any(|v| v.as_str() == Some(cap)));
                         terminal.command_capability(self.command_capable);
                         ensure!(
                             CAPS.iter()
@@ -888,6 +907,7 @@ impl Engine {
                             self.lease = Some(bin16(body, "lease_id")?);
                             self.last_size = (0, 0);
                             phase = "attached";
+                            self.admit_transfers()?;
                             terminal.connection_state("connected");
                         }
                         diagnostics::line(format_args!("[session] {}", self.state.id));
@@ -909,6 +929,7 @@ impl Engine {
                         self.resize_generation = num(body, "resize_generation")?;
                         self.last_size = (0, 0);
                         phase = "attached";
+                        self.admit_transfers()?;
                         terminal.connection_state("connected");
                     }
                     "Output" if phase == "attached" => {

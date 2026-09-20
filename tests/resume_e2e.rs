@@ -23,6 +23,20 @@ fn host_executable() -> &'static str {
 fn controller_executable() -> String {
     std::env::var("SIGNED_CONTROLLER").unwrap_or_else(|_| client_executable().into())
 }
+struct Pending(Option<Child>);
+impl Pending {
+    fn output(mut self) -> std::process::Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 fn test_shell() -> String {
     std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into())
 }
@@ -55,6 +69,7 @@ impl Fixture {
         let host = Command::new(host_executable())
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
+            .env("TEMP", &home).env("TMP", &home)
             .stdin(Stdio::null())
             .stdout(fs::File::create(home.join("host.stdout")).unwrap())
             .stderr(fs::File::create(home.join("host.stderr")).unwrap())
@@ -130,6 +145,7 @@ impl Fixture {
         let mut command = Command::new(client_executable());
         command
             .env("VSTERM_REMOTE_HOME", &self.home)
+            .env("TEMP", &self.home).env("TMP", &self.home)
             .env("VSTERM_HISTORY_PATH", self.home.join("powershell-history.txt"))
             .args([verb, "fixture"]);
         if let Some(id) = id {
@@ -286,6 +302,16 @@ struct CreationGate {
     frame: &'static str,
     observed: std::sync::atomic::AtomicBool,
     release: std::sync::atomic::AtomicBool,
+    occurrence: usize,
+    seen: std::sync::atomic::AtomicUsize,
+    hide_file_capability: bool,
+    hide_metadata_capability: bool,
+    hide_directory_capability: bool,
+    hold_session_exit: bool,
+    exit_observed: std::sync::atomic::AtomicBool,
+    exit_release: std::sync::atomic::AtomicBool,
+    file_result: Mutex<Option<serde_json::Value>>,
+    file_progress: Mutex<Vec<(String, Instant)>>,
 }
 fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>,
     gate: Option<Arc<CreationGate>>) -> (String, mpsc::Receiver<TcpStream>) {
@@ -364,15 +390,45 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                         let mut segments = Vec::new();
                         if id == 12 {
                             frames.push(&data[..n]).unwrap();
-                            while let Some(frame) = frames.next().unwrap() {
+                            while let Some(mut frame) = frames.next().unwrap() {
                                 if let Some(gate) = &gate {
+                                    if get(&frame, "type").as_str() == Some("FileProgress") {
+                                        gate.file_progress.lock().unwrap().push((
+                                            get(get(&frame, "body"), "phase").as_str().unwrap().into(), Instant::now()));
+                                    }
+                                    if gate.hold_session_exit && get(&frame, "type").as_str() == Some("SessionExited") {
+                                        use std::sync::atomic::Ordering;
+                                        gate.exit_observed.store(true, Ordering::Release);
+                                        let deadline = Instant::now() + Duration::from_secs(15);
+                                        while !gate.exit_release.load(Ordering::Acquire) {
+                                            assert!(Instant::now() < deadline, "owned exit gate was not released");
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                    }
+                                    if (gate.hide_file_capability || gate.hide_metadata_capability || gate.hide_directory_capability) && get(&frame, "type").as_str() == Some("HelloOk") {
+                                        if let Value::Map(fields) = &mut frame {
+                                            if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("body")) {
+                                                if let Some((_, Value::Array(caps))) = body.iter_mut().find(|(k, _)| k.as_str() == Some("capabilities")) {
+                                                    caps.retain(|v| !(gate.hide_file_capability && v.as_str() == Some(arterm::transfer_admission::CAPABILITY))
+                                                        && !(gate.hide_metadata_capability && v.as_str() == Some(arterm::transfer_payload::METADATA_CAPABILITY))
+                                                        && !(gate.hide_directory_capability && v.as_str() == Some(arterm::transfer_payload::DIRECTORY_CAPABILITY)));
+                                                }
+                                            }
+                                        }
+                                    }
                                     if get(&frame, "type").as_str() == Some(gate.frame) {
                                         use std::sync::atomic::Ordering;
+                                        if gate.seen.fetch_add(1, Ordering::AcqRel) == gate.occurrence {
+                                        if get(&frame, "type").as_str() == Some("FileResult") {
+                                            let json = get(get(&frame, "body"), "json").as_str().unwrap();
+                                            *gate.file_result.lock().unwrap() = Some(serde_json::from_str(json).unwrap());
+                                        }
                                         gate.observed.store(true, Ordering::Release);
                                         let deadline = Instant::now() + Duration::from_secs(15);
                                         while !gate.release.load(Ordering::Acquire) {
                                             assert!(Instant::now() < deadline, "owned {} gate was not released", gate.frame);
                                             thread::sleep(Duration::from_millis(10));
+                                        }
                                         }
                                     }
                                 }
@@ -457,6 +513,566 @@ fn pid_marker(text: &str, prefix: &str, suffix: &str) -> Option<String> {
             None
         }
     })
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_roundtrip_current_owner_busy_command_and_binary_integrity() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    let (address, connections) = relay(fixture.home.clone(), 10);
+    let mut client = fixture.client("connect", Some("files"), &address);
+    client.command("$global:FileState='retained'; Write-Output ('READY=' + $PID + ':files')");
+    client.wait_for(|out, _| pid_marker(out, "READY=", ":files").is_some());
+    let pid = pid_marker(&client.out, "READY=", ":files").unwrap();
+    let _connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .env("TEMP", &fixture.home).env("TMP", &fixture.home)
+        .args(args).output().unwrap();
+    let slow = control(&["send", "fixture", "files", "--command",
+        "1..100 | ForEach-Object { Write-Output ('BUSY=' + $_); Start-Sleep -Milliseconds 300 }", "--json"]);
+    assert!(slow.status.success(), "{}", String::from_utf8_lossy(&slow.stdout));
+    let mut completed = 0;
+    for (index, bytes) in [
+        Vec::new(), vec![0, 255, 13, 10, 27, 128],
+        (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect(),
+        vec![80, 75, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ].into_iter().enumerate() {
+        let basename = if index == 3 { "ordinary.zip".into() } else { format!("binary-{index}.bin") };
+        let path = fixture.home.join(&basename);
+        fs::write(&path, &bytes).unwrap();
+        let sent = control(&["send", "fixture", "files", "--file", path.to_str().unwrap(), "--json"]);
+        assert_eq!(sent.status.code(), Some(0), "{} {}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr));
+        let sent: serde_json::Value = serde_json::from_slice(&sent.stdout).unwrap();
+        assert_eq!(sent["status"], "completed");
+        assert_eq!(sent["source_kind"], "file");
+        assert_eq!(sent["original_basename"], basename);
+        assert!(sent["command_id"].is_null());
+        let remote = PathBuf::from(sent["actual_path"].as_str().unwrap());
+        assert!(remote.is_absolute() && remote.starts_with(&fixture.home));
+        assert_eq!(fs::read(&remote).unwrap(), bytes);
+        let received = control(&["receive", "fixture", "files", "--file", remote.to_str().unwrap(), "--json"]);
+        assert_eq!(received.status.code(), Some(0), "{} {}", String::from_utf8_lossy(&received.stdout), String::from_utf8_lossy(&received.stderr));
+        let received: serde_json::Value = serde_json::from_slice(&received.stdout).unwrap();
+        assert_eq!(received["source_kind"], "file");
+        assert_eq!(received["original_basename"], basename);
+        let local = PathBuf::from(received["actual_path"].as_str().unwrap());
+        assert!(local.starts_with(&fixture.home) && local != remote && local != path);
+        assert_eq!(fs::read(&local).unwrap(), bytes);
+        let hash = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(sent["sha256"], hash);
+        assert_eq!(received["sha256"], hash);
+        assert_eq!(received["bytes"], bytes.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        completed += 2;
+    }
+    assert_eq!(completed, 8);
+    let output = control(&["read", "fixture", "files", "--json"]);
+    assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("BUSY="));
+    let interrupted = control(&["interrupt", "fixture", "files", "--json"]);
+    assert!(interrupted.status.success());
+    let after = control(&["send", "fixture", "files", "--command",
+        "Write-Output ('AFTER=' + $PID + ':' + $global:FileState)", "--wait", "--timeout", "20s", "--json"]);
+    assert!(after.status.success(), "{}", String::from_utf8_lossy(&after.stdout));
+    client.wait_for(|out, _| pid_marker(out, "AFTER=", ":retained").is_some());
+    assert_eq!(pid_marker(&client.out, "AFTER=", ":retained").unwrap(), pid);
+    client.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn folder_roundtrip_snapshot_busy_owner_and_empty_directory() {
+    use std::sync::atomic::Ordering;
+    for direction in ["send", "receive"] {
+        let fixture = Fixture::new();
+        let gate = Arc::new(CreationGate { frame: "FileResult", ..Default::default() });
+        let (address, _) = relay_with_creation_gate(fixture.home.clone(), 4, None, Some(gate.clone()));
+        let mut owner = fixture.client("connect", Some("folders"), &address);
+        owner.command("$global:FolderState='retained'; Write-Output ('READY=' + $PID + ':folders')");
+        owner.wait_for(|out, _| pid_marker(out, "READY=", ":folders").is_some());
+        let pid = pid_marker(&owner.out, "READY=", ":folders").unwrap();
+        let control = |args: &[&str]| Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args(args).output().unwrap();
+        assert!(control(&["send", "fixture", "folders", "--command",
+            "1..100 | ForEach-Object { Write-Output ('BUSY=' + $_); Start-Sleep -Milliseconds 100 }",
+            "--json"]).status.success());
+        let source = fixture.home.join("snapshot");
+        fs::create_dir_all(source.join("nested").join("empty")).unwrap();
+        fs::create_dir(source.join(".hidden-directory")).unwrap();
+        let unicode = source.join("nested").join("\u{65e5}\u{672c}.txt");
+        fs::write(&unicode, b"old snapshot").unwrap();
+        fs::write(source.join(".hidden"), b"hidden").unwrap();
+        use std::os::windows::ffi::OsStrExt;
+        for name in [".hidden", ".hidden-directory"] {
+            let hidden: Vec<u16> = source.join(name).as_os_str().encode_wide().chain(Some(0)).collect();
+            assert_ne!(unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                hidden.as_ptr(), windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN) }, 0);
+        }
+        let child = Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "folders", "--file", source.to_str().unwrap(), "--json"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let pending = Pending(Some(child));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !gate.observed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "folder preparation gate not reached");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // FileBegin's result is after packing in both directions.
+        fs::write(&unicode, b"edited after packing").unwrap();
+        fs::write(source.join("new-after-pack.txt"), b"not in snapshot").unwrap();
+        gate.release.store(true, Ordering::Release);
+        let output = pending.output();
+        assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["source_kind"], "directory");
+        assert_eq!(receipt["original_basename"], "snapshot");
+        assert_eq!(receipt["extracted_bytes"], 18);
+        let destination = PathBuf::from(receipt["actual_path"].as_str().unwrap());
+        assert_eq!(destination.file_name().unwrap(), "snapshot");
+        assert!(destination.starts_with(&fixture.home));
+        assert_eq!(fs::read(destination.join("nested").join("\u{65e5}\u{672c}.txt")).unwrap(), b"old snapshot");
+        assert!(destination.join("nested").join("empty").is_dir());
+        assert!(destination.join(".hidden-directory").is_dir());
+        assert_eq!(fs::read(destination.join(".hidden")).unwrap(), b"hidden");
+        assert!(!destination.join("new-after-pack.txt").exists());
+        assert_eq!(fs::read(&unicode).unwrap(), b"edited after packing");
+        let empty = fixture.home.join("empty-folder");
+        fs::create_dir(&empty).unwrap();
+        let output = control(&[direction, "fixture", "folders", "--file", empty.to_str().unwrap(), "--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["extracted_bytes"], 0);
+        assert!(PathBuf::from(receipt["actual_path"].as_str().unwrap()).is_dir());
+        assert!(String::from_utf8_lossy(&control(&["read", "fixture", "folders", "--json"]).stdout).contains("BUSY="));
+        assert!(control(&["interrupt", "fixture", "folders", "--json"]).status.success());
+        assert!(control(&["send", "fixture", "folders", "--command",
+            "Write-Output ('AFTER=' + $PID + ':' + $global:FolderState)", "--wait", "--timeout", "20s", "--json"]).status.success());
+        owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":retained").is_some());
+        assert_eq!(pid_marker(&owner.out, "AFTER=", ":retained").unwrap(), pid);
+        owner.detach();
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn folder_old_capability_fails_before_publication() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { hide_directory_capability: true, ..Default::default() });
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 3, None, Some(gate));
+    let mut owner = fixture.client("connect", Some("legacy-folder"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':legacy')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":legacy").is_some());
+    let source = fixture.home.join("folder-source");
+    fs::create_dir(&source).unwrap();
+    for direction in ["send", "receive"] {
+        let output = Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "legacy-folder", "--file", source.to_str().unwrap(), "--json"])
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stdout));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("unsupported"));
+        assert!(owned_partials(&fixture.home).is_empty());
+    }
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required; 512 MiB local fixture"]
+fn folder_native_long_preparation_progress_and_caller_cancellation() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate::default());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("long-folder"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':long')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":long").is_some());
+    let source = fixture.home.join("large-folder");
+    fs::create_dir(&source).unwrap();
+    let mut state = 123456789u32;
+    let data: Vec<u8> = (0..1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }).collect();
+    for index in 0..64 {
+        let mut file = fs::File::create(source.join(format!("{index}.bin"))).unwrap();
+        for _ in 0..8 { file.write_all(&data).unwrap(); }
+    }
+    let mut controller = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["receive", "fixture", "long-folder", "--file", source.to_str().unwrap(), "--json"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let started = Instant::now();
+    loop {
+        let progress = gate.file_progress.lock().unwrap();
+        let preparing: Vec<_> = progress.iter().filter(|(phase, _)| phase == "preparing").collect();
+        if preparing.len() >= 5 {
+            assert!(preparing.last().unwrap().1.duration_since(preparing[0].1) >= Duration::from_secs(20));
+            break;
+        }
+        drop(progress);
+        assert!(started.elapsed() < Duration::from_secs(90), "native preparation did not emit five progress frames");
+        assert!(controller.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "native controller ended before long archive phase completed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    controller.0.as_mut().unwrap().kill().unwrap();
+    controller.0.as_mut().unwrap().wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let stages = fs::read_dir(&fixture.home).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("arterm-archive-"));
+        if !stages { break; }
+        assert!(Instant::now() < deadline, "cancelled archive preparation left an owned stage");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(owned_partials(&fixture.home).is_empty());
+    assert_eq!(fs::metadata(source.join("0.bin")).unwrap().len(), 8 * 1024 * 1024);
+    owner.command("Write-Output ('AFTER=' + $PID + ':long')");
+    owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":long").is_some());
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn folder_lease_change_revokes_transfer_without_replacing_shell() {
+    use std::sync::atomic::Ordering;
+    for direction in ["send", "receive"] {
+        let fixture = Fixture::new();
+        let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 1, ..Default::default() });
+        let (address, connections) = relay_with_creation_gate(fixture.home.clone(), 3, None, Some(gate.clone()));
+        let mut owner = fixture.client("connect", Some("lease-folder"), &address);
+        owner.command("Write-Output ('READY=' + $PID + ':lease')");
+        owner.wait_for(|out, _| pid_marker(out, "READY=", ":lease").is_some());
+        let pid = pid_marker(&owner.out, "READY=", ":lease").unwrap();
+        let primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+        let source = fixture.home.join("lease-source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data.bin"), b"snapshot").unwrap();
+        let mut controller = Pending(Some(Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "lease-folder", "--file", source.to_str().unwrap(), "--json"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+        let _file_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.observed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "folder chunk was not gated");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let partials = owned_partials(&fixture.home);
+        assert_eq!(partials.len(), 1);
+        let destination = partials[0].parent().unwrap().join("lease-source");
+        primary.shutdown(Shutdown::Both).unwrap();
+        let _replacement = connections.recv_timeout(Duration::from_secs(20)).unwrap();
+        gate.release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "old transfer survived attachment replacement");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!controller.output().status.success());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !owned_partials(&fixture.home).is_empty() {
+            assert!(Instant::now() < deadline, "revoked folder partial remained");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!destination.exists());
+        assert_eq!(fs::read(source.join("data.bin")).unwrap(), b"snapshot");
+        owner.command("Write-Output ('AFTER=' + $PID + ':lease')");
+        owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":lease").is_some());
+        assert_eq!(pid_marker(&owner.out, "AFTER=", ":lease").unwrap(), pid);
+        owner.detach();
+    }
+}
+
+fn owned_partials(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            found.extend(owned_partials(&entry.path()));
+        } else if entry.file_name() == ".arterm-partial" {
+            found.push(entry.path());
+        }
+    }
+    found
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_caller_abort_and_transport_disconnect_clean_only_partials() {
+    caller_abort_and_transport_disconnect(false);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn folder_caller_abort_and_transport_disconnect_clean_only_partials() {
+    caller_abort_and_transport_disconnect(true);
+}
+
+fn caller_abort_and_transport_disconnect(folder: bool) {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    for direction in ["send", "receive"] {
+        for caller_abort in [true, false] {
+            let fixture = Fixture::new();
+            let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+            let _release = Release(gate.clone());
+            let (address, connections) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+            let mut owner = fixture.client("connect", Some("cancel"), &address);
+            owner.command("Write-Output ('READY=' + $PID + ':cancel')");
+            owner.wait_for(|out, _| pid_marker(out, "READY=", ":cancel").is_some());
+            let _primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            let source = fixture.home.join(if folder { "keep-folder" } else { "keep-source.bin" });
+            let data_path = if folder {
+                fs::create_dir(&source).unwrap();
+                source.join("data.bin")
+            } else { source.clone() };
+            let mut state = 123456789u32;
+            let data: Vec<u8> = (0..1024 * 1024).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            }).collect();
+            fs::write(&data_path, &data).unwrap();
+            let mut controller = Command::new(controller_executable())
+                .env("VSTERM_REMOTE_HOME", &fixture.home)
+                .args([direction, "fixture", "cancel", "--file", source.to_str().unwrap(), "--json"])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let transfer_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !gate.observed.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "file chunk gate never reached");
+                assert!(controller.try_wait().unwrap().is_none(), "controller exited before file chunk gate");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let partials = owned_partials(&fixture.home);
+            assert_eq!(partials.len(), 1, "{direction} must have one owned staging file");
+            let destination = partials[0].parent().unwrap().join(source.file_name().unwrap());
+            assert!(!destination.exists());
+            if caller_abort {
+                controller.kill().unwrap();
+                controller.wait().unwrap();
+            } else {
+                transfer_link.shutdown(Shutdown::Both).unwrap();
+                let output = controller.wait_with_output().unwrap();
+                assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stdout));
+            }
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !owned_partials(&fixture.home).is_empty() {
+                assert!(Instant::now() < deadline, "abandoned file partial not cleaned");
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!destination.exists(), "cancelled transfer must not publish");
+            assert_eq!(fs::read(&data_path).unwrap(), data);
+            gate.release.store(true, Ordering::Release);
+            owner.command("Write-Output ('AFTER=' + $PID + ':cancel')");
+            owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":cancel").is_some());
+            owner.detach();
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_old_host_is_unsupported_without_staging() {
+    for hide_metadata in [false, true] {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate {
+        hide_file_capability: !hide_metadata, hide_metadata_capability: hide_metadata, ..Default::default()
+    });
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 1, None, Some(gate));
+    let mut owner = fixture.client("connect", Some("legacy"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':legacy')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":legacy").is_some());
+    let source = fixture.home.join("source.bin");
+    fs::write(&source, b"legacy").unwrap();
+    for direction in ["send", "receive"] {
+        let output = Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "legacy", "--file", source.to_str().unwrap(), "--json"])
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("unsupported"));
+        assert!(owned_partials(&fixture.home).is_empty());
+    }
+    owner.command("Write-Output ('AFTER=' + $PID + ':legacy')");
+    owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":legacy").is_some());
+    owner.detach();
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_lost_commit_receipt_is_unknown_and_preserves_published_file() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+    let _release = Release(gate.clone());
+    let (address, connections) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("commit"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':commit')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":commit").is_some());
+    let _primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let source = fixture.home.join("commit.bin");
+    fs::write(&source, b"abc").unwrap();
+    let controller = Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "commit", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let transfer_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "commit receipt gate never reached");
+        thread::sleep(Duration::from_millis(20));
+    }
+    transfer_link.shutdown(Shutdown::Both).unwrap();
+    let output = controller.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(6), "{}", String::from_utf8_lossy(&output.stdout));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["status"], "unknown");
+    assert_eq!(response["commit_started"], true);
+    assert_eq!(response["automatic_retry"], false);
+    assert_eq!(response["transfer_id"], response["remote_transfer_id"]);
+    let destination = PathBuf::from(response["actual_path"].as_str().unwrap());
+    assert!(destination.starts_with(&fixture.home) && destination != source);
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    assert_eq!(fs::read(&source).unwrap(), b"abc");
+    assert!(owned_partials(&fixture.home).is_empty());
+    gate.release.store(true, Ordering::Release);
+    owner.detach();
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_confirmed_termination_revokes_pending_receive() {
+    confirmed_termination_revokes_pending_receive(false);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn folder_confirmed_termination_revokes_pending_receive() {
+    confirmed_termination_revokes_pending_receive(true);
+}
+
+fn confirmed_termination_revokes_pending_receive(folder: bool) {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release.store(true, Ordering::Release);
+            self.0.exit_release.store(true, Ordering::Release);
+        }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate {
+        frame: "FileResult", occurrence: 2, hold_session_exit: true, ..Default::default()
+    });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 3, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("end-race"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':end-race')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":end-race").is_some());
+    let source = fixture.home.join("empty.bin");
+    if folder { fs::create_dir(&source).unwrap(); }
+    else { fs::write(&source, b"").unwrap(); }
+    let mut controller = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["receive", "fixture", "end-race", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "FileClose receipt was not gated");
+        assert!(controller.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let terminated = Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["terminate", "fixture", "end-race", "--json"]).output().unwrap();
+    assert!(terminated.status.success(), "{} {}", String::from_utf8_lossy(&terminated.stdout), String::from_utf8_lossy(&terminated.stderr));
+    let terminated: serde_json::Value = serde_json::from_slice(&terminated.stdout).unwrap();
+    assert_eq!(terminated["status"], "terminated");
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    while !gate.exit_observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < exit_deadline, "SessionExited was not gated");
+        thread::sleep(Duration::from_millis(10));
+    }
+    gate.release.store(true, Ordering::Release);
+    let response_deadline = Instant::now() + Duration::from_secs(5);
+    while controller.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < response_deadline, "revoked receive did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = controller.output();
+    assert_eq!(response.status.code(), Some(1), "{} {}", String::from_utf8_lossy(&response.stdout), String::from_utf8_lossy(&response.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["commit_started"], false);
+    assert!(!PathBuf::from(response["actual_path"].as_str().unwrap()).exists());
+    assert!(owned_partials(&fixture.home).is_empty());
+    assert_eq!(source.is_dir(), folder);
+    assert!(source.exists());
+    gate.exit_release.store(true, Ordering::Release);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_owner_death_reports_unknown_without_waiting_for_transfer_deadline() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("owner-loss"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':owner-loss')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":owner-loss").is_some());
+    let source = fixture.home.join("committed.bin");
+    fs::write(&source, b"abc").unwrap();
+    let mut controller = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "owner-loss", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "committed receipt was not gated");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let receipt = gate.file_result.lock().unwrap().clone().unwrap();
+    let destination = PathBuf::from(receipt["actual_path"].as_str().unwrap());
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    owner.child.kill().unwrap();
+    owner.child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while controller.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "controller kept waiting after owner died");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = controller.output();
+    assert_eq!(response.status.code(), Some(6), "{} {}", String::from_utf8_lossy(&response.stdout), String::from_utf8_lossy(&response.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "unknown");
+    assert_eq!(response["operation_kind"], "file_transfer");
+    assert_eq!(response["commit_may_have_started"], true);
+    assert_eq!(response["automatic_retry"], false);
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    gate.release.store(true, Ordering::Release);
 }
 
 #[test]
@@ -728,13 +1344,6 @@ fn local_shell_accepts_command_after_detach_failure_and_remote_exit() {
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
     use std::sync::atomic::Ordering;
-    struct Pending(Option<Child>);
-    impl Pending {
-        fn output(mut self) -> std::process::Output { self.0.take().unwrap().wait_with_output().unwrap() }
-    }
-    impl Drop for Pending {
-        fn drop(&mut self) { if let Some(child) = &mut self.0 { let _ = child.kill(); let _ = child.wait(); } }
-    }
     struct Release(Arc<CreationGate>);
     impl Drop for Release { fn drop(&mut self) { self.0.release.store(true, Ordering::Release); } }
     for frame in ["HelloOk", "SessionCreated"] {

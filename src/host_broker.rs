@@ -34,6 +34,8 @@ use windows_sys::Win32::{
 use crate::host_pipe;
 use arterm::{
     deployment, store,
+    file_transfer::{AuthorizedSession, Limits, TransferManager, TransferState, MAX_CHUNK_BYTES},
+    transfer_payload::{self, PayloadReceipt, PayloadStatus, PreparedSource, SourceMetadata},
     shell_integration::{Commands, CAPABILITY as COMMAND_CAPABILITY},
     wire::{self, bin16, binary, get, map, message, num, s, text, Frames},
 };
@@ -52,6 +54,8 @@ const CAPS: &[&str] = &[
     COMMAND_CAPABILITY,
     "host-owner-management-v1",
     "session-termination-confirmed",
+    arterm::transfer_admission::CAPABILITY,
+    transfer_payload::METADATA_CAPABILITY,
 ];
 const MAX_SESSIONS: usize = 16;
 const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
@@ -182,6 +186,7 @@ struct SessionState {
     output_bytes: usize,
     next_output: u64,
     attachment: Option<Attachment>,
+    attachment_connection: Option<Arc<AtomicBool>>,
     highest_epochs: HashMap<Vec<u8>, u64>,
     input_committed: u64,
     resize_generation: u64,
@@ -198,6 +203,142 @@ struct Session {
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     job: Job,
+    transfers: Mutex<FileState>,
+}
+
+#[derive(Default)]
+struct FileState {
+    manager: Option<TransferManager>,
+    operations: HashMap<Uuid, Uuid>,
+    sources: HashMap<Uuid, SourceMetadata>,
+    preparations: HashMap<Uuid, PreparedSource<arterm::folder_archive::PreparedArchive>>,
+}
+
+struct FileBridge {
+    session: Arc<Session>,
+    attachment: Attachment,
+    connected: Arc<AtomicBool>,
+    directory_capable: bool,
+    deadline: Instant,
+    ids: Vec<Uuid>,
+}
+
+impl FileBridge {
+    fn authorize(&self) -> Result<std::sync::MutexGuard<'_, SessionState>> {
+        ensure!(Instant::now() < self.deadline, "FileDeadlineExpired");
+        ensure!(self.connected.load(Ordering::Acquire), "FileDisconnected");
+        let state = self.session.state.lock().unwrap();
+        ensure!(state.exit.is_none() && state.attachment.as_ref().is_some_and(|a|
+            a.id == self.attachment.id && a.lease == self.attachment.lease &&
+            a.client == self.attachment.client && a.epoch == self.attachment.epoch),
+            "FileLeaseRevoked");
+        ensure!(state.attachment_connection.as_ref().is_some_and(|live| live.load(Ordering::Acquire)),
+            "FileWriterDisconnected");
+        Ok(state)
+    }
+
+    fn request(&mut self, kind: &str, body: &Value, progress: &dyn Fn() -> Result<()>)
+        -> Result<(serde_json::Value, Option<Vec<u8>>)> {
+        drop(self.authorize()?);
+        let session = self.session.clone();
+        let mut files = session.transfers.try_lock().map_err(|_| anyhow::anyhow!("FileBusy"))?;
+        // Revalidate after taking the independent file lock, never a terminal/global lock during I/O.
+        drop(self.authorize()?);
+        if matches!(kind, "FileBeginUpload" | "FileBeginDownload") {
+            let operation = Uuid::parse_str(text(body, "operation_id")?)?;
+            ensure!(!files.operations.contains_key(&operation), "FileDuplicateOperation");
+            ensure!(files.operations.len() < 256, "FileOperationCapacity");
+            let check = || { drop(self.authorize()?); progress() };
+            let prepared = if kind == "FileBeginDownload" {
+                Some(transfer_payload::prepare_source(
+                    arterm::file_transfer::pin_source(Path::new(text(body, "path")?))?,
+                    self.directory_capable, &check, transfer_payload::prepare_directory)?)
+            } else { None };
+            let source = if let Some(prepared) = &prepared { prepared.metadata().clone() }
+                else { SourceMetadata::from_wire(body)? };
+            source.require_directory_support(self.directory_capable)?;
+            if kind == "FileBeginUpload" && source.kind == transfer_payload::SourceKind::File {
+                ensure!(text(body, "path")? == source.original_basename, "FileSourceMetadataMismatch");
+            }
+            if files.manager.is_none() {
+                files.manager = Some(TransferManager::new(AuthorizedSession::after_authorization(session.id),
+                    &std::env::temp_dir().components().collect::<PathBuf>(), Limits::default())?);
+            }
+            let manager = files.manager.as_mut().context("FileManagerMissing")?;
+            let status = if kind == "FileBeginUpload" {
+                manager.begin_upload(text(body, "path")?, num(body, "size")?)?
+            } else { manager.begin_download(prepared.as_ref().context("FilePreparationMissing")?.payload_path())? };
+            self.ids.push(status.transfer_id);
+            files.operations.insert(operation, status.transfer_id);
+            files.sources.insert(status.transfer_id, source.clone());
+            if let Some(prepared) = prepared { files.preparations.insert(status.transfer_id, prepared); }
+            drop(self.authorize()?);
+            return Ok((serde_json::to_value(PayloadStatus { payload: status, source })?, None));
+        }
+        let id = Uuid::parse_str(text(body, "transfer_id")?)?;
+        ensure!(self.ids.contains(&id), "FileUnauthorizedTransfer");
+        let source = files.sources.get(&id).context("FileSourceMetadataMissing")?.clone();
+        if kind == "FileClose" {
+            if let Some(prepared) = files.preparations.get(&id) {
+                prepared.verify_sources(&|| { drop(self.authorize()?); progress() })?;
+            }
+        }
+        let manager = files.manager.as_mut().context("FileManagerMissing")?;
+        let result = match kind {
+            "FileWrite" => {
+                let bytes = binary(body, "bytes")?;
+                ensure!(bytes.len() <= MAX_CHUNK_BYTES, "FileChunkTooLarge");
+                serde_json::json!({"offset":manager.write_chunk(id, num(body, "offset")?, &bytes)?})
+            }
+            "FileRead" => {
+                let chunk = manager.read_chunk(id, num(body, "offset")?, MAX_CHUNK_BYTES)?;
+                drop(self.authorize()?);
+                return Ok((serde_json::json!({"offset":chunk.offset, "eof":chunk.eof}), Some(chunk.bytes)));
+            }
+            "FileFinish" => {
+                let hash: [u8; 32] = binary(body, "sha256")?.try_into()
+                    .map_err(|_| anyhow::anyhow!("FileInvalidDigest"))?;
+                let receipt = manager.finish_guarded(id, hash, || self.authorize())?;
+                serde_json::to_value(transfer_payload::complete_payload(manager, source, receipt,
+                    &|| { drop(self.authorize()?); progress() },
+                    |source, payload, budget, check, admit| {
+                        transfer_payload::publish_directory(
+                            source, payload, budget, check, admit, || self.authorize(),
+                        )
+                    })?)?
+            }
+            "FileClose" => serde_json::to_value(PayloadReceipt {
+                payload: manager.close(id)?, source, extracted_bytes: None,
+            })?,
+            "FileCancel" => serde_json::to_value(manager.cancel(id)?)?,
+            _ => bail!("FileUnsupportedOperation"),
+        };
+        if matches!(kind, "FileClose" | "FileCancel") { files.preparations.remove(&id); }
+        drop(self.authorize()?);
+        Ok((result, None))
+    }
+}
+
+impl Drop for FileBridge {
+    fn drop(&mut self) {
+        if self.ids.is_empty() { return; }
+        let mut files = self.session.transfers.lock().unwrap();
+        if let Some(manager) = &mut files.manager {
+            for id in &self.ids {
+                if manager.status(*id).is_ok_and(|s| matches!(s.state, TransferState::Uploading | TransferState::Downloading)) {
+                    if let Err(error) = manager.cancel(*id) {
+                        arterm::statusln!("[file] Partial cleanup failed: {error:#}");
+                    }
+                }
+            }
+        }
+        for id in &self.ids { files.preparations.remove(id); }
+    }
+}
+
+struct FileConnection(Arc<AtomicBool>);
+impl Drop for FileConnection {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -337,11 +478,13 @@ impl Session {
         let session = Arc::new(Self {
             id,
             token,
+            transfers: Mutex::new(FileState::default()),
             state: Mutex::new(SessionState {
                 output: VecDeque::new(),
                 output_bytes: 0,
                 next_output: 1,
                 attachment: None,
+                attachment_connection: None,
                 highest_epochs: HashMap::new(),
                 input_committed: 0,
                 resize_generation: 0,
@@ -478,7 +621,7 @@ fn error(code: &str, detail: &str) -> Value {
         map(vec![("code", s(code)), ("message", s(detail))]),
     )
 }
-fn send(file: &mut File, value: Value) -> Result<()> {
+fn send(mut file: impl Write, value: Value) -> Result<()> {
     file.write_all(&wire::encode(&value)?)?;
     file.flush()?;
     Ok(())
@@ -705,7 +848,10 @@ impl Broker {
         first: [u8; 4],
     ) -> Result<()> {
         let (tx, rx) = mpsc::sync_channel::<Result<Value>>(64);
+        let connected = Arc::new(AtomicBool::new(true));
+        let reader_connected = connected.clone();
         thread::spawn(move || {
+            let _connection = FileConnection(reader_connected);
             let mut frames = Frames::default();
             if frames.push(&first).is_err() {
                 return;
@@ -755,7 +901,9 @@ impl Broker {
                     ("broker_instance_id", Value::Binary(self.instance.clone())),
                     (
                         "capabilities",
-                        Value::Array(CAPS.iter().map(|v| s(v)).collect()),
+                        Value::Array(CAPS.iter().copied()
+                            .chain(transfer_payload::DIRECTORY_ADAPTER_INSTALLED.then_some(transfer_payload::DIRECTORY_CAPABILITY))
+                            .map(s).collect()),
                     ),
                     ("max_frame", (wire::MAX_FRAME as u64).into()),
                     ("max_input_window_bytes", 65536.into()),
@@ -763,6 +911,11 @@ impl Broker {
             ),
         )?;
         let mut attached: Option<(Arc<Session>, Vec<u8>, u64)> = None;
+        let result = (|| -> Result<()> {
+        let file_caps = get(hello_body, "capabilities")?.as_array().context("invalid capabilities")?;
+        let file_capable = [arterm::transfer_admission::CAPABILITY, transfer_payload::METADATA_CAPABILITY]
+            .iter().all(|cap| file_caps.iter().any(|v| v.as_str() == Some(cap)));
+        let mut file_bridge: Option<FileBridge> = None;
         let mut cursor = 0u64;
         let mut command_revision = None;
         let mut last_peer = Instant::now();
@@ -773,6 +926,68 @@ impl Broker {
                     let kind = text(&value, "type")?;
                     let body = get(&value, "body")?;
                     match kind {
+                        "FileAuthorize" => {
+                            let authorized = (|| -> Result<FileBridge> {
+                                ensure!(file_capable && file_bridge.is_none(), "FileUnauthorized");
+                                ensure!(bin16(body, "broker_instance_id")? == self.instance, "FileUnauthorized");
+                                let id = Uuid::parse_str(text(body, "session_id")?)?;
+                                let session = self.sessions.lock().unwrap().get(&id).cloned().context("FileUnauthorized")?;
+                                ensure!(binary(body, "resume_token")? == session.token &&
+                                    bin16(body, "client_instance_id")? == client, "FileUnauthorized");
+                                let bridge = FileBridge {
+                                    session, attachment: Attachment {
+                                        id: bin16(body, "attachment_id")?, lease: bin16(body, "lease_id")?,
+                                        client: client.clone(), epoch: num(body, "connection_epoch")?,
+                                    }, connected: connected.clone(), ids: Vec::new(),
+                                    directory_capable: transfer_payload::DIRECTORY_ADAPTER_INSTALLED &&
+                                        file_caps.iter().any(|v| v.as_str() == Some(transfer_payload::DIRECTORY_CAPABILITY)),
+                                    deadline: Instant::now() + transfer_payload::OPERATION_TIMEOUT,
+                                };
+                                drop(bridge.authorize()?);
+                                Ok(bridge)
+                            })();
+                            match authorized {
+                                Ok(bridge) => {
+                                    file_bridge = Some(bridge);
+                                    send(&mut output, message("FileAuthorized", map(vec![])))?;
+                                }
+                                Err(_) => send(&mut output, error("FileUnauthorized", "file authorization rejected"))?,
+                            }
+                        }
+                        "FileBeginUpload" | "FileBeginDownload" | "FileWrite" | "FileRead" |
+                        "FileFinish" | "FileClose" | "FileCancel" => {
+                            let request_id = s(text(body, "request_id")?);
+                            let result = {
+                                let last_progress = std::cell::Cell::new(Instant::now());
+                                let progress = || {
+                                    if last_progress.get().elapsed() >= transfer_payload::PROGRESS_INTERVAL {
+                                        send(&output, message("FileProgress", map(vec![
+                                            ("request_id", request_id.clone()),
+                                            ("phase", s(match kind {
+                                                "FileBeginDownload" => "preparing",
+                                                "FileFinish" => "publishing",
+                                                "FileClose" => "verifying",
+                                                _ => "transferring",
+                                            })),
+                                        ])))?;
+                                        last_progress.set(Instant::now());
+                                    }
+                                    Ok(())
+                                };
+                                file_bridge.as_mut().context("FileUnauthorized")
+                                    .and_then(|bridge| bridge.request(kind, body, &progress))
+                            };
+                            last_peer = Instant::now();
+                            match result {
+                                Ok((result, bytes)) => send(&mut output, message("FileResult", map(vec![
+                                    ("request_id", request_id), ("json", s(&serde_json::to_string(&result)?)),
+                                    ("bytes", bytes.map(Value::Binary).unwrap_or(Value::Nil)),
+                                ])))?,
+                                Err(error) => send(&mut output, message("FileError", map(vec![
+                                    ("request_id", request_id), ("detail", s(&error.to_string())),
+                                ])))?,
+                            }
+                        }
                         "ListSessions" => {
                             // The accepted host pipe authenticates the Windows owner/logon context.
                             // The remote transport must launch the native helper as that owner.
@@ -813,6 +1028,8 @@ impl Broker {
                                         ),
                                     )?;
                                 } else {
+                                    session.state.lock().unwrap().attachment_connection = Some(connected.clone());
+                                    attached = Some((session.clone(), attachment.id.clone(), attachment.epoch));
                                     let committed = session.state.lock().unwrap().input_committed;
                                     cursor = num(body, "after_output_seq")?;
                                     send(
@@ -839,7 +1056,6 @@ impl Broker {
                                             ]),
                                         ),
                                     )?;
-                                    attached = Some((session, attachment.id, attachment.epoch));
                                     command_revision = None;
                                 }
                             }
@@ -973,9 +1189,11 @@ impl Broker {
                             }
                             st.highest_epochs.insert(client.clone(), epoch);
                             st.attachment = Some(attachment.clone());
+                            st.attachment_connection = Some(connected.clone());
                             let committed = st.input_committed;
                             let generation = st.resize_generation;
                             drop(st);
+                            attached = Some((session.clone(), attachment.id.clone(), epoch));
                             cursor = num(body, "after_output_seq")?;
                             send(
                                 &mut output,
@@ -992,7 +1210,6 @@ impl Broker {
                                     ]),
                                 ),
                             )?;
-                            attached = Some((session, attachment.id, epoch));
                             command_revision = None;
                         }
                         "CommandSubmit" | "CommandStatus" | "CommandInterrupt" | "SessionInterrupt" => {
@@ -1233,6 +1450,9 @@ impl Broker {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            if file_bridge.as_ref().is_some_and(|bridge| bridge.authorize().is_err()) {
+                file_bridge = None;
+            }
             if last_peer.elapsed() > PEER_IDLE_TIMEOUT {
                 eprintln!("host connection closed: peer idle timeout after 20 seconds without a client protocol message");
                 break;
@@ -1318,6 +1538,8 @@ impl Broker {
                 }
             }
         }
+        Ok(())
+        })();
         if let Some((session, attachment_id, _)) = attached {
             let mut st = session.state.lock().unwrap();
             if st
@@ -1328,7 +1550,7 @@ impl Broker {
                 st.attachment = None;
             }
         }
-        Ok(())
+        result
     }
 }
 
