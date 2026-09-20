@@ -1,5 +1,4 @@
-#[path = "../client_config.rs"]
-mod client_config;
+use arterm::client_config;
 #[path = "../client_protocol.rs"]
 mod client_protocol;
 #[path = "../client_output.rs"]
@@ -10,7 +9,7 @@ use arterm::statusln as eprintln;
 use client_config::{ClientConfig, Target};
 use arterm::{
     console::{Console, Terminal},
-    deployment::{self, Role},
+    deployment,
     engine::{End, Engine},
     local_control::{self, Operation, Owner},
     store::{self, SessionReference, Store},
@@ -52,6 +51,8 @@ Usage:\n\
   arterm terminate MACHINE SESSION [--json]\n\
   arterm doctor [ALIAS]\n\
   arterm --help | --version\n\n\
+Client Setup initializes local files. setup is optional repair/custom-path configuration, not sign-in.\n\
+Use arterm login if not signed in, then arterm add to register a host.\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
 Control commands print readable results by default; use --json for structured automation output.\n\
 Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
@@ -136,17 +137,8 @@ fn setup(root: &Path, args: &[String]) -> Result<()> {
     if let Some(path) = &override_path {
         ensure!(path.is_absolute(), "--devtunnel-path must be absolute");
     }
-    let selected =
-        deployment::ensure_dependency(Role::Client, override_path.as_deref(), no_download)?;
-    let mut config = client_config::load(root)?;
-    config.devtunnel_path = Some(selected.clone());
-    client_config::save(root, &config)?;
-    let signed_in = authenticated(&selected)?;
-    if !signed_in {
-        run_vendor(&selected, &["user", "login", "--github"])?;
-        ensure!(authenticated(&selected)?, "login did not establish usable devtunnel credentials; run the client's login command again");
-    }
-    println!("Client configured with {}", selected.display());
+    let selected = client_config::initialize(root, override_path.as_deref(), no_download)?;
+    println!("Local client ready with {}. Use arterm login if not signed in, then arterm add to register a host. Existing sign-in was not changed.", selected.display());
     Ok(())
 }
 
@@ -163,14 +155,12 @@ fn add_target(root: &Path, args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let mut config = client_config::load(root)?;
-    let target = client_config::add(
-        &mut config,
-        alias,
-        tunnel.as_deref().context("add requires --tunnel")?,
-        host_path.as_deref().context("add requires --host-path")?,
-    )?;
-    client_config::save(root, &config)?;
+    let tunnel = tunnel.as_deref().context("add requires --tunnel")?;
+    let host_path = host_path.as_deref().context("add requires --host-path")?;
+    client_config::validate_registration(alias, tunnel, host_path)?;
+    let target = client_config::update(root, |config| {
+        client_config::add(config, alias, tunnel, host_path)
+    })?;
     println!(
         "Added {alias} -> {} ({})",
         target.tunnel_id, target.host_path
@@ -193,9 +183,8 @@ fn list_targets(root: &Path, args: &[String]) -> Result<()> {
 
 fn remove_target(root: &Path, args: &[String]) -> Result<()> {
     ensure!(args.len() == 1, "remove requires exactly one alias");
-    let mut config = client_config::load(root)?;
-    client_config::remove(&mut config, root, &args[0])?;
-    client_config::save(root, &config)?;
+    client_config::validate_alias(&args[0])?;
+    client_config::update(root, |config| client_config::remove(config, root, &args[0]))?;
     println!("Removed alias {}. Recovery records were retained.", args[0]);
     Ok(())
 }

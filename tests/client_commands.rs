@@ -57,6 +57,33 @@ fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
 }
 
 #[test]
+fn concurrent_registration_processes_preserve_all_successful_writes() {
+    let home = std::env::temp_dir().join(format!("arterm-client-writers-{}", Uuid::now_v7()));
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8).map(|index| {
+            let home = &home;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                run(home, &["add", &format!("box-{index}"), "--tunnel", "my-box",
+                    "--host-path", r"C:\Tools\arterm-host.exe"])
+            })
+        }).collect();
+        for worker in workers {
+            let output = worker.join().unwrap();
+            assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+    });
+    let config = arterm::client_config::load(&home).unwrap();
+    assert_eq!(config.targets.len(), 8);
+    for index in 0..8 {
+        assert_eq!(config.targets[&format!("box-{index}")].tunnel_id, "my-box");
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn help_version_and_validation_do_not_require_setup() {
     let home = std::env::temp_dir().join(format!("devbox-client-help-{}", Uuid::now_v7()));
     assert!(run(&home, &["--help"]).status.success());

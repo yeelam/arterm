@@ -74,9 +74,10 @@ Then run the installer for the role you need:
 .\arTerm-Host-Setup.exe
 ```
 
-Installation and configuration are separate. Open a fresh PowerShell window
-after installation, then run `arterm.exe setup` on the client or
-`arterm-host.exe setup --name my-devbox` on the host. Sign into the same GitHub
+Client installation completes local initialization; no `arterm.exe setup` is
+required. Open a fresh PowerShell window after installation. On the client,
+use `arterm.exe login` only if not already signed in; installation never changes
+sign-in. On the host, run `arterm-host.exe setup --name my-devbox`. Sign into the same GitHub
 account on both machines and run the host's printed registration command on
 the client. Follow [QUICKSTART.md](https://github.com/yeelam/arterm/blob/main/QUICKSTART.md) for the
 complete connection and automation steps.

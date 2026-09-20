@@ -692,7 +692,11 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
         if remove {
             return uninstall(&dir, role, terminate_sessions, force_stop);
         }
-        ensure_dependency(role, None, no_download || quiet)?;
+        if role == Role::Client {
+            crate::client_config::initialize(&data_root()?, None, no_download || quiet)?;
+        } else {
+            ensure_dependency(role, None, no_download || quiet)?;
+        }
         let existing = installed_runtimes(&dir, role)?;
         if role == Role::Host && !existing.is_empty() {
             verify_install_owner(&dir, role)?;
@@ -701,15 +705,19 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
         write_payload(&dir, role, payload)?;
         update_path(&dir, true)?;
         register_uninstall(&dir, role)?;
-        println!(
-            "Installed {} to {}. Existing user configuration and credentials were retained. Open a new terminal and run {} {}.",
-            role_name(role),
-            dir.display(),
-            exe_name(role),
-            if role == Role::Host && data_root()?.join("host").join("setup.json").try_exists()? {
-                "start (already configured; no registration required)"
-            } else if role == Role::Host { "setup --name <your-box-name>" } else { "setup" }
-        );
+        if role == Role::Client {
+            println!("Installed Client to {}. Local client ready; no arterm setup is required. Existing configuration and credentials were retained. Open a new terminal; use arterm login if not signed in, then arterm add to register a host.", dir.display());
+        } else {
+            println!(
+                "Installed {} to {}. Existing user configuration and credentials were retained. Open a new terminal and run {} {}.",
+                role_name(role),
+                dir.display(),
+                exe_name(role),
+                if data_root()?.join("host").join("setup.json").try_exists()? {
+                    "start (already configured; no registration required)"
+                } else { "setup --name <your-box-name>" }
+            );
+        }
         println!("No account was signed in and no existing vendor tunnel was changed.");
         Ok(())
     })();
@@ -733,10 +741,13 @@ fn installer_help(role: Role) -> String {
     let host = if role == Role::Host {
         "\n--terminate-sessions requests graceful shutdown of the current user/logon/data-root host, ending its sessions.\n--force-stop-host bypasses an unresponsive control pipe and force-stops only matching installed host executable paths for the current user/Windows logon. ALL sessions of those processes are lost, including hosts using other data roots. Other installations/users are not killed.\nForce-stop is never automatic; without it an unresponsive host cancels the operation."
     } else { "" };
+    let client = if role == Role::Client {
+        "\nClient installation initializes local files; no arterm setup is required. Use arterm login if not signed in, then arterm add to register a host."
+    } else { "" };
     format!("arTerm {} installer\n--quiet --no-download --log <absolute-path> --uninstall{host}\n\
         Both --option and /option spellings are accepted.\n\
         Existing configuration and credentials are retained.\n\
-        Per-user installation. Signing credentials are not bundled. Login occurs in setup, never in the installer.",
+        Per-user installation. Signing credentials are not bundled. The installer never signs in.{client}",
         role_name(role))
 }
 

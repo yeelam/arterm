@@ -139,10 +139,12 @@ From the extracted download:
 Open a fresh PowerShell window, then:
 
 ```powershell
-arterm.exe setup
+arterm.exe login # Only if not already signed in
 ```
 
-Use the **same GitHub account as the remote host**. Run the registration command
+The installer completes local initialization without inspecting or changing sign-in;
+no `arterm setup` is required. Use the **same GitHub account as the remote host**.
+Already signed-in users can go directly to registration. Run the registration command
 the host printed in PowerShell. For example (use the actual remote host path):
 
 ```powershell
@@ -150,7 +152,7 @@ arterm.exe add my-devbox --tunnel my-devbox --host-path 'C:\Tools\VsTerm\Host\ar
 ```
 
 This saves the friendly name and host path, not a generated tunnel ID.
-`setup` does not create this registration automatically. On every connection
+The installer does not create this registration automatically. On every connection
 and reconnect, the client discovers the current ID from the host name in
 `devtunnel list`. Hosts must have unique names under the signed-in account.
 Then:
@@ -164,7 +166,15 @@ arterm.exe connect my-devbox MyWork
 
 For an explicitly provisioned devtunnel CLI, use
 `arterm.exe setup --devtunnel-path 'C:\Tools\devtunnel.exe' --no-download`.
-Setup still prompts for GitHub sign-in when needed. Installer switches use
+This optional repair/custom-path command preserves registrations and does not sign in.
+Upgrades retain the configured dependency path and configuration bytes.
+Missing configuration alongside existing local data, invalid configuration, or an
+unavailable configured dependency fails explicitly rather than resetting state.
+Client configuration writers share a short-lived lock (up to two seconds of
+waiting); dependency download prompts do not hold it. Initialization reloads
+registrations before saving. If another command changes the configured dependency
+during selection, initialization fails without overwriting it; retry the command.
+Use `arterm login` explicitly if sign-in is needed. Installer switches use
 slashes (`/quiet`, `/no-download`); runtime setup switches use double hyphens.
 
 `connect MACHINE` only prints a reusable command and exits, without a

@@ -1,4 +1,5 @@
 pub mod console;
+pub mod client_config;
 pub mod deployment;
 pub mod engine;
 pub mod host_setup;

@@ -69,10 +69,11 @@ a cold boot requires Windows sign-in, and arTerm does not configure autologon.
 3. **On the local client**, run `arTerm-Client-Setup.exe`. Open a fresh PowerShell:
 
    ```powershell
-   arterm setup
+   arterm login # Only if not already signed in
    ```
 
-   Sign in with the same GitHub account. **Copy and run the host's printed
+   Client Setup completes local initialization; `arterm setup` is not required.
+   Sign in with the same GitHub account if needed. **Copy and run the host's printed
    registration command once**; client setup does not register the host for you.
    Then create your session:
 

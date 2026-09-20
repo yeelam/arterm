@@ -14,6 +14,10 @@ fn setup_help_uses_neutral_product_branding_without_installing() {
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(text.lines().next(), Some(expected));
+        if expected == "arTerm Client installer" {
+            assert!(text.contains("no arterm setup is required"));
+            assert!(text.contains("Use arterm login if not signed in"));
+        }
         assert!(output.stderr.is_empty());
     }
 }
@@ -85,6 +89,9 @@ impl Sandbox {
             ("LOCALAPPDATA", std::env::var_os("LOCALAPPDATA")),
             ("VSTERM_REMOTE_HOME", std::env::var_os("VSTERM_REMOTE_HOME")),
             ("PATH", std::env::var_os("PATH")),
+            ("USERPROFILE", std::env::var_os("USERPROFILE")),
+            ("APPDATA", std::env::var_os("APPDATA")),
+            ("HOME", std::env::var_os("HOME")),
         ];
         let mut paths: Vec<PathBuf> = dependencies
             .iter()
@@ -96,6 +103,9 @@ impl Sandbox {
         std::env::set_var("LOCALAPPDATA", &home);
         std::env::set_var("VSTERM_REMOTE_HOME", home.join("data"));
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("APPDATA", home.join("Roaming"));
+        std::env::set_var("HOME", &home);
         Self {
             home,
             registry_path,
@@ -119,6 +129,172 @@ impl Drop for Sandbox {
         }
         let _ = fs::remove_dir_all(&self.home);
     }
+}
+
+#[test]
+#[ignore = "requires installed signed Microsoft devtunnel; isolated HKCU/files, no sign-in"]
+fn client_initialization_fresh_upgrade_and_legacy_repair() {
+    use arterm::client_config;
+    use std::process::Command;
+    let dependency = deployment::ensure_dependency(Role::Client, None, true).unwrap();
+    let sandbox = Sandbox::new(&[dependency.clone()]);
+    let root = deployment::data_root().unwrap();
+    let config_path = client_config::config_path(&root);
+    let payload = fs::read(env!("CARGO_BIN_EXE_arterm")).unwrap();
+    let args = vec!["/quiet".into(), "/no-download".into()];
+    // Credential-shaped sentinel files must never be inspected, replaced, or deleted.
+    let credential = sandbox.home.join(".devtunnel").join("token.json");
+    fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    fs::write(&credential, b"credential sentinel: not valid JSON").unwrap();
+    deployment::installer_with_args(Role::Client, &payload, &args).unwrap();
+    let mut config = client_config::load(&root).unwrap();
+    assert_eq!(config.schema, 1);
+    assert_eq!(config.devtunnel_path.as_ref(), Some(&dependency));
+    assert!(config.targets.is_empty());
+    assert!(root.join("client\\sessions").is_dir());
+    assert!(root.join("client\\forwards").is_dir());
+    let dir = deployment::install_dir(Role::Client).unwrap();
+    assert_branding(&dir, "Client");
+    assert_eq!(fs::read(dir.join("arterm.exe")).unwrap(), payload);
+    let add = Command::new(dir.join("arterm.exe"))
+        .args(["add", "box", "--tunnel", "my-box", "--host-path", r"C:\Tools\arterm-host.exe"])
+        .output().unwrap();
+    assert!(add.status.success(), "{:?}", add);
+    config = client_config::load(&root).unwrap();
+    let target = config.targets["box"].clone();
+    let connect = Command::new(dir.join("arterm.exe"))
+        .args(["connect", "box"]).output().unwrap();
+    assert!(connect.status.success(), "{:?}", connect);
+    assert!(String::from_utf8_lossy(&connect.stdout).contains("connect"));
+
+    let custom = sandbox.home.join("custom-devtunnel.exe");
+    fs::copy(&dependency, &custom).unwrap();
+    config.devtunnel_path = Some(custom.clone());
+    // Include unknown future metadata and noncanonical formatting: upgrades must not serialize.
+    let mut json = serde_json::to_value(&config).unwrap();
+    json["future_metadata"] = "preserve me".into();
+    let bytes = format!(" \r\n{}\r\n", serde_json::to_string(&json).unwrap()).into_bytes();
+    fs::write(&config_path, &bytes).unwrap();
+    let records = client_config::state_dir(&root, &target);
+    fs::create_dir_all(&records).unwrap();
+    let record = records.join("retained.dpapi");
+    fs::write(&record, b"protected session sentinel").unwrap();
+    deployment::installer_with_args(Role::Client, &payload, &args).unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), bytes);
+    assert_eq!(client_config::load(&root).unwrap().devtunnel_path, Some(custom.clone()));
+
+    let setup = Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .args(["setup", "--no-download"]).output().unwrap();
+    assert!(setup.status.success(), "{:?}", setup);
+    assert!(String::from_utf8_lossy(&setup.stdout).contains("Local client ready"));
+    assert_eq!(fs::read(&config_path).unwrap(), bytes);
+    // Explicit legacy repair may change the dependency, but not targets or recovery data.
+    let repair = Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .args(["setup", "--no-download", "--devtunnel-path"])
+        .arg(&dependency).output().unwrap();
+    assert!(repair.status.success(), "{:?}", repair);
+    let repaired = client_config::load(&root).unwrap();
+    assert_eq!(repaired.devtunnel_path.as_ref(), Some(&dependency));
+    assert_eq!(repaired.targets.get("box"), Some(&target));
+    assert_eq!(fs::read(&record).unwrap(), b"protected session sentinel");
+    assert_eq!(fs::read(&credential).unwrap(), b"credential sentinel: not valid JSON");
+
+    let help = Command::new(env!("CARGO_BIN_EXE_arterm")).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("setup is optional repair"));
+}
+
+#[test]
+fn client_initialization_invalid_or_missing_config_fails_without_installing() {
+    use arterm::client_config;
+    let _sandbox = Sandbox::new(&[]);
+    let root = deployment::data_root().unwrap();
+    let config_path = client_config::config_path(&root);
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let args = vec!["/quiet".into(), "/no-download".into()];
+    for bytes in [
+        b"corrupt".as_slice(),
+        br#"{"schema":2,"devtunnel_path":null,"targets":{}}"#,
+        br#"{"schema":1,"targets":[]}"#,
+    ] {
+        fs::write(&config_path, bytes).unwrap();
+        let error = deployment::installer_with_args(Role::Client, b"MZfixture", &args).unwrap_err();
+        assert!(format!("{error:#}").contains("configuration"), "{error:#}");
+        assert_eq!(fs::read(&config_path).unwrap(), bytes);
+        assert!(!deployment::install_dir(Role::Client).unwrap().exists());
+    }
+    fs::remove_file(&config_path).unwrap();
+    let record = root.join("client\\sessions\\retained.dpapi");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"retained").unwrap();
+    let error = deployment::installer_with_args(Role::Client, b"MZfixture", &args).unwrap_err();
+    assert!(error.to_string().contains("configuration is missing"), "{error:#}");
+    assert!(!config_path.exists());
+    assert_eq!(fs::read(record).unwrap(), b"retained");
+    assert!(!deployment::install_dir(Role::Client).unwrap().exists());
+    let dir = deployment::install_dir(Role::Client).unwrap();
+    deployment::write_payload(&dir, Role::Client, b"MZoriginal").unwrap();
+    let marker = fs::read(dir.join("installed.json")).unwrap();
+    fs::write(&config_path, b"corrupt upgrade config").unwrap();
+    assert!(deployment::installer_with_args(Role::Client, b"MZreplacement", &args).is_err());
+    assert_eq!(fs::read(dir.join("arterm.exe")).unwrap(), b"MZoriginal");
+    assert_eq!(fs::read(dir.join("installed.json")).unwrap(), marker);
+    assert_eq!(fs::read(&config_path).unwrap(), b"corrupt upgrade config");
+    let legacy = std::process::Command::new(env!("CARGO_BIN_EXE_arterm"))
+        .args(["setup", "--no-download"]).output().unwrap();
+    assert_eq!(legacy.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&legacy.stderr).contains("invalid client configuration"));
+    assert_eq!(fs::read(&config_path).unwrap(), b"corrupt upgrade config");
+}
+
+#[test]
+#[ignore = "requires installed signed Microsoft devtunnel; isolated HKCU/files, no sign-in"]
+fn client_initialization_dependency_and_atomic_save_fail_closed() {
+    use arterm::client_config;
+    use std::os::windows::fs::OpenOptionsExt;
+    let dependency = deployment::ensure_dependency(Role::Client, None, true).unwrap();
+    let _sandbox = Sandbox::new(&[dependency.clone()]);
+    let root = deployment::data_root().unwrap();
+    let mut config = client_config::ClientConfig {
+        schema: 1,
+        devtunnel_path: Some(root.join("missing-custom.exe")),
+        ..Default::default()
+    };
+    client_config::update(&root, |latest| { *latest = config.clone(); Ok(()) }).unwrap();
+    let path = client_config::config_path(&root);
+    let original = fs::read(&path).unwrap();
+    let args = vec!["/quiet".into(), "/no-download".into()];
+    assert!(deployment::installer_with_args(Role::Client, b"MZfixture", &args).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!deployment::install_dir(Role::Client).unwrap().exists());
+    config.devtunnel_path = Some(dependency);
+    // Permit reads, but deny delete/rename to force the atomic replacement to fail.
+    let lock = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+    assert!(client_config::update(&root, |latest| { *latest = config.clone(); Ok(()) }).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(fs::read_dir(path.parent().unwrap()).unwrap().all(|e| {
+        e.unwrap().path().extension().is_none_or(|ext| ext != "tmp")
+    }));
+    drop(lock);
+    client_config::update(&root, |latest| { *latest = config.clone(); Ok(()) }).unwrap();
+    // Directory failures must not publish a successful install or rewrite configuration.
+    let before = fs::read(&path).unwrap();
+    fs::write(root.join("client\\sessions"), b"not a directory").unwrap();
+    assert!(deployment::installer_with_args(Role::Client, b"MZfixture", &args).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!deployment::install_dir(Role::Client).unwrap().exists());
+}
+
+#[test]
+fn client_initialization_quiet_missing_dependency_does_not_download() {
+    let sandbox = Sandbox::new(&[]);
+    std::env::set_var("PATH", &sandbox.home);
+    let root = deployment::data_root().unwrap();
+    let error = deployment::installer_with_args(Role::Client, b"MZfixture", &["/quiet".into()])
+        .unwrap_err();
+    assert!(error.to_string().contains("missing"), "{error:#}");
+    assert!(!arterm::client_config::config_path(&root).exists());
+    assert!(!deployment::install_dir(Role::Client).unwrap().exists());
 }
 
 #[test]
@@ -212,7 +388,12 @@ fn both_roles_install_upgrade_and_uninstall_without_touching_real_profile() {
     let _sandbox = Sandbox::new(&dependencies);
     let retained = deployment::data_root().unwrap().join("client");
     fs::create_dir_all(retained.join("sessions")).unwrap();
-    fs::write(retained.join("config.json"), b"unchanged legacy target configuration").unwrap();
+    let retained_config = serde_json::to_vec(&arterm::client_config::ClientConfig {
+        schema: 1,
+        devtunnel_path: Some(dependencies[0].clone()),
+        ..Default::default()
+    }).unwrap();
+    fs::write(retained.join("config.json"), &retained_config).unwrap();
     fs::write(retained.join("sessions").join("retained.dpapi"), b"unchanged protected record").unwrap();
     for (role, source) in [
         (Role::Client, env!("CARGO_BIN_EXE_arterm")),
@@ -240,7 +421,7 @@ fn both_roles_install_upgrade_and_uninstall_without_touching_real_profile() {
         assert!(!dir.join(deployment::exe_name(role)).exists());
         assert!(!dir.join("installed.json").exists());
         assert!(!dir.join(deployment::legacy_exe_name(role)).exists());
-        assert_eq!(fs::read(retained.join("config.json")).unwrap(), b"unchanged legacy target configuration");
+        assert_eq!(fs::read(retained.join("config.json")).unwrap(), retained_config);
         assert_eq!(fs::read(retained.join("sessions").join("retained.dpapi")).unwrap(), b"unchanged protected record");
         deployment::installer_with_args(role, &payload, &args).unwrap();
         use_legacy_marker(&dir, "yeelam-gordon");
