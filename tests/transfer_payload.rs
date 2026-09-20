@@ -35,7 +35,8 @@ fn regular_zip_never_enters_preparation_or_extraction_adapter() {
         false, &|| Ok(()), transfer_payload::archive_unavailable).unwrap();
     assert_eq!(prepared.metadata().kind, SourceKind::File);
     assert_eq!(prepared.metadata().original_basename, "ordinary.zip");
-    assert_eq!(prepared.payload_path(), source);
+    let payload_pin = file_transfer::pin_source(prepared.payload_path()).unwrap();
+    file_transfer::verify_path_identity(payload_pin.file(), &source).unwrap();
     prepared.verify_sources(&|| Ok(())).unwrap();
     let (mut manager, payload) = fixture.payload();
     let original = payload.actual_path.clone();
