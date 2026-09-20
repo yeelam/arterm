@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Read, Write},
     os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
@@ -203,6 +203,7 @@ pub fn pin_source(source: &Path) -> Result<PinnedSource> {
 struct Upload {
     file: File,
     directory: PathBuf,
+    directory_identity: (u32, u64),
     _pin: File,
     hash: Sha256,
 }
@@ -249,12 +250,15 @@ impl TransferManager {
         let mut pins = pin_directories(temp_root)?;
         let root = temp_root.join(format!("{}-{}", auth.session_id, Uuid::now_v7()));
         create_private_directory(&root)?;
-        let root_pin = pin_directory(&root).map_err(|e| cleanup_empty_directory(&root, e))?;
+        let root_pin = pin_directory(&root)
+            .context("new transfer root could not be verified; unverified path retained")?;
+        let root_identity = handle_identity(&root_pin)
+            .context("new transfer root identity unavailable; unverified path retained")?;
         let root = match actual_path(&root_pin) {
             Ok(path) => path,
             Err(error) => {
                 drop(root_pin);
-                return Err(cleanup_empty_directory(&root, error));
+                return Err(cleanup_empty_directory(&root, root_identity, error));
             }
         };
         pins.push(root_pin);
@@ -366,7 +370,10 @@ impl TransferManager {
         let path = directory.join(basename);
         validate_absolute_path(&path)?;
         create_private_directory(&directory)?;
-        let pin = pin_directory(&directory).map_err(|e| cleanup_empty_directory(&directory, e))?;
+        let pin = pin_directory(&directory)
+            .context("new upload directory could not be verified; unverified path retained")?;
+        let directory_identity = handle_identity(&pin)
+            .context("new upload directory identity unavailable; unverified path retained")?;
         // A fixed staging name cannot collide with a permitted destination name.
         let staging = extended_path(&directory)?.join(".arterm-partial");
         let opened = OpenOptions::new()
@@ -383,6 +390,7 @@ impl TransferManager {
                 drop(pin);
                 return Err(cleanup_empty_directory(
                     &directory,
+                    directory_identity,
                     io_error("create upload staging file", error),
                 ));
             }
@@ -396,6 +404,7 @@ impl TransferManager {
                 active: Some(Active::Upload(Upload {
                     file,
                     directory,
+                    directory_identity,
                     _pin: pin,
                     hash: Sha256::new(),
                 })),
@@ -690,14 +699,15 @@ impl TransferManager {
                 entry.status.error = Some(format!("partial cleanup failed: {error:#}"));
                 return Err(error);
             }
-            let directory = upload.directory.clone();
-            drop(upload);
+            let Upload { file, directory, directory_identity, _pin: pin, .. } = upload;
+            drop(file);
+            drop(pin);
             self.charged_bytes -= entry.status.expected_bytes;
             entry.status.state = TransferState::Cancelled;
-            if let Err(error) = fs::remove_dir(directory) {
+            if let Err(error) = delete_owned_directory(&directory, directory_identity) {
                 entry.status.error =
                     Some(format!("empty transfer-directory cleanup failed: {error}"));
-                return Err(io_error("remove empty transfer directory", error));
+                return Err(error).context("remove owned empty transfer directory");
             }
         }
         entry.status.state = TransferState::Cancelled;
@@ -870,9 +880,12 @@ pub fn verify_path_identity(file: &File, requested: &Path) -> Result<()> {
 }
 /// Pins this component only. Use `pin_directories` for an untrusted full path.
 pub fn pin_directory(path: &Path) -> Result<File> {
+    pin_directory_access(path, FILE_READ_ATTRIBUTES)
+}
+fn pin_directory_access(path: &Path, access: u32) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(extended_path(path)?)
@@ -1038,8 +1051,15 @@ pub(crate) fn delete_open_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_empty_directory(path: &Path, error: anyhow::Error) -> anyhow::Error {
-    match fs::remove_dir(path) {
+fn delete_owned_directory(path: &Path, identity: (u32, u64)) -> Result<()> {
+    let directory = pin_directory_access(path, FILE_READ_ATTRIBUTES | DELETE_ACCESS)?;
+    if handle_identity(&directory)? != identity {
+        return Err(fail(ErrorCode::PathPolicyDenied, "owned directory was substituted; retained"));
+    }
+    delete_open_file(&directory)
+}
+fn cleanup_empty_directory(path: &Path, identity: (u32, u64), error: anyhow::Error) -> anyhow::Error {
+    match delete_owned_directory(path, identity) {
         Ok(()) => error,
         Err(cleanup) => error.context(format!("empty directory cleanup also failed: {cleanup}")),
     }
@@ -1145,7 +1165,29 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Seek, SeekFrom};
+
+    #[test]
+    fn directory_cleanup_rejects_a_substituted_empty_object() {
+        let root = std::env::temp_dir().join(format!("arterm-owned-cleanup-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        {
+            let _parents = pin_directories(&root).unwrap();
+            let original = root.join("stage");
+            let moved = root.join("moved");
+            create_private_directory(&original).unwrap();
+            let pin = pin_directory(&original).unwrap();
+            let identity = handle_identity(&pin).unwrap();
+            drop(pin);
+            fs::rename(&original, &moved).unwrap();
+            fs::create_dir(&original).unwrap();
+            let error = delete_owned_directory(&original, identity).unwrap_err();
+            assert_eq!(error.downcast_ref::<TransferError>().unwrap().code, ErrorCode::PathPolicyDenied);
+            assert!(original.is_dir() && moved.is_dir());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rename_information_includes_nul_when_filename_consumes_alignment_padding() {

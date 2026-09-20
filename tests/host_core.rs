@@ -22,6 +22,9 @@ impl Host {
     }
     fn start_at(mut home: PathBuf, use_short_alias: bool) -> Self {
         fs::create_dir_all(&home).unwrap();
+        let resolved = fs::canonicalize(&home).unwrap();
+        let text = resolved.to_str().unwrap();
+        home = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
         if use_short_alias {
             let path = home.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
             let mut short = vec![0u16; 32768];
