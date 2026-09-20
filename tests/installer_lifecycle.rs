@@ -3,6 +3,8 @@ use arterm::deployment::{self, Role};
 use std::{ffi::OsString, fs, path::PathBuf};
 use windows_sys::Win32::{Foundation::ERROR_SUCCESS, System::Registry::*};
 
+static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "installers")]
 #[test]
 fn setup_help_uses_neutral_product_branding_without_installing() {
@@ -23,6 +25,7 @@ fn setup_help_uses_neutral_product_branding_without_installing() {
 }
 
 struct Sandbox {
+    _lock: std::sync::MutexGuard<'static, ()>,
     home: PathBuf,
     registry_path: Vec<u16>,
     key: HKEY,
@@ -63,6 +66,8 @@ fn use_legacy_marker(dir: &std::path::Path, publisher: &str) {
 }
 impl Sandbox {
     fn new(dependencies: &[PathBuf]) -> Self {
+        // Environment variables and RegOverridePredefKey are process-global.
+        let lock = SANDBOX_LOCK.lock().expect("installer sandbox lock poisoned");
         let id = uuid::Uuid::now_v7();
         let home = std::env::temp_dir().join(format!("devbox-install-e2e-{id}"));
         fs::create_dir_all(&home).unwrap();
@@ -107,6 +112,7 @@ impl Sandbox {
         std::env::set_var("APPDATA", home.join("Roaming"));
         std::env::set_var("HOME", &home);
         Self {
+            _lock: lock,
             home,
             registry_path,
             key,
