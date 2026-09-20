@@ -41,6 +41,8 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         return Ok(serde_json::to_string(response)?);
     }
     let status = match response["status"].as_str() {
+        Some("completed") if response["transfer_id"].is_string() && response["source_kind"] == "directory" =>
+            "Folder transfer completed.",
         Some("completed") if response["transfer_id"].is_string() => "File transfer completed.",
         Some("accepted") => "Command accepted; completion not yet confirmed.",
         Some("completed") if response["record"]["succeeded"] == true => {
@@ -53,6 +55,8 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         Some("timeout") => {
             "Wait timed out; the remote command was not cancelled. Query its command ID."
         }
+        Some("unknown") if response["source_kind"] == "directory" =>
+            "Folder transfer outcome unknown; inspect the destination before retrying.",
         Some("unknown") if response["commit_started"] == true =>
             "File commit outcome unknown; inspect the destination before retrying.",
         Some("unknown") if response["operation_kind"] == "file_transfer" =>
@@ -215,6 +219,22 @@ pub fn server(inventory: &Value, json: bool) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn folder_results_keep_json_schema_and_distinguish_human_completion() {
+        let response = json!({"status":"completed","transfer_id":"folder-id",
+            "source_kind":"directory","actual_path":"C:\\temp\\reports",
+            "bytes":128,"extracted_bytes":4096,"sha256":"payload-hash"});
+        let human = result(&response, "work", "shell", false).unwrap();
+        assert!(human.contains("Folder transfer completed."));
+        assert!(human.contains("Extracted bytes: 4096"));
+        assert!(human.contains("Destination: C:\\temp\\reports"));
+        assert_eq!(exit_code(&response), 0);
+        assert_eq!(serde_json::from_str::<Value>(&result(&response, "work", "shell", true).unwrap()).unwrap(), response);
+        let unknown = json!({"status":"unknown","source_kind":"directory","commit_started":true});
+        assert_eq!(exit_code(&unknown), 6);
+        assert!(result(&unknown, "work", "shell", false).unwrap().contains("Folder transfer outcome unknown"));
+    }
 
     #[test]
     fn json_preserves_full_response_and_inventory_schema() {

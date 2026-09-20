@@ -14,7 +14,7 @@ use crate::{
 pub const METADATA_CAPABILITY: &str = "transfer-source-metadata-v1";
 pub const DIRECTORY_CAPABILITY: &str = "directory-transfer-zip-v1";
 // Enable only together with the concrete preparation/extraction adapters.
-pub const DIRECTORY_ADAPTER_INSTALLED: bool = false;
+pub const DIRECTORY_ADAPTER_INSTALLED: bool = true;
 pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -126,28 +126,37 @@ impl PayloadReceipt {
     }
 }
 
-/// Own the archive and its cleanup/pins until the transfer ends. The adapter must
-/// verify the entire enumerated tree, not merely the top directory timestamp.
+/// Own the immutable archive and its cleanup/pins until the transfer ends.
+/// Preparation audits the original tree; subsequent checks verify only the ZIP.
 pub trait PreparedArchive {
     fn payload_path(&self) -> &Path;
     fn verify_sources(&self, check: &dyn Fn() -> Result<()>) -> Result<()>;
 }
 
 pub struct PreparedSource<A> {
-    source: PinnedSource,
-    archive: Option<A>,
+    payload: PreparedPayload<A>,
     metadata: SourceMetadata,
+}
+
+enum PreparedPayload<A> {
+    File(PinnedSource),
+    Directory(A),
 }
 
 impl<A: PreparedArchive> PreparedSource<A> {
     pub fn metadata(&self) -> &SourceMetadata { &self.metadata }
     pub fn payload_path(&self) -> &Path {
-        self.archive.as_ref().map_or(self.source.path(), PreparedArchive::payload_path)
+        match &self.payload {
+            PreparedPayload::File(source) => source.path(),
+            PreparedPayload::Directory(archive) => archive.payload_path(),
+        }
     }
     pub fn verify_sources(&self, check: &dyn Fn() -> Result<()>) -> Result<()> {
         check()?;
-        self.source.verify_unchanged()?;
-        if let Some(archive) = &self.archive { archive.verify_sources(check)?; }
+        match &self.payload {
+            PreparedPayload::File(source) => source.verify_unchanged()?,
+            PreparedPayload::Directory(archive) => archive.verify_sources(check)?,
+        }
         check()
     }
 }
@@ -161,13 +170,50 @@ pub fn prepare_source<A: PreparedArchive>(
     check()?;
     let metadata = SourceMetadata::from_source(&source)?;
     metadata.require_directory_support(directory_supported)?;
-    let archive = match metadata.kind {
-        SourceKind::File => None,
-        SourceKind::Directory => Some(prepare_directory(&source, check)?),
+    let payload = match metadata.kind {
+        SourceKind::File => PreparedPayload::File(source),
+        SourceKind::Directory => {
+            let archive = prepare_directory(&source, check)?;
+            drop(source);
+            PreparedPayload::Directory(archive)
+        }
     };
-    let prepared = PreparedSource { source, archive, metadata };
+    let prepared = PreparedSource { payload, metadata };
     prepared.verify_sources(check)?;
     Ok(prepared)
+}
+
+impl PreparedArchive for crate::folder_archive::PreparedArchive {
+    fn payload_path(&self) -> &Path { self.path() }
+    fn verify_sources(&self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        self.verify_payload(check)
+    }
+}
+
+pub fn prepare_directory(
+    source: &PinnedSource, check: &dyn Fn() -> Result<()>,
+) -> Result<crate::folder_archive::PreparedArchive> {
+    crate::folder_archive::pack_directory(
+        source.path(), &std::env::temp_dir().components().collect::<PathBuf>(), check,
+    )
+}
+
+pub fn publish_directory<G>(
+    source: &SourceMetadata, payload: &Receipt, budget: u64,
+    check: &dyn Fn() -> Result<()>, admit: &mut dyn FnMut(u64) -> Result<()>,
+    authorize: impl FnOnce() -> Result<G>,
+) -> Result<PathBuf> {
+    let published = crate::folder_archive::extract_archive_with_limit(
+        &payload.actual_path,
+        payload.actual_path.parent().context("payload has no parent")?,
+        &source.original_basename, budget, check,
+        |summary| {
+            let guard = authorize()?;
+            admit(summary.uncompressed_bytes)?;
+            Ok(guard)
+        },
+    )?;
+    Ok(published.path)
 }
 
 // An uninhabited adapter cannot accidentally advertise or complete directories.

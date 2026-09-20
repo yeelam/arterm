@@ -236,3 +236,60 @@ fn successful_folder_publication_charges_actual_expansion_and_returns_only_folde
     assert_eq!(fs::read(result.payload.actual_path.join("data.bin")).unwrap(), b"12345678");
     assert!(manager.begin_upload("excess.bin", 1).is_err());
 }
+
+#[test]
+fn concrete_folder_adapter_enforces_budget_guard_and_no_replace() {
+    for mode in ["success", "quota", "revoked", "collision"] {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("reports");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data.txt"), vec![42; 4096]).unwrap();
+        let prepared = transfer_payload::prepare_source(file_transfer::pin_source(&source).unwrap(),
+            true, &|| Ok(()), transfer_payload::prepare_directory).unwrap();
+        fs::write(source.join("data.txt"), b"new source").unwrap();
+        prepared.verify_sources(&|| Ok(())).unwrap();
+        let bytes = fs::read(prepared.payload_path()).unwrap();
+        let mut manager = TransferManager::new(
+            AuthorizedSession::after_authorization(Uuid::now_v7()), &fixture.0,
+            Limits { max_file_bytes: 8192, max_stored_bytes: bytes.len() as u64 + if mode == "quota" { 4095 } else { 4096 },
+                max_active: 2, max_records: 8 }).unwrap();
+        let upload = manager.begin_upload("payload.zip", bytes.len() as u64).unwrap();
+        manager.write_chunk(upload.transfer_id, 0, &bytes).unwrap();
+        let payload = manager.finish(upload.transfer_id, Sha256::digest(&bytes).into()).unwrap();
+        let destination = payload.actual_path.parent().unwrap().join("reports");
+        if mode == "collision" {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("keep.txt"), b"keep").unwrap();
+        }
+        let guard_held = Cell::new(false);
+        struct Guard<'a>(&'a Cell<bool>);
+        impl Drop for Guard<'_> { fn drop(&mut self) { self.0.set(false); } }
+        let result = transfer_payload::complete_payload(&mut manager, prepared.metadata().clone(), payload,
+            &|| { assert!(!guard_held.get(), "progress must not run under publication guard"); Ok(()) },
+            |metadata, payload, budget, check, admit| transfer_payload::publish_directory(
+                metadata, payload, budget, check, admit, || {
+                    if mode == "revoked" { anyhow::bail!("lease revoked"); }
+                    guard_held.set(true);
+                    Ok(Guard(&guard_held))
+                }));
+        assert!(!guard_held.get());
+        if mode == "success" {
+            let receipt = result.unwrap();
+            assert_eq!(receipt.extracted_bytes, Some(4096));
+            assert_eq!(receipt.payload.actual_path, destination);
+            assert_eq!(fs::read(destination.join("data.txt")).unwrap(), vec![42; 4096]);
+            assert_eq!(manager.charged_bytes(), bytes.len() as u64 + 4096);
+        } else {
+            assert!(result.is_err(), "{mode}");
+            assert!(!destination.join("data.txt").exists());
+            if mode == "collision" {
+                assert_eq!(fs::read(destination.join("keep.txt")).unwrap(), b"keep");
+            } else {
+                assert!(!destination.exists());
+            }
+            if mode == "quota" || mode == "revoked" {
+                assert_eq!(manager.charged_bytes(), bytes.len() as u64);
+            }
+        }
+    }
+}

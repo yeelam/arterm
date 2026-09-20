@@ -35,7 +35,7 @@ use crate::host_pipe;
 use arterm::{
     deployment, store,
     file_transfer::{AuthorizedSession, Limits, TransferManager, TransferState, MAX_CHUNK_BYTES},
-    transfer_payload::{self, PayloadReceipt, PayloadStatus, PreparedSource, SourceMetadata, UnavailableArchive},
+    transfer_payload::{self, PayloadReceipt, PayloadStatus, PreparedSource, SourceMetadata},
     shell_integration::{Commands, CAPABILITY as COMMAND_CAPABILITY},
     wire::{self, bin16, binary, get, map, message, num, s, text, Frames},
 };
@@ -211,7 +211,7 @@ struct FileState {
     manager: Option<TransferManager>,
     operations: HashMap<Uuid, Uuid>,
     sources: HashMap<Uuid, SourceMetadata>,
-    preparations: HashMap<Uuid, PreparedSource<UnavailableArchive>>,
+    preparations: HashMap<Uuid, PreparedSource<arterm::folder_archive::PreparedArchive>>,
 }
 
 struct FileBridge {
@@ -252,7 +252,7 @@ impl FileBridge {
             let prepared = if kind == "FileBeginDownload" {
                 Some(transfer_payload::prepare_source(
                     arterm::file_transfer::pin_source(Path::new(text(body, "path")?))?,
-                    self.directory_capable, &check, transfer_payload::archive_unavailable)?)
+                    self.directory_capable, &check, transfer_payload::prepare_directory)?)
             } else { None };
             let source = if let Some(prepared) = &prepared { prepared.metadata().clone() }
                 else { SourceMetadata::from_wire(body)? };
@@ -300,7 +300,12 @@ impl FileBridge {
                     .map_err(|_| anyhow::anyhow!("FileInvalidDigest"))?;
                 let receipt = manager.finish_guarded(id, hash, || self.authorize())?;
                 serde_json::to_value(transfer_payload::complete_payload(manager, source, receipt,
-                    &|| { drop(self.authorize()?); progress() }, transfer_payload::extraction_unavailable)?)?
+                    &|| { drop(self.authorize()?); progress() },
+                    |source, payload, budget, check, admit| {
+                        transfer_payload::publish_directory(
+                            source, payload, budget, check, admit, || self.authorize(),
+                        )
+                    })?)?
             }
             "FileClose" => serde_json::to_value(PayloadReceipt {
                 payload: manager.close(id)?, source, extracted_bytes: None,

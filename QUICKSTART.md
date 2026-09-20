@@ -316,10 +316,9 @@ Command text is limited to 16 KiB of UTF-8; at most four waiters are supported
 per local owner. These are bounded automation facilities, not an unlimited
 command queue.
 
-**Development release gate:** 0.6 transfer must include files and automatic
-directory ZIP/extraction together. This core worktree has working file transport
-and adapter boundaries, but no archive implementation; it is **not** a
-release-ready file-only feature.
+**Development release gate:** files and automatic directory ZIP/extraction are
+integrated together. Independent archive review was blocked by service screening
+and remains a release blocker; this worktree is **not release-qualified**.
 
 The shared interface uses the already-running local connect owner:
 
@@ -333,8 +332,8 @@ accept command IDs, `--wait`, or command `--timeout`; command semantics are
 unchanged. Receive requires an absolute remote source path. Neither operation
 connects implicitly or pastes file bytes into the terminal. `--file PATH` is the
 file-or-directory interface: the source endpoint classifies a pinned filesystem
-object. Directory preparation/extraction remains an integration requirement,
-not a separate deferred release. No manual ZIP step is intended for directories.
+object. Directories are automatically packed, transferred, and extracted.
+No manual ZIP step is needed for directories.
 An explicitly supplied ZIP file remains a regular file and is never extracted
 based on its extension.
 
@@ -359,8 +358,8 @@ remote capability, bound to the session secret and current client/attachment/
 lease/epoch. Both `file-transfer-v1` and `transfer-source-metadata-v1` are required.
 The immutable metadata contains `kind` (`file` or `directory`) and
 `original_basename`, and is checked in admission and receipts. Directory
-preparation additionally requires `directory-transfer-zip-v1`, which this
-worktree does not advertise until the archive adapter is installed. Old hosts
+preparation additionally requires `directory-transfer-zip-v1`, advertised only
+with the installed archive adapter. Old hosts
 fail explicitly before local staging publication. Busy commands do not block file control. Caller exit or connection
 loss stops transfer and removes only owned partials; completed files survive.
 There is no interrupted-transfer resume or automatic retry. Losing the response
@@ -368,9 +367,11 @@ after commit begins can leave an unknown outcome: inspect the reported destinati
 before retrying, rather than assuming nothing was written.
 
 The archive integration points are `transfer_payload::prepare_source` and
-`complete_payload`. A `PreparedArchive` owns its ZIP, descendant pins/snapshots
-and cleanup until transfer ends, and implements `payload_path` plus
-`verify_sources(check)`. The receiver's publication callback must safely extract
+`complete_payload`. A `PreparedArchive` owns its immutable ZIP and cleanup until
+transfer ends, and implements `payload_path` plus `verify_sources(check)`.
+Packing audits the original tree and then releases its pins. Later edits to
+the original do not change the transferred snapshot; this is a source snapshot,
+not an atomic filesystem snapshot. The receiver's publication callback extracts
 into an owned private stage, preserve the original basename and nested/empty
 directories, recheck cancellation/lease authorization immediately around its
 atomic no-replace directory rename, and return the actual published directory.
@@ -398,9 +399,12 @@ pin_directory, create_private_directory, verify_path_identity, actual_path,
 rename_no_replace}`. Keep ancestor pins alive around path operations.
 `pin_source` rejects reparse objects and holds write/delete-denying handles;
 its `verify_unchanged` checks that object, **not an entire directory tree**.
-The archive adapter must validate and track each descendant and enforce its own
-bounded entry-count, expansion-size, nesting and extraction policies. These
-archive limits and end-to-end directory tests remain required before release.
+The archive adapter validates and tracks each descendant. Folder limits are
+8 GiB for both the ZIP payload and actual expanded bytes, 10,000 entries,
+1,024 UTF-16 units per relative path, depth 64, and 16 MiB central-directory
+metadata. Symlinks and other reparse points are rejected. Nested, empty, Unicode,
+and hidden entries retain their contents; ACLs, timestamps, attributes,
+alternate streams, and hard-link relationships are not promised.
 Long adapter phases must invoke their cancellation callback regularly during
 enumeration and bounded I/O. The core uses five-second correlated keepalives
 during local preparation and request-correlated `FileProgress` frames during
@@ -408,8 +412,10 @@ remote preparation, verification and publication. Progress renews only the
 20-second response-idle budget, never the original four-hour operation deadline;
 the host also expires its authorization at that deadline. No background progress
 threads or session locks around archive I/O are added. Missing progress fails
-explicitly, and a progress frame is never a completion receipt. Real long-running
-directory E2E tests remain required when the archive adapter is integrated.
+explicitly, and a progress frame is never a completion receipt. Native functional
+coverage includes preparation lasting over 20 seconds with correlated progress
+and caller cancellation. The blocked independent archive review remains a
+release requirement.
 
 </details>
 

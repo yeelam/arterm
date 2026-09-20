@@ -390,7 +390,7 @@ pub fn transfer(
                     pin_source(Path::new(path))?,
                     directory_supported,
                     preparing,
-                    transfer_payload::archive_unavailable,
+                    transfer_payload::prepare_directory,
                 )
             },
         )?)
@@ -596,7 +596,14 @@ pub fn transfer(
                             metadata,
                             receipt,
                             extracting,
-                            transfer_payload::extraction_unavailable,
+                            |source, payload, budget, check, admit| {
+                                transfer_payload::publish_directory(
+                                    source, payload, budget, check, admit, || {
+                                        caller()?;
+                                        ticket.commit_guard()
+                                    },
+                                )
+                            },
                         )
                     },
                 )

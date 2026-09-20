@@ -3,6 +3,7 @@ pub mod client_config;
 pub mod deployment;
 pub mod engine;
 pub mod file_transfer;
+pub mod folder_archive;
 pub mod transfer_admission;
 pub mod transfer_payload;
 pub mod host_setup;
