@@ -35,6 +35,7 @@ impl Host {
         let child = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
+            .env("TEMP", &home).env("TMP", &home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -242,6 +243,104 @@ fn create_message(request: Uuid, id: Uuid, claim: &[u8], broker: &[u8]) -> Value
             ("after_output_seq", 0.into()),
         ]),
     )
+}
+
+#[test]
+fn file_authorization_rejects_wrong_session_lease_epoch_and_revoked_writer() {
+    use sha2::{Digest, Sha256};
+    fn greeting(bridge: &mut Bridge, client: &[u8]) {
+        bridge.send(message("Hello", map(vec![
+            ("min_version", 1.into()), ("max_version", 1.into()),
+            ("client_instance_id", Value::Binary(client.to_vec())),
+            ("capabilities", Value::Array(vec![s(arterm::transfer_admission::CAPABILITY),
+                s(arterm::transfer_payload::METADATA_CAPABILITY)])),
+        ])));
+        assert_eq!(text(&bridge.recv(), "type").unwrap(), "HelloOk");
+    }
+    fn rpc(bridge: &mut Bridge, kind: &str, mut fields: Vec<(&str, Value)>) -> Value {
+        fields.push(("request_id", s(&Uuid::now_v7().to_string())));
+        bridge.send(message(kind, map(fields)));
+        bridge.recv()
+    }
+    let host = Host::start();
+    let client = vec![21; 16];
+    let mut writer = host.bridge();
+    let broker = writer.hello(&client);
+    let session = Uuid::now_v7();
+    writer.send(create_message(Uuid::now_v7(), session, &[7; 32], &broker));
+    let created = writer.recv();
+    let body = get(&created, "body").unwrap();
+    let token = binary(body, "resume_token").unwrap();
+    let attachment = binary(body, "attachment_id").unwrap();
+    let lease = binary(body, "lease_id").unwrap();
+    let auth = || vec![
+        ("session_id", s(&session.to_string())),
+        ("resume_token", Value::Binary(token.clone())),
+        ("broker_instance_id", Value::Binary(broker.clone())),
+        ("attachment_id", Value::Binary(attachment.clone())),
+        ("lease_id", Value::Binary(lease.clone())),
+        ("client_instance_id", Value::Binary(client.clone())),
+        ("connection_epoch", 1.into()),
+    ];
+    for (key, invalid) in [
+        ("session_id", s(&Uuid::now_v7().to_string())),
+        ("resume_token", Value::Binary(vec![0; 32])),
+        ("attachment_id", Value::Binary(vec![0; 16])),
+        ("lease_id", Value::Binary(vec![0; 16])),
+        ("client_instance_id", Value::Binary(vec![0; 16])),
+        ("connection_epoch", 2.into()),
+    ] {
+        let mut file = host.bridge();
+        greeting(&mut file, &client);
+        let mut fields = auth();
+        fields.iter_mut().find(|(field, _)| *field == key).unwrap().1 = invalid;
+        file.send(message("FileAuthorize", map(fields)));
+        assert_eq!(text(&file.recv(), "type").unwrap(), "Error", "{key}");
+        let response = rpc(&mut file, "FileBeginDownload", vec![
+            ("operation_id", s(&Uuid::now_v7().to_string())),
+            ("path", s(host.home.join("must-not-open.bin").to_str().unwrap())),
+        ]);
+        assert_eq!(text(&response, "type").unwrap(), "FileError");
+        assert_eq!(text(get(&response, "body").unwrap(), "detail").unwrap(), "FileUnauthorized");
+    }
+    let mut file = host.bridge();
+    greeting(&mut file, &client);
+    file.send(message("FileAuthorize", map(auth())));
+    assert_eq!(text(&file.recv(), "type").unwrap(), "FileAuthorized");
+    let operation = Uuid::now_v7().to_string();
+    let begin = || vec![("operation_id", s(&operation)), ("path", s("revoked.bin")), ("size", 3.into()),
+        ("source", map(vec![("kind", s("file")), ("original_basename", s("revoked.bin"))]))];
+    let response = rpc(&mut file, "FileBeginUpload", begin());
+    assert_eq!(text(&response, "type").unwrap(), "FileResult");
+    let status: serde_json::Value = serde_json::from_str(text(get(&response, "body").unwrap(), "json").unwrap()).unwrap();
+    let id = status["transfer_id"].as_str().unwrap();
+    let path = PathBuf::from(status["actual_path"].as_str().unwrap());
+    assert!(path.starts_with(&host.home));
+    assert_eq!(text(&rpc(&mut file, "FileBeginUpload", begin()), "type").unwrap(), "FileError");
+    let write = rpc(&mut file, "FileWrite", vec![
+        ("transfer_id", s(id)), ("offset", 0.into()), ("bytes", Value::Binary(b"abc".to_vec())),
+    ]);
+    assert_eq!(text(&write, "type").unwrap(), "FileResult");
+    writer.close_input();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = host.command(&["sessions", "--json"]);
+        let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
+        if sessions.as_array().unwrap().iter().any(|s| s["id"] == session.to_string() && s["attached"] == false) { break; }
+        assert!(Instant::now() < deadline, "writer lease was not revoked");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let finish = rpc(&mut file, "FileFinish", vec![
+        ("transfer_id", s(id)), ("sha256", Value::Binary(Sha256::digest(b"abc").to_vec())),
+    ]);
+    assert_eq!(text(&finish, "type").unwrap(), "FileError");
+    assert!(!path.exists());
+    drop(file);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while path.parent().unwrap().exists() {
+        assert!(Instant::now() < deadline, "revoked upload partial not cleaned");
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

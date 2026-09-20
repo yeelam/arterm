@@ -3,6 +3,8 @@ use arterm::client_config;
 mod client_protocol;
 #[path = "../client_output.rs"]
 mod client_output;
+#[path = "../file_protocol.rs"]
+mod file_protocol;
 
 use anyhow::{bail, ensure, Context, Result};
 use arterm::statusln as eprintln;
@@ -46,6 +48,8 @@ Usage:\n\
   arterm connect ALIAS [REF] [--shell EXE] [--cwd PATH] [--retries 0..20]\n\
   arterm list --client [--json] | list --server MACHINE [--json]\n\
   arterm send MACHINE SESSION --command TEXT [--command-id UUID] [--timeout 60s] [--wait] [--json]\n\
+  arterm send MACHINE SESSION --file LOCALPATH [--json]\n\
+  arterm receive MACHINE SESSION --file ABSOLUTE-REMOTEPATH [--json]\n\
   arterm read MACHINE SESSION [--lines N | --command-id UUID] [--json]\n\
   arterm interrupt MACHINE SESSION [--json] | detach MACHINE SESSION [--json]\n\
   arterm terminate MACHINE SESSION [--json]\n\
@@ -59,6 +63,8 @@ Commands require a compatible, command-enabled PowerShell session. Existing sess
 Send waits up to 30s for readiness by default; --timeout overrides it. --wait requires --timeout and shares its budget with completion.\n\
 Command IDs are retained for the session lifetime; capacity is 256, with no silent eviction or replacement.\n\
 Local IPC requires OS trust, the pinned certificate, and byte-identical client builds; cross-elevation is rejected.\n\
+Transfers use unique session TEMP destinations, not terminal paste. An explicit ZIP file stays a file.\n\
+Directory sources require directory-transfer-zip-v1; this development build has no archive adapter installed.\n\
 Ctrl+] detaches without terminating the remote session.",
         env!("CARGO_PKG_VERSION")
     );
@@ -274,23 +280,33 @@ fn run_session(
     let service_config = config.clone();
     let service_target = target.clone();
     let service_address = flags.address.clone();
-    owner.set_service(std::sync::Arc::new(move |_operation_id, action| {
-        ensure!(matches!(action, Operation::Terminate), "invalid management operation");
-        let state = service_snapshot.lock().unwrap().clone();
-        ensure!(!state.ended && state.token.is_some(), "session is not authorized or has ended");
-        let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
-        let confirmed = client_protocol::terminate(&mut link, &state)?;
-        let mut snapshot = service_snapshot.lock().unwrap();
-        snapshot.ended = true;
-        service_store.save(&snapshot)?;
-        Ok(serde_json::json!({"status":if confirmed { "terminated" } else { "termination_accepted" }, "session_id":state.id}))
-    }));
     let mut engine = if Uuid::parse_str(reference.as_str()).is_ok()
         && state.reference.is_none() && state.token.is_some() {
         Engine::resume_guid(state)
     } else {
         Engine::new(state)
     };
+    let admission = engine.transfer_admission();
+    let files = std::sync::Mutex::new(file_protocol::Files::default());
+    owner.set_service(std::sync::Arc::new(move |operation_id, action, check| {
+        let state = service_snapshot.lock().unwrap().clone();
+        ensure!(!state.ended && state.token.is_some(), "session is not authorized or has ended");
+        check()?;
+        if matches!(action, Operation::FileSend { .. } | Operation::FileReceive { .. }) {
+            let ticket = admission.ticket().context("file transfer unsupported or attachment unavailable")?;
+            let mut files = files.try_lock().map_err(|_| anyhow::anyhow!("another file operation is active"))?;
+            let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
+            return file_protocol::transfer(&mut link, &state, &mut files, &ticket, operation_id, action, check);
+        }
+        ensure!(matches!(action, Operation::Terminate), "invalid management operation");
+        let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
+        check()?;
+        let confirmed = client_protocol::terminate(&mut link, &state)?;
+        let mut snapshot = service_snapshot.lock().unwrap();
+        snapshot.ended = true;
+        service_store.save(&snapshot)?;
+        Ok(serde_json::json!({"status":if confirmed { "terminated" } else { "termination_accepted" }, "session_id":state.id}))
+    }));
     let mut terminal = owner.terminal(console);
     let result = (|| -> Result<u32> {
         for attempt in 0..=retries {
@@ -445,6 +461,7 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
     let reference = SessionReference::parse(args.get(2).context("command requires MACHINE SESSION")?)?;
     let mut lines = None;
     let mut command = None;
+    let mut file = None;
     let mut wait = false;
     let mut timeout = None;
     let mut json = false;
@@ -453,7 +470,9 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
     while index < args.len() {
         match args[index].as_str() {
             "--json" if !json => json = true,
-            "--file" | "--transfer-id" => bail!("file transfer is deferred and is not available in arTerm 0.5"),
+            "--file" if matches!(verb.as_str(), "send" | "receive") && file.is_none() => {
+                file = Some(value(args, &mut index, "--file")?);
+            }
             "--command-id" if matches!(verb.as_str(), "read" | "send") && command_id.is_none() => {
                 command_id = Some(Uuid::parse_str(&value(args, &mut index, "--command-id")?).context("invalid command ID")?);
             }
@@ -486,11 +505,24 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
         "detach" => Operation::Detach,
         "interrupt" => Operation::Interrupt,
         "send" => {
-            ensure!(command.is_some(), "send requires --command");
-            ensure!(!wait || timeout.is_some(), "--wait requires explicit --timeout");
-            ensure!(!wait || command.is_some(), "--wait is only valid with --command");
-            ensure!(command_id.is_none() || command.is_some(), "--command-id is only valid with --command");
-            Operation::Send { command: command.unwrap(), timeout_ms: timeout }
+            ensure!(command.is_some() != file.is_some(), "send requires exactly one of --command and --file");
+            if let Some(file) = file {
+                ensure!(!wait && timeout.is_none() && command_id.is_none(),
+                    "--file cannot be combined with --wait, --timeout or --command-id");
+                let path = std::path::absolute(file)?;
+                arterm::file_transfer::validate_absolute_path(&path)?;
+                Operation::FileSend { path: path.to_str().context("source path is not Unicode")?.into() }
+            } else {
+                ensure!(!wait || timeout.is_some(), "--wait requires explicit --timeout");
+                ensure!(!wait || command.is_some(), "--wait is only valid with --command");
+                ensure!(command_id.is_none() || command.is_some(), "--command-id is only valid with --command");
+                Operation::Send { command: command.unwrap(), timeout_ms: timeout }
+            }
+        }
+        "receive" => {
+            let path = file.context("receive requires --file")?;
+            arterm::file_transfer::validate_absolute_path(Path::new(&path))?;
+            Operation::FileReceive { path }
         }
         _ => unreachable!(),
     };
@@ -548,8 +580,6 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
 }
 
 fn command(args: &[String]) -> Result<u32> {
-    ensure!(args.first().map(String::as_str) != Some("receive"),
-        "file transfer is deferred and is not available in arTerm 0.5");
     let root = deployment::data_root()?;
     match args.first().map(String::as_str) {
         Some("setup") => {
@@ -639,7 +669,7 @@ fn command(args: &[String]) -> Result<u32> {
                 Ok(0)
             }
         }
-        Some("read" | "detach" | "interrupt" | "send") => local_command(&root, args),
+        Some("read" | "detach" | "interrupt" | "send" | "receive") => local_command(&root, args),
         Some("terminate") => terminate_session(&root, &args[1..]),
         Some("doctor") => {
             doctor(&root, &args[1..])?;

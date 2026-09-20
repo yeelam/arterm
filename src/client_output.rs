@@ -18,7 +18,7 @@ pub fn exit_code(response: &Value) -> u32 {
         Some("timeout") => 124,
         Some("unknown") => 6,
         Some("completed") => {
-            if response["record"]["succeeded"] == true {
+            if response["record"]["succeeded"] == true || response["transfer_id"].is_string() {
                 0
             } else {
                 1
@@ -41,6 +41,7 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         return Ok(serde_json::to_string(response)?);
     }
     let status = match response["status"].as_str() {
+        Some("completed") if response["transfer_id"].is_string() => "File transfer completed.",
         Some("accepted") => "Command accepted; completion not yet confirmed.",
         Some("completed") if response["record"]["succeeded"] == true => {
             "Command completed successfully."
@@ -52,6 +53,8 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         Some("timeout") => {
             "Wait timed out; the remote command was not cancelled. Query its command ID."
         }
+        Some("unknown") if response["commit_started"] == true =>
+            "File commit outcome unknown; inspect the destination before retrying.",
         Some("unknown") => "Command outcome unknown; query its command ID rather than resubmit.",
         Some("detach_requested") => "Detach requested; remote shell retained.",
         Some("interrupt_requested") => "Interrupt requested; command completion is not confirmed.",
@@ -74,6 +77,11 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         ("State", &response["record"]["state"]),
         ("Succeeded", &response["record"]["succeeded"]),
         ("Exit code", &response["record"]["exit_code"]),
+        ("Transfer ID", &response["transfer_id"]),
+        ("Source", &response["source"]),
+        ("Destination", &response["actual_path"]),
+        ("Bytes", &response["bytes"]),
+        ("SHA-256", &response["sha256"]),
     ] {
         if !value.is_null() {
             output.push_str(&format!("\n{label}: {}", text(value)));

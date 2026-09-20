@@ -88,7 +88,7 @@ fn help_version_and_validation_do_not_require_setup() {
     let home = std::env::temp_dir().join(format!("devbox-client-help-{}", Uuid::now_v7()));
     assert!(run(&home, &["--help"]).status.success());
     let help = String::from_utf8(run(&home, &["--help"]).stdout).unwrap();
-    assert!(!help.contains("--file") && !help.contains("arterm receive"));
+    assert!(help.contains("--file") && help.contains("arterm receive"));
     assert!(run(&home, &["--version"]).status.success());
     assert!(!run(
         &home,

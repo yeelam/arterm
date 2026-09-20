@@ -35,6 +35,9 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 const HISTORY: usize = 2000;
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 pub const READINESS_TIMEOUT_MS: u64 = 30_000;
+pub const FILE_TIMEOUT: Duration = crate::transfer_payload::OPERATION_TIMEOUT;
+
+type Service = dyn Fn(Uuid, Operation, &dyn Fn() -> Result<()>) -> Result<Value> + Send + Sync;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -70,6 +73,8 @@ pub enum Operation {
         timeout_ms: u64,
     },
     Terminate,
+    FileSend { path: String },
+    FileReceive { path: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,7 +225,7 @@ struct Shared {
     control: Mutex<ControlState>,
     changed: Condvar,
     waiters: AtomicUsize,
-    service: Mutex<Option<Arc<dyn Fn(Uuid, Operation) -> Result<Value> + Send + Sync>>>,
+    service: Mutex<Option<Arc<Service>>>,
 }
 
 #[derive(Clone)]
@@ -427,7 +432,7 @@ impl Owner {
     }
     pub fn set_service(
         &mut self,
-        service: Arc<dyn Fn(Uuid, Operation) -> Result<Value> + Send + Sync>,
+        service: Arc<Service>,
     ) {
         *self.shared.service.lock().unwrap() = Some(service);
     }
@@ -871,10 +876,19 @@ fn serve(
             shared.detach.store(true, Ordering::Release);
             result["status"] = "detach_requested".into();
         }
-        action @ Operation::Terminate => {
+        action @ (Operation::Terminate | Operation::FileSend { .. } | Operation::FileReceive { .. }) => {
             let service = shared.service.lock().unwrap().clone();
+            let deadline = Instant::now() + if matches!(action, Operation::Terminate) {
+                Duration::from_secs(120)
+            } else { FILE_TIMEOUT };
             let response = (|| -> Result<Value> {
-                service.context("operation service is unavailable")?(request.operation_id, action)
+                let check = || {
+                    ensure!(Instant::now() < deadline && !shared.stop.load(Ordering::Acquire),
+                        "local service stopped or deadline expired");
+                    check_caller(pipe, revalidate)
+                };
+                check()?;
+                service.context("operation service is unavailable")?(request.operation_id, action, &check)
             })();
             match response {
                 Ok(value) => {
@@ -940,6 +954,16 @@ fn serve(
     Ok(())
 }
 
+fn check_caller(pipe: &File, revalidate: &dyn Fn() -> Result<()>) -> Result<()> {
+    revalidate().context("local service caller changed or exited")?;
+    let mut available = 0;
+    ensure!(unsafe {
+        PeekNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut(), 0,
+            std::ptr::null_mut(), &mut available, std::ptr::null_mut())
+    } != 0, "local service caller disconnected");
+    Ok(())
+}
+
 pub fn discover(root: &Path) -> Result<Vec<Identity>> {
     let directory = root.join("client").join("active");
     if !directory.exists() {
@@ -984,7 +1008,9 @@ pub fn request_with_id(
     operation_id: Uuid,
 ) -> Result<Value> {
     let authentication = IpcIdentity::current().context("authenticate local client program")?;
-    let response_timeout = if matches!(&action, Operation::Terminate) {
+    let response_timeout = if matches!(&action, Operation::FileSend { .. } | Operation::FileReceive { .. }) {
+        FILE_TIMEOUT + Duration::from_secs(120)
+    } else if matches!(&action, Operation::Terminate) {
         Duration::from_secs(120)
     } else if let Operation::Send { timeout_ms, .. } = &action {
         Duration::from_millis(timeout_ms.unwrap_or(READINESS_TIMEOUT_MS))

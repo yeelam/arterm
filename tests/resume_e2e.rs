@@ -55,6 +55,7 @@ impl Fixture {
         let host = Command::new(host_executable())
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
+            .env("TEMP", &home).env("TMP", &home)
             .stdin(Stdio::null())
             .stdout(fs::File::create(home.join("host.stdout")).unwrap())
             .stderr(fs::File::create(home.join("host.stderr")).unwrap())
@@ -130,6 +131,7 @@ impl Fixture {
         let mut command = Command::new(client_executable());
         command
             .env("VSTERM_REMOTE_HOME", &self.home)
+            .env("TEMP", &self.home).env("TMP", &self.home)
             .env("VSTERM_HISTORY_PATH", self.home.join("powershell-history.txt"))
             .args([verb, "fixture"]);
         if let Some(id) = id {
@@ -286,6 +288,10 @@ struct CreationGate {
     frame: &'static str,
     observed: std::sync::atomic::AtomicBool,
     release: std::sync::atomic::AtomicBool,
+    occurrence: usize,
+    seen: std::sync::atomic::AtomicUsize,
+    hide_file_capability: bool,
+    hide_metadata_capability: bool,
 }
 fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>,
     gate: Option<Arc<CreationGate>>) -> (String, mpsc::Receiver<TcpStream>) {
@@ -364,15 +370,27 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                         let mut segments = Vec::new();
                         if id == 12 {
                             frames.push(&data[..n]).unwrap();
-                            while let Some(frame) = frames.next().unwrap() {
+                            while let Some(mut frame) = frames.next().unwrap() {
                                 if let Some(gate) = &gate {
+                                    if (gate.hide_file_capability || gate.hide_metadata_capability) && get(&frame, "type").as_str() == Some("HelloOk") {
+                                        if let Value::Map(fields) = &mut frame {
+                                            if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("body")) {
+                                                if let Some((_, Value::Array(caps))) = body.iter_mut().find(|(k, _)| k.as_str() == Some("capabilities")) {
+                                                    caps.retain(|v| !(gate.hide_file_capability && v.as_str() == Some(arterm::transfer_admission::CAPABILITY))
+                                                        && !(gate.hide_metadata_capability && v.as_str() == Some(arterm::transfer_payload::METADATA_CAPABILITY)));
+                                                }
+                                            }
+                                        }
+                                    }
                                     if get(&frame, "type").as_str() == Some(gate.frame) {
                                         use std::sync::atomic::Ordering;
+                                        if gate.seen.fetch_add(1, Ordering::AcqRel) == gate.occurrence {
                                         gate.observed.store(true, Ordering::Release);
                                         let deadline = Instant::now() + Duration::from_secs(15);
                                         while !gate.release.load(Ordering::Acquire) {
                                             assert!(Instant::now() < deadline, "owned {} gate was not released", gate.frame);
                                             thread::sleep(Duration::from_millis(10));
+                                        }
                                         }
                                     }
                                 }
@@ -457,6 +475,221 @@ fn pid_marker(text: &str, prefix: &str, suffix: &str) -> Option<String> {
             None
         }
     })
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_roundtrip_current_owner_busy_command_and_binary_integrity() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    let (address, connections) = relay(fixture.home.clone(), 10);
+    let mut client = fixture.client("connect", Some("files"), &address);
+    client.command("$global:FileState='retained'; Write-Output ('READY=' + $PID + ':files')");
+    client.wait_for(|out, _| pid_marker(out, "READY=", ":files").is_some());
+    let pid = pid_marker(&client.out, "READY=", ":files").unwrap();
+    let _connection = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .env("TEMP", &fixture.home).env("TMP", &fixture.home)
+        .args(args).output().unwrap();
+    let slow = control(&["send", "fixture", "files", "--command",
+        "1..100 | ForEach-Object { Write-Output ('BUSY=' + $_); Start-Sleep -Milliseconds 300 }", "--json"]);
+    assert!(slow.status.success(), "{}", String::from_utf8_lossy(&slow.stdout));
+    let mut completed = 0;
+    for (index, bytes) in [
+        Vec::new(), vec![0, 255, 13, 10, 27, 128],
+        (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect(),
+        vec![80, 75, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ].into_iter().enumerate() {
+        let basename = if index == 3 { "ordinary.zip".into() } else { format!("binary-{index}.bin") };
+        let path = fixture.home.join(&basename);
+        fs::write(&path, &bytes).unwrap();
+        let sent = control(&["send", "fixture", "files", "--file", path.to_str().unwrap(), "--json"]);
+        assert_eq!(sent.status.code(), Some(0), "{} {}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr));
+        let sent: serde_json::Value = serde_json::from_slice(&sent.stdout).unwrap();
+        assert_eq!(sent["status"], "completed");
+        assert_eq!(sent["source_kind"], "file");
+        assert_eq!(sent["original_basename"], basename);
+        assert!(sent["command_id"].is_null());
+        let remote = PathBuf::from(sent["actual_path"].as_str().unwrap());
+        assert!(remote.is_absolute() && remote.starts_with(&fixture.home));
+        assert_eq!(fs::read(&remote).unwrap(), bytes);
+        let received = control(&["receive", "fixture", "files", "--file", remote.to_str().unwrap(), "--json"]);
+        assert_eq!(received.status.code(), Some(0), "{} {}", String::from_utf8_lossy(&received.stdout), String::from_utf8_lossy(&received.stderr));
+        let received: serde_json::Value = serde_json::from_slice(&received.stdout).unwrap();
+        assert_eq!(received["source_kind"], "file");
+        assert_eq!(received["original_basename"], basename);
+        let local = PathBuf::from(received["actual_path"].as_str().unwrap());
+        assert!(local.starts_with(&fixture.home) && local != remote && local != path);
+        assert_eq!(fs::read(&local).unwrap(), bytes);
+        let hash = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(sent["sha256"], hash);
+        assert_eq!(received["sha256"], hash);
+        assert_eq!(received["bytes"], bytes.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        completed += 2;
+    }
+    assert_eq!(completed, 8);
+    let output = control(&["read", "fixture", "files", "--json"]);
+    assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("BUSY="));
+    let directory = control(&["send", "fixture", "files", "--file", fixture.home.to_str().unwrap(), "--json"]);
+    assert_eq!(directory.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&directory.stdout).contains("directory transfer unsupported"));
+    let interrupted = control(&["interrupt", "fixture", "files", "--json"]);
+    assert!(interrupted.status.success());
+    let after = control(&["send", "fixture", "files", "--command",
+        "Write-Output ('AFTER=' + $PID + ':' + $global:FileState)", "--wait", "--timeout", "20s", "--json"]);
+    assert!(after.status.success(), "{}", String::from_utf8_lossy(&after.stdout));
+    client.wait_for(|out, _| pid_marker(out, "AFTER=", ":retained").is_some());
+    assert_eq!(pid_marker(&client.out, "AFTER=", ":retained").unwrap(), pid);
+    client.detach();
+}
+
+fn owned_partials(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            found.extend(owned_partials(&entry.path()));
+        } else if entry.file_name() == ".arterm-partial" {
+            found.push(entry.path());
+        }
+    }
+    found
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_caller_abort_and_transport_disconnect_clean_only_partials() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    for direction in ["send", "receive"] {
+        for caller_abort in [true, false] {
+            let fixture = Fixture::new();
+            let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+            let _release = Release(gate.clone());
+            let (address, connections) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+            let mut owner = fixture.client("connect", Some("cancel"), &address);
+            owner.command("Write-Output ('READY=' + $PID + ':cancel')");
+            owner.wait_for(|out, _| pid_marker(out, "READY=", ":cancel").is_some());
+            let _primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            let source = fixture.home.join("keep-source.bin");
+            fs::write(&source, vec![42; 1024 * 1024]).unwrap();
+            let mut controller = Command::new(controller_executable())
+                .env("VSTERM_REMOTE_HOME", &fixture.home)
+                .args([direction, "fixture", "cancel", "--file", source.to_str().unwrap(), "--json"])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let transfer_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !gate.observed.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "file chunk gate never reached");
+                assert!(controller.try_wait().unwrap().is_none(), "controller exited before file chunk gate");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let partials = owned_partials(&fixture.home);
+            assert_eq!(partials.len(), 1, "{direction} must have one owned staging file");
+            let destination = partials[0].parent().unwrap().join("keep-source.bin");
+            assert!(!destination.exists());
+            if caller_abort {
+                controller.kill().unwrap();
+                controller.wait().unwrap();
+            } else {
+                transfer_link.shutdown(Shutdown::Both).unwrap();
+                let output = controller.wait_with_output().unwrap();
+                assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stdout));
+            }
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !owned_partials(&fixture.home).is_empty() {
+                assert!(Instant::now() < deadline, "abandoned file partial not cleaned");
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!destination.exists(), "cancelled transfer must not publish");
+            assert_eq!(fs::read(&source).unwrap(), vec![42; 1024 * 1024]);
+            gate.release.store(true, Ordering::Release);
+            owner.command("Write-Output ('AFTER=' + $PID + ':cancel')");
+            owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":cancel").is_some());
+            owner.detach();
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_old_host_is_unsupported_without_staging() {
+    for hide_metadata in [false, true] {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate {
+        hide_file_capability: !hide_metadata, hide_metadata_capability: hide_metadata, ..Default::default()
+    });
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 1, None, Some(gate));
+    let mut owner = fixture.client("connect", Some("legacy"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':legacy')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":legacy").is_some());
+    let source = fixture.home.join("source.bin");
+    fs::write(&source, b"legacy").unwrap();
+    for direction in ["send", "receive"] {
+        let output = Command::new(controller_executable())
+            .env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "legacy", "--file", source.to_str().unwrap(), "--json"])
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("unsupported"));
+        assert!(owned_partials(&fixture.home).is_empty());
+    }
+    owner.command("Write-Output ('AFTER=' + $PID + ':legacy')");
+    owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":legacy").is_some());
+    owner.detach();
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_lost_commit_receipt_is_unknown_and_preserves_published_file() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+    let _release = Release(gate.clone());
+    let (address, connections) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("commit"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':commit')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":commit").is_some());
+    let _primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let source = fixture.home.join("commit.bin");
+    fs::write(&source, b"abc").unwrap();
+    let controller = Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "commit", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let transfer_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "commit receipt gate never reached");
+        thread::sleep(Duration::from_millis(20));
+    }
+    transfer_link.shutdown(Shutdown::Both).unwrap();
+    let output = controller.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(6), "{}", String::from_utf8_lossy(&output.stdout));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["status"], "unknown");
+    assert_eq!(response["commit_started"], true);
+    assert_eq!(response["automatic_retry"], false);
+    assert_eq!(response["transfer_id"], response["remote_transfer_id"]);
+    let destination = PathBuf::from(response["actual_path"].as_str().unwrap());
+    assert!(destination.starts_with(&fixture.home) && destination != source);
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    assert_eq!(fs::read(&source).unwrap(), b"abc");
+    assert!(owned_partials(&fixture.home).is_empty());
+    gate.release.store(true, Ordering::Release);
+    owner.detach();
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
 }
 
 #[test]
