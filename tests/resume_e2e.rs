@@ -23,6 +23,20 @@ fn host_executable() -> &'static str {
 fn controller_executable() -> String {
     std::env::var("SIGNED_CONTROLLER").unwrap_or_else(|_| client_executable().into())
 }
+struct Pending(Option<Child>);
+impl Pending {
+    fn output(mut self) -> std::process::Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 fn test_shell() -> String {
     std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into())
 }
@@ -292,6 +306,10 @@ struct CreationGate {
     seen: std::sync::atomic::AtomicUsize,
     hide_file_capability: bool,
     hide_metadata_capability: bool,
+    hold_session_exit: bool,
+    exit_observed: std::sync::atomic::AtomicBool,
+    exit_release: std::sync::atomic::AtomicBool,
+    file_result: Mutex<Option<serde_json::Value>>,
 }
 fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc<Mutex<SyntheticInputTrace>>>,
     gate: Option<Arc<CreationGate>>) -> (String, mpsc::Receiver<TcpStream>) {
@@ -372,6 +390,15 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                             frames.push(&data[..n]).unwrap();
                             while let Some(mut frame) = frames.next().unwrap() {
                                 if let Some(gate) = &gate {
+                                    if gate.hold_session_exit && get(&frame, "type").as_str() == Some("SessionExited") {
+                                        use std::sync::atomic::Ordering;
+                                        gate.exit_observed.store(true, Ordering::Release);
+                                        let deadline = Instant::now() + Duration::from_secs(15);
+                                        while !gate.exit_release.load(Ordering::Acquire) {
+                                            assert!(Instant::now() < deadline, "owned exit gate was not released");
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                    }
                                     if (gate.hide_file_capability || gate.hide_metadata_capability) && get(&frame, "type").as_str() == Some("HelloOk") {
                                         if let Value::Map(fields) = &mut frame {
                                             if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("body")) {
@@ -385,6 +412,10 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                                     if get(&frame, "type").as_str() == Some(gate.frame) {
                                         use std::sync::atomic::Ordering;
                                         if gate.seen.fetch_add(1, Ordering::AcqRel) == gate.occurrence {
+                                        if get(&frame, "type").as_str() == Some("FileResult") {
+                                            let json = get(get(&frame, "body"), "json").as_str().unwrap();
+                                            *gate.file_result.lock().unwrap() = Some(serde_json::from_str(json).unwrap());
+                                        }
                                         gate.observed.store(true, Ordering::Release);
                                         let deadline = Instant::now() + Duration::from_secs(15);
                                         while !gate.release.load(Ordering::Acquire) {
@@ -694,6 +725,113 @@ fn single_file_lost_commit_receipt_is_unknown_and_preserves_published_file() {
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_confirmed_termination_revokes_pending_receive() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release.store(true, Ordering::Release);
+            self.0.exit_release.store(true, Ordering::Release);
+        }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate {
+        frame: "FileResult", occurrence: 2, hold_session_exit: true, ..Default::default()
+    });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 3, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("end-race"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':end-race')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":end-race").is_some());
+    let source = fixture.home.join("empty.bin");
+    fs::write(&source, b"").unwrap();
+    let mut controller = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["receive", "fixture", "end-race", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "FileClose receipt was not gated");
+        assert!(controller.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let terminated = Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["terminate", "fixture", "end-race", "--json"]).output().unwrap();
+    assert!(terminated.status.success(), "{} {}", String::from_utf8_lossy(&terminated.stdout), String::from_utf8_lossy(&terminated.stderr));
+    let terminated: serde_json::Value = serde_json::from_slice(&terminated.stdout).unwrap();
+    assert_eq!(terminated["status"], "terminated");
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    while !gate.exit_observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < exit_deadline, "SessionExited was not gated");
+        thread::sleep(Duration::from_millis(10));
+    }
+    gate.release.store(true, Ordering::Release);
+    let response_deadline = Instant::now() + Duration::from_secs(5);
+    while controller.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < response_deadline, "revoked receive did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = controller.output();
+    assert_eq!(response.status.code(), Some(1), "{} {}", String::from_utf8_lossy(&response.stdout), String::from_utf8_lossy(&response.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["commit_started"], false);
+    assert!(!PathBuf::from(response["actual_path"].as_str().unwrap()).exists());
+    assert!(owned_partials(&fixture.home).is_empty());
+    assert!(source.is_file());
+    gate.exit_release.store(true, Ordering::Release);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn single_file_owner_death_reports_unknown_without_waiting_for_transfer_deadline() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame: "FileResult", occurrence: 2, ..Default::default() });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("owner-loss"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':owner-loss')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":owner-loss").is_some());
+    let source = fixture.home.join("committed.bin");
+    fs::write(&source, b"abc").unwrap();
+    let mut controller = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "owner-loss", "--file", source.to_str().unwrap(), "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "committed receipt was not gated");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let receipt = gate.file_result.lock().unwrap().clone().unwrap();
+    let destination = PathBuf::from(receipt["actual_path"].as_str().unwrap());
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    owner.child.kill().unwrap();
+    owner.child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while controller.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "controller kept waiting after owner died");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let response = controller.output();
+    assert_eq!(response.status.code(), Some(6), "{} {}", String::from_utf8_lossy(&response.stdout), String::from_utf8_lossy(&response.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "unknown");
+    assert_eq!(response["operation_kind"], "file_transfer");
+    assert_eq!(response["commit_may_have_started"], true);
+    assert_eq!(response["automatic_retry"], false);
+    assert_eq!(fs::read(&destination).unwrap(), b"abc");
+    gate.release.store(true, Ordering::Release);
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn interactive_win32_keyup_preserves_command_readiness() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     struct Interactive(Box<dyn portable_pty::Child + Send + Sync>);
@@ -961,13 +1099,6 @@ fn local_shell_accepts_command_after_detach_failure_and_remote_exit() {
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
     use std::sync::atomic::Ordering;
-    struct Pending(Option<Child>);
-    impl Pending {
-        fn output(mut self) -> std::process::Output { self.0.take().unwrap().wait_with_output().unwrap() }
-    }
-    impl Drop for Pending {
-        fn drop(&mut self) { if let Some(child) = &mut self.0 { let _ = child.kill(); let _ = child.wait(); } }
-    }
     struct Release(Arc<CreationGate>);
     impl Drop for Release { fn drop(&mut self) { self.0.release.store(true, Ordering::Release); } }
     for frame in ["HelloOk", "SessionCreated"] {

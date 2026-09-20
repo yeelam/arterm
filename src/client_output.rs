@@ -55,6 +55,8 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         }
         Some("unknown") if response["commit_started"] == true =>
             "File commit outcome unknown; inspect the destination before retrying.",
+        Some("unknown") if response["operation_kind"] == "file_transfer" =>
+            "File transfer outcome unknown; inspect the destination before retrying.",
         Some("unknown") => "Command outcome unknown; query its command ID rather than resubmit.",
         Some("detach_requested") => "Detach requested; remote shell retained.",
         Some("interrupt_requested") => "Interrupt requested; command completion is not confirmed.",

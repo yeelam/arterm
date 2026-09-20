@@ -302,6 +302,7 @@ fn run_session(
         let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
         check()?;
         let confirmed = client_protocol::terminate(&mut link, &state)?;
+        admission.revoke();
         let mut snapshot = service_snapshot.lock().unwrap();
         snapshot.ended = true;
         service_store.save(&snapshot)?;

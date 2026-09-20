@@ -1008,7 +1008,8 @@ pub fn request_with_id(
     operation_id: Uuid,
 ) -> Result<Value> {
     let authentication = IpcIdentity::current().context("authenticate local client program")?;
-    let response_timeout = if matches!(&action, Operation::FileSend { .. } | Operation::FileReceive { .. }) {
+    let file_request = matches!(&action, Operation::FileSend { .. } | Operation::FileReceive { .. });
+    let response_timeout = if file_request {
         FILE_TIMEOUT + Duration::from_secs(120)
     } else if matches!(&action, Operation::Terminate) {
         Duration::from_secs(120)
@@ -1087,16 +1088,32 @@ pub fn request_with_id(
             action,
         })?,
     )?;
-    let response: Value = serde_json::from_slice(&read_frame_timeout(&file, response_timeout)?)?;
-    peer.revalidate()
-        .context("revalidate local owner response")?;
-    transfer(&file, &mut [1], true)?;
-    ensure!(
-        response["operation_id"] == operation_id.to_string()
-            && response["identity"]["instance_id"] == identity.instance_id.to_string(),
-        "local response correlation mismatch"
-    );
-    Ok(response)
+    let result = (|| -> Result<Value> {
+        let response: Value = serde_json::from_slice(&read_frame_timeout_checked(
+            &file, response_timeout, &|| peer.revalidate().context("local owner exited or changed while awaiting response"),
+        )?)?;
+        peer.revalidate().context("revalidate local owner response")?;
+        ensure!(
+            response["operation_id"] == operation_id.to_string()
+                && response["identity"]["instance_id"] == identity.instance_id.to_string(),
+            "local response correlation mismatch"
+        );
+        transfer(&file, &mut [1], true)?;
+        Ok(response)
+    })();
+    match result {
+        Err(error) if file_request => Ok(json!({
+            "schema_version": VERSION,
+            "operation_id": operation_id,
+            "identity": identity,
+            "status": "unknown",
+            "operation_kind": "file_transfer",
+            "commit_may_have_started": true,
+            "automatic_retry": false,
+            "error": format!("Local result channel lost after file-request dispatch: {error:#}. Inspect the destination; do not automatically retry.")
+        })),
+        other => other,
+    }
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -1205,12 +1222,22 @@ fn transfer(file: &File, bytes: &mut [u8], writing: bool) -> Result<()> {
     transfer_timeout(file, bytes, writing, RPC_TIMEOUT)
 }
 fn transfer_timeout(file: &File, bytes: &mut [u8], writing: bool, timeout: Duration) -> Result<()> {
+    transfer_timeout_checked(file, bytes, writing, timeout, &|| Ok(()))
+}
+fn transfer_timeout_checked(
+    file: &File, bytes: &mut [u8], writing: bool, timeout: Duration, check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("timeout overflow")?;
     let mut offset = 0;
+    let mut next_check = Instant::now();
     while offset < bytes.len() {
         ensure!(Instant::now() < deadline, "local IPC deadline expired");
+        if Instant::now() >= next_check {
+            check()?;
+            next_check = Instant::now() + Duration::from_millis(100);
+        }
         let mut file = file;
         let result = if writing {
             file.write(&bytes[offset..])
@@ -1218,9 +1245,13 @@ fn transfer_timeout(file: &File, bytes: &mut [u8], writing: bool, timeout: Durat
             file.read(&mut bytes[offset..])
         };
         match result {
-            Ok(0) => thread::sleep(Duration::from_millis(2)),
+            Ok(0) => {
+                if !writing { check_read_pipe(file)?; }
+                thread::sleep(Duration::from_millis(2));
+            }
             Ok(n) => offset += n,
             Err(error) if error.raw_os_error() == Some(ERROR_NO_DATA as i32) => {
+                if !writing { check_read_pipe(file)?; }
                 thread::sleep(Duration::from_millis(2))
             }
             Err(error) => return Err(error.into()),
@@ -1228,19 +1259,31 @@ fn transfer_timeout(file: &File, bytes: &mut [u8], writing: bool, timeout: Durat
     }
     Ok(())
 }
+fn check_read_pipe(file: &File) -> Result<()> {
+    let mut available = 0;
+    if unsafe { PeekNamedPipe(file.as_raw_handle(), std::ptr::null_mut(), 0,
+        std::ptr::null_mut(), &mut available, std::ptr::null_mut()) } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("local result channel closed");
+    }
+    Ok(())
+}
 fn read_frame(file: &File) -> Result<Vec<u8>> {
     read_frame_timeout(file, RPC_TIMEOUT)
 }
 fn read_frame_timeout(file: &File, timeout: Duration) -> Result<Vec<u8>> {
+    read_frame_timeout_checked(file, timeout, &|| Ok(()))
+}
+fn read_frame_timeout_checked(file: &File, timeout: Duration, check: &dyn Fn() -> Result<()>) -> Result<Vec<u8>> {
     let mut length = [0; 4];
-    transfer_timeout(file, &mut length, false, timeout)?;
+    transfer_timeout_checked(file, &mut length, false, timeout, check)?;
     let length = u32::from_le_bytes(length) as usize;
     ensure!(
         (1..=MAX_FRAME).contains(&length),
         "invalid local frame length"
     );
     let mut bytes = vec![0; length];
-    transfer(file, &mut bytes, false)?;
+    transfer_timeout_checked(file, &mut bytes, false, RPC_TIMEOUT, check)?;
     Ok(bytes)
 }
 fn write_frame(file: &File, bytes: &[u8]) -> Result<()> {
