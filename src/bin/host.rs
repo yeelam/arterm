@@ -12,19 +12,42 @@ arterm-host setup [--name NAME] [--code-path PATH] [--no-download] [--accept-ser
 arterm-host login | start | doctor\n\
 arterm-host status [--json] | sessions [--json]\n\
 arterm-host terminate <session-id> --yes [--json]\n\
-arterm-host stop [--terminate-sessions] [--json]\n\
+arterm-host stop [--terminate-sessions] [--disable] [--json]\n\
 arterm-host --help | --version\n\
-Internal: run | bridge --protocol vsterm-session-v1\n\
+Internal: run | ensure-running --data-root ROOT | bridge --protocol vsterm-session-v1\n\
+Ordinary stop permits restart at the next 10-minute task check; --disable prevents future checks until explicit start.\n\
 Sessions have no idle or age TTL; they end only on shell exit, explicit termination, host failure, logoff, or reboot.");
 }
 fn main() {
-    if let Err(error) = entry() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let scheduled = matches!(args.first().map(String::as_str), Some("run" | "ensure-running"))
+        && args.len() == 3 && args[1] == "--data-root";
+    let _logs = if scheduled {
+        match arterm::host_task_io::ScheduledIo::open(std::path::Path::new(&args[2])) {
+            Ok(logs) => Some(logs),
+            Err(error) => {
+                eprintln!("scheduled host logging failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    } else { None };
+    if let Err(error) = entry(&args) {
         eprintln!("{error:#}");
         std::process::exit(1);
     }
+    if scheduled { eprintln!("[host] stopped normally pid={}", std::process::id()); }
 }
-fn entry() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+fn entry(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some("ensure-running") && args.len() == 3 && args[1] == "--data-root" {
+        ensure!(std::path::Path::new(&args[2]).is_absolute(), "scheduled data root must be absolute");
+        std::env::set_var("VSTERM_REMOTE_HOME", &args[2]);
+        return host_broker::ensure_running();
+    }
+    if args.first().map(String::as_str) == Some("run") && args.len() == 3 && args[1] == "--data-root" {
+        ensure!(std::path::Path::new(&args[2]).is_absolute(), "scheduled data root must be absolute");
+        std::env::set_var("VSTERM_REMOTE_HOME", &args[2]);
+        return host_broker::run_with_transport(arterm::host_supervisor::TunnelSupervisor::start);
+    }
     if let Some(code) = arterm::host_setup::handle(&args)? {
         ensure!(code == 0, "host setup command failed with exit code {code}");
         return Ok(());
@@ -44,11 +67,11 @@ fn entry() -> Result<()> {
             host_pipe::copy_bridge(host_pipe::connect(&pipe, Duration::from_secs(3))?)
         }
         Some("status") if args.len() == 1 => {
-            let value = host_broker::control("status", None, false)?;
-            println!("{}", status_output(&value, json)?);
             if !json {
                 arterm::host_setup::status_details()?;
             }
+            let value = host_broker::control("status", None, false)?;
+            println!("{}", status_output(&value, json)?);
             Ok(())
         }
         Some("sessions") if args.len() == 1 => {
@@ -70,10 +93,15 @@ fn entry() -> Result<()> {
         }
         Some("stop") => {
             ensure!(
-                args.len() == 1 || args.as_slice() == ["stop", "--terminate-sessions"],
+                args[1..].iter().all(|a| a == "--terminate-sessions" || a == "--disable")
+                    && args.iter().filter(|a| *a == "--terminate-sessions").count() <= 1
+                    && args.iter().filter(|a| *a == "--disable").count() <= 1,
                 "invalid stop arguments"
             );
-            host_broker::stop(args.len() == 2)?;
+            arterm::host_task::intentional_stop(
+                || host_broker::stop(args.iter().any(|a| a == "--terminate-sessions")),
+                args.iter().any(|a| a == "--disable"),
+            )?;
             println!(
                 "{}",
                 control_output(

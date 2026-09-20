@@ -3,6 +3,8 @@ pub mod client_config;
 pub mod deployment;
 pub mod engine;
 pub mod host_setup;
+pub mod host_task;
+pub mod host_task_io;
 pub mod host_supervisor;
 pub mod diagnostics;
 

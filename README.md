@@ -44,6 +44,42 @@ Installers detect dependencies and offer downloads only with consent; vendor
 binaries are not bundled. Host setup requires acceptance of the VS Code server
 license terms. Host startup is at **Windows user logon**, not a SYSTEM service:
 a cold boot requires Windows sign-in, and arTerm does not configure autologon.
+The per-user Task Scheduler task uses InteractiveToken/LeastPrivilege and runs
+under the current process's Windows token SID, including Entra/AAD `S-1-12-1`
+identities. Both the principal and logon trigger use that SID; no local-account
+name is derived or substituted. Registration validates persisted principal,
+trigger, executable and data-root ownership. Scheduler-returned account names
+are translated to SIDs only for verification; rejection is reported without
+password, SYSTEM, service, batch-logon or local-account fallback. At user logon,
+and every **10 minutes** afterward (`PT10M`, no repetition duration), the task
+runs a short, idempotent `ensure-running --data-root ...` check. A responsive
+broker is left untouched; an absent broker starts in the background, and the
+check exits. A locked/unresponsive broker is reported, never killed or replaced.
+There is no continuous monitor or crash-retry backoff. Task Scheduler's
+`RestartOnFailure` is not used. InteractiveToken prevents checks without a
+logged-in user; no service or unattended account logon is configured.
+The check and broker append startup/PID, shutdown, and error diagnostics
+to `host\host.stdout.log` and `host\host.stderr.log` under its explicit data root;
+the tunnel retains its separate `code-tunnel.*.log` files. A small owned VBScript
+bootstrap runs under GUI `wscript.exe`, launches the check with window style 0,
+waits for that bounded check and propagates its exit status. The check creates
+its broker with `CREATE_NO_WINDOW`. Shared terminal windows are never hidden or
+killed; Task Scheduler's Hidden flag is not relied upon. Registration probes
+Windows Script Host/VBScript availability and fails explicitly if unavailable
+or policy-blocked, with no visible-console fallback.
+**Ordinary `arterm-host stop` permits automatic startup at the next 10-minute
+check (or next logon). Use `stop --disable` to keep it stopped until explicit
+`start`.** Recovery creates a new broker, not restored terminal sessions.
+Install/update/uninstall only manage ownership-verified tasks for this installation.
+Runtime setup holds that pause through shutdown, explicit authentication, configuration
+save and task registration. A failed setup restores the prior configuration before
+restoring task state; unsafe recovery leaves checks disabled and reports the error.
+The installed `arterm-host.exe` and `vsterm-host.exe` aliases resolve the same
+SID/data-root task only when both belong to the same ownership-marked host
+installation. The registered action remains exact; another directory or publisher
+is not treated as an alias.
+Legacy `VsTermHost` Run entries are removed only after successful task registration
+and only when their command matches the owned installed executable.
 
 ## Get connected
 
@@ -251,7 +287,7 @@ The following remain stable compatibility identifiers, even on fresh installs:
 
 - Data and protected state: `%LOCALAPPDATA%\VsTerm`.
 - Installed binaries: `%LOCALAPPDATA%\Programs\VsTerm\Client` or `Host`.
-- Existing registry keys, startup value, pipe identity, and session protocol.
+- Existing registry keys, pipe identity, and session protocol (legacy startup migrates to Task Scheduler).
 
 New ownership markers use arTerm. Both legacy VsTerm publisher markers remain
 accepted for upgrade/uninstall with the matching role. Installers check both

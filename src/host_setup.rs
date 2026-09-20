@@ -13,16 +13,11 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
     Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
     System::{
-        Registry::{
-            RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-            RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-        },
         RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
         Threading::{
-            GetCurrentProcessId, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+            GetCurrentProcessId, CREATE_NO_WINDOW,
         },
     },
 };
@@ -30,8 +25,6 @@ use windows_sys::Win32::{
 use crate::deployment::{self, Role};
 
 const SCHEMA: u32 = 1;
-const STARTUP_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const STARTUP_VALUE: &str = "VsTermHost";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SetupConfig {
@@ -99,6 +92,10 @@ pub fn handle(args: &[String]) -> Result<Option<i32>> {
 pub fn status_details() -> Result<()> {
     let root = deployment::data_root()?;
     if let Some(config) = load_config(&root)? {
+        match crate::host_task::diagnostic(&current_exe()?, &root) {
+            Ok(message) => println!("{message}"),
+            Err(error) => println!("Task Scheduler: {error:#}"),
+        }
         println!(
             "Tunnel name: {} (isolated GitHub configuration)",
             config.name
@@ -192,28 +189,73 @@ fn setup(args: SetupArgs) -> Result<()> {
     };
     validate_config(&proposed)?;
 
-    prepare_setup_host(
-        existing.as_ref() != Some(&proposed),
-        args.terminate_sessions || args.force_stop_host,
-        host_is_running,
-        || {
-            if args.force_stop_host {
-                deployment::force_stop_host_command(&current_exe()?)
-            } else {
-                deployment::stop_host_command(&current_exe()?, true)
-            }
-        },
-    )?;
-    login_if_needed(&proposed.code_path, &cli_data)?;
-    save_config_if_changed(&root, &proposed)?;
-
     let exe = current_exe()?;
-    deployment::set_startup(Some(&exe)).context("register per-user host startup")?;
+    let registration = crate::host_task::Task::current(&exe, &root)?;
+    let paths = deployment::host_runtime_paths(&exe)?;
+    let tasks: Vec<_> = crate::host_task::installed(&paths)?.into_iter()
+        .filter(|task| args.force_stop_host || task.name == registration.name).collect();
+    let new_task = if tasks.iter().any(|task| task.name == registration.name) { None } else { Some(&registration) };
+    setup_transaction(&root, &tasks, new_task, |task, op| task.operation(op), || {
+        prepare_setup_host(
+            existing.as_ref() != Some(&proposed),
+            args.terminate_sessions || args.force_stop_host,
+            host_is_running,
+            || {
+                if args.force_stop_host {
+                    deployment::force_stop_host_command_paused(&exe)
+                } else {
+                    deployment::stop_host_command_paused(&exe, true)
+                }
+            },
+        )?;
+        login_if_needed(&proposed.code_path, &cli_data)?;
+        save_config_if_changed(&root, &proposed)?;
+        registration.register()?;
+        deployment::remove_legacy_startup(&paths)?;
+        Ok(())
+    })?;
+    registration.operation("enable")?;
     if !host_is_running()? {
-        spawn_host(&exe, &host)?;
+        start_task(&exe, &root)?;
     }
     report_registration(&proposed, &root, &exe);
     Ok(())
+}
+
+fn setup_transaction(
+    root: &Path,
+    tasks: &[crate::host_task::Task],
+    new_task: Option<&crate::host_task::Task>,
+    mut backend: impl FnMut(&crate::host_task::Task, &str) -> Result<()>,
+    work: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let path = config_path(root);
+    let before = if path.try_exists()? { Some(fs::read(&path)?) } else { None };
+    let recovery_safe = std::cell::Cell::new(true);
+    crate::host_task::install_transaction(tasks, new_task, |task, op| {
+        ensure!(recovery_safe.get() || !matches!(op, "enable" | "start"),
+            "configuration recovery failed; owned task remains disabled");
+        backend(task, op)
+    }, || {
+        let result = work();
+        if let Err(error) = &result {
+            let restore = (|| -> Result<()> {
+                let after = if path.try_exists()? { Some(fs::read(&path)?) } else { None };
+                if after != before {
+                    match &before {
+                        Some(bytes) => write_config_bytes(root, bytes)?,
+                        None => fs::remove_file(&path)?,
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(restore) = restore {
+                recovery_safe.set(false);
+                bail!("setup failed: {error:#}; configuration recovery failed: {restore:#}");
+            }
+        }
+        result
+    })
 }
 
 fn setup_defaults(args: &SetupArgs, existing: Option<&SetupConfig>) -> Result<(String, Option<PathBuf>)> {
@@ -276,13 +318,14 @@ fn start_host() -> Result<()> {
         "isolated VS Code tunnel account is not logged in; run `arterm-host login`"
     );
     let exe = current_exe()?;
-    deployment::set_startup(Some(&exe)).context("register per-user host startup")?;
+    ensure!(config.accepted_server_license_terms, "server license terms have not been accepted; run setup");
+    register_task(&exe, &root)?;
     if host_is_running()? {
-        println!("arTerm host is already running.");
+        println!("arTerm broker is already running; its owned task is enabled for logon and 10-minute checks. Task activity is separate from broker status.");
         return Ok(());
     }
 
-    spawn_host(&exe, &host_dir(&root))?;
+    start_task(&exe, &root)?;
     println!(
         "arTerm host started for tunnel name {}.",
         config.name
@@ -292,6 +335,7 @@ fn start_host() -> Result<()> {
 
 fn doctor() -> Result<()> {
     let root = deployment::data_root()?;
+    println!("{}", crate::host_task::diagnostic(&current_exe()?, &root)?);
     let config = require_config(&root)?;
     let mut problems = Vec::new();
 
@@ -351,22 +395,12 @@ fn doctor() -> Result<()> {
     }
 
     check_session(&root, &mut problems);
-    match startup_value() {
-        Ok(Some(actual)) => {
-            let expected = format!("\"{}\" start", current_exe()?.display());
-            if actual == expected {
-                println!("ok: per-user startup registration");
-            } else {
-                problems.push(format!(
-                    "startup registration points elsewhere: {actual:?}; run `arterm-host start`"
-                ));
-            }
-        }
-        Ok(None) => problems
-            .push("per-user startup registration is missing; run `arterm-host start`".into()),
-        Err(error) => problems.push(format!(
-            "cannot inspect per-user startup registration: {error:#}"
-        )),
+    match crate::host_task::diagnostic(&current_exe()?, &root) {
+        Ok(message) => println!("{message}"),
+        Err(error) => problems.push(format!("Task Scheduler: {error:#}")),
+    }
+    if let Err(error) = crate::host_task::require_enabled(&current_exe()?, &root) {
+        problems.push(format!("Task Scheduler: {error:#}"));
     }
 
     match host_is_running() {
@@ -648,32 +682,38 @@ fn exact_tunnel_id(output: &str) -> Option<String> {
     })
 }
 
-fn spawn_host(exe: &Path, host: &Path) -> Result<()> {
-    fs::create_dir_all(host)?;
-    let stdout = append_log(&host.join("host.stdout.log"))?;
-    let stderr = append_log(&host.join("host.stderr.log"))?;
-    let mut child = Command::new(exe)
-        .arg("run")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn()
-        .context("start arTerm host")?;
+fn register_task(exe: &Path, root: &Path) -> Result<()> {
+    let task = crate::host_task::Task::current(exe, root)?;
+    task.register()?;
+    deployment::remove_legacy_startup(&deployment::host_runtime_paths(exe)?)?;
+    task.operation("enable")?;
+    Ok(())
+}
+
+pub(crate) fn configured_for_start(root: &Path) -> Result<bool> {
+    check_start_prerequisites(root, |config| {
+        let code = deployment::ensure_dependency(Role::Host, Some(&config.code_path), true)?;
+        Ok(inspect_auth(&code, &code_data_dir(root))? == AuthState::LoggedIn)
+    })
+}
+
+fn check_start_prerequisites(root: &Path, probe: impl FnOnce(&SetupConfig) -> Result<bool>) -> Result<bool> {
+    let Some(config) = load_config(root)? else { return Ok(false); };
+    if !config.accepted_server_license_terms { return Ok(false); }
+    validate_config(&config)?;
+    ensure!(probe(&config)?, "isolated VS Code tunnel account is not logged in or has expired; run `arterm-host login` explicitly");
+    Ok(true)
+}
+
+fn start_task(exe: &Path, root: &Path) -> Result<()> {
+    crate::host_task::Task::current(exe, root)?.start()?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        ensure!(
-            child.try_wait()?.is_none(),
-            "host exited during startup; inspect {}",
-            host.display()
-        );
         if host_is_running()? {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("host did not become responsive; inspect {}", host.display());
+            bail!("scheduled host did not become responsive; inspect Task Scheduler history and {}", host_dir(root).display());
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -682,17 +722,14 @@ fn spawn_host(exe: &Path, host: &Path) -> Result<()> {
 
 fn host_is_running() -> Result<bool> {
     let mut command = Command::new(current_exe()?);
-    command.arg("status").creation_flags(CREATE_NO_WINDOW);
+    command.args(["status", "--json"]).creation_flags(CREATE_NO_WINDOW);
     let output = crate::transport::output_bounded(command, Duration::from_secs(5))
         .context("query arTerm host status")?;
     if !output.status.success() {
         return Ok(false);
     }
-    let text = combined_output(&output).to_ascii_lowercase();
-    Ok(text.contains("running")
-        && !text.contains("not running")
-        && !text.contains("stopped")
-        && !text.contains("absent"))
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(value["ok"] == true && value["sessions"].is_u64())
 }
 
 fn append_log(path: &Path) -> Result<File> {
@@ -717,7 +754,7 @@ fn config_path(root: &Path) -> PathBuf {
 
 fn load_config(root: &Path) -> Result<Option<SetupConfig>> {
     let path = config_path(root);
-    if !path.exists() {
+    if !path.try_exists().context("inspect host setup configuration")? {
         return Ok(None);
     }
     let config = serde_json::from_slice(&fs::read(&path).context("read host setup configuration")?)
@@ -731,6 +768,10 @@ fn require_config(root: &Path) -> Result<SetupConfig> {
 
 fn save_config(root: &Path, config: &SetupConfig) -> Result<()> {
     validate_config(config)?;
+    write_config_bytes(root, &serde_json::to_vec_pretty(config)?)
+}
+
+fn write_config_bytes(root: &Path, bytes: &[u8]) -> Result<()> {
     let path = config_path(root);
     let parent = path.parent().context("host setup path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -740,7 +781,7 @@ fn save_config(root: &Path, config: &SetupConfig) -> Result<()> {
             .create_new(true)
             .write(true)
             .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(config)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         let from = wide(temp.as_os_str());
@@ -795,68 +836,6 @@ fn check_session(root: &Path, problems: &mut Vec<String>) {
     }
 }
 
-struct RegistryKey(HKEY);
-impl Drop for RegistryKey {
-    fn drop(&mut self) {
-        unsafe { RegCloseKey(self.0) };
-    }
-}
-
-fn startup_value() -> Result<Option<String>> {
-    let mut raw = std::ptr::null_mut();
-    let key_name = wide(OsStr::new(STARTUP_KEY));
-    let result =
-        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_READ, &mut raw) };
-    if result == ERROR_FILE_NOT_FOUND {
-        return Ok(None);
-    }
-    ensure!(
-        result == ERROR_SUCCESS,
-        "open startup registry key failed: {result}"
-    );
-    let key = RegistryKey(raw);
-    let value_name = wide(OsStr::new(STARTUP_VALUE));
-    let mut size = 0;
-    let result = unsafe {
-        RegGetValueW(
-            key.0,
-            std::ptr::null(),
-            value_name.as_ptr(),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    if result == ERROR_FILE_NOT_FOUND {
-        return Ok(None);
-    }
-    ensure!(
-        result == ERROR_SUCCESS,
-        "read startup registry value failed: {result}"
-    );
-    let mut value = vec![0u16; size as usize / 2];
-    let result = unsafe {
-        RegGetValueW(
-            key.0,
-            std::ptr::null(),
-            value_name.as_ptr(),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
-            std::ptr::null_mut(),
-            value.as_mut_ptr().cast(),
-            &mut size,
-        )
-    };
-    ensure!(
-        result == ERROR_SUCCESS,
-        "read startup registry value failed: {result}"
-    );
-    while value.last() == Some(&0) {
-        value.pop();
-    }
-    Ok(Some(String::from_utf16(&value)?))
-}
-
 fn current_exe() -> Result<PathBuf> {
     Ok(std::env::current_exe()?.canonicalize()?)
 }
@@ -901,7 +880,7 @@ fn print_login_help() {
 }
 
 fn print_start_help() {
-    println!("arterm-host start\nStarts the configured per-user host without changing accounts.");
+    println!("arterm-host start\nEnables the per-user task and immediately runs its hidden ensure-running check in this interactive session. Later checks run at logon and every 10 minutes. Accounts are unchanged; Scheduler policy/permission errors are not bypassed.");
 }
 
 fn print_doctor_help() {
@@ -911,6 +890,151 @@ fn print_doctor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_readiness_separates_missing_setup_or_license_from_expired_auth() {
+        let root = std::env::temp_dir().join(format!("arterm-readiness-policy-{}", uuid::Uuid::now_v7()));
+        assert!(!check_start_prerequisites(&root, |_| panic!("no setup must not probe auth")).unwrap());
+        fs::create_dir_all(host_dir(&root)).unwrap();
+        let mut config = SetupConfig { schema: SCHEMA, name: "configured".into(), code_path: r"C:\fixture\code-tunnel.exe".into(), accepted_server_license_terms: false };
+        fs::write(config_path(&root), serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!check_start_prerequisites(&root, |_| panic!("missing license must not probe auth")).unwrap());
+        config.accepted_server_license_terms = true;
+        save_config(&root, &config).unwrap();
+        let original = fs::read(config_path(&root)).unwrap();
+        let expired = check_start_prerequisites(&root, |_| Ok(false)).unwrap_err();
+        assert!(format!("{expired:#}").contains("arterm-host login"));
+        let network = check_start_prerequisites(&root, |_| bail!("network probe failure")).unwrap_err();
+        assert!(format!("{network:#}").contains("network probe failure"));
+        assert!(check_start_prerequisites(&root, |_| Ok(true)).unwrap());
+        assert_eq!(fs::read(config_path(&root)).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn setup_task_fixture(root: &Path, enabled: bool) -> crate::host_task::Task {
+        crate::host_task::Task {
+            name: "isolated-setup-boundary".into(), sid: "S-1-12-1-1-2-3-4".into(),
+            exe: r"C:\fixture\arterm-host.exe".into(), launcher: r"C:\Windows\System32\wscript.exe".into(),
+            root: root.to_string_lossy().into_owned(), enabled, running: false,
+            snapshot_xml: Some("verified fixture XML".into()),
+        }
+    }
+
+    #[test]
+    fn setup_keeps_scheduler_paused_through_stop_login_save_and_registration() {
+        use std::cell::{Cell, RefCell};
+        let root = std::env::temp_dir().join(format!("arterm-setup-boundary-{}", uuid::Uuid::now_v7()));
+        let old = SetupConfig { schema: SCHEMA, name: "old".into(), code_path: r"C:\fixture\code-tunnel.exe".into(), accepted_server_license_terms: true };
+        let mut new = old.clone();
+        new.name = "new".into();
+        save_config(&root, &old).unwrap();
+        let task = setup_task_fixture(&root, true);
+        let enabled = Cell::new(true);
+        let broker_name = RefCell::new(Some("old".to_owned()));
+        let ticks = RefCell::new(Vec::new());
+        let tick = |stage: &str| {
+            ticks.borrow_mut().push(stage.to_owned());
+            if enabled.get() && broker_name.borrow().is_none() {
+                *broker_name.borrow_mut() = Some(require_config(&root).unwrap().name);
+            }
+        };
+        setup_transaction(&root, &[task], None, |_, op| {
+            match op {
+                "disable" => enabled.set(false),
+                "register" => assert!(!enabled.get(), "preflight registration must not enable the task"),
+                "enable" => { assert_eq!(require_config(&root)?.name, "new"); enabled.set(true); tick("commit"); },
+                other => panic!("unexpected operation {other}"),
+            }
+            Ok(())
+        }, || {
+            prepare_setup_host(true, true, || panic!("explicit stop needs no status query"), || {
+                *broker_name.borrow_mut() = None;
+                tick("stop");
+                Ok(())
+            })?;
+            tick("login");
+            assert!(broker_name.borrow().is_none());
+            save_config_if_changed(&root, &new)?;
+            tick("save");
+            tick("registration");
+            assert!(!enabled.get() && broker_name.borrow().is_none());
+            Ok(())
+        }).unwrap();
+        assert_eq!(broker_name.borrow().as_deref(), Some("new"));
+        assert_eq!(*ticks.borrow(), ["stop", "login", "save", "registration", "commit"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_failure_restores_exact_config_before_previous_task_state() {
+        use std::cell::Cell;
+        for was_enabled in [false, true] {
+            for failure in ["login", "registration"] {
+                let root = std::env::temp_dir().join(format!("arterm-setup-rollback-{}", uuid::Uuid::now_v7()));
+                let old = SetupConfig { schema: SCHEMA, name: "old".into(), code_path: r"C:\fixture\code-tunnel.exe".into(), accepted_server_license_terms: true };
+                save_config(&root, &old).unwrap();
+                let original = [fs::read(config_path(&root)).unwrap(), b"\n".to_vec()].concat();
+                fs::write(config_path(&root), &original).unwrap();
+                fs::write(root.join("credentials.fixture"), b"untouched").unwrap();
+                let enabled = Cell::new(was_enabled);
+                let task = setup_task_fixture(&root, was_enabled);
+                let result = setup_transaction(&root, &[task], None, |_, op| {
+                    match op {
+                        "disable" => enabled.set(false),
+                        "register" => assert!(!enabled.get()),
+                        "restore" => assert_eq!(fs::read(config_path(&root))?, original),
+                        "enable" => { assert_eq!(fs::read(config_path(&root))?, original); enabled.set(true); },
+                        other => panic!("unexpected operation {other}"),
+                    }
+                    Ok(())
+                }, || {
+                    assert!(!enabled.get());
+                    if failure == "registration" {
+                        let mut new = old.clone();
+                        new.name = "new".into();
+                        save_config(&root, &new)?;
+                    }
+                    bail!("injected {failure} failure")
+                });
+                assert!(result.is_err());
+                assert_eq!(enabled.get(), was_enabled);
+                assert_eq!(fs::read(config_path(&root)).unwrap(), original);
+                assert_eq!(fs::read(root.join("credentials.fixture")).unwrap(), b"untouched");
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn setup_default_refusal_never_stops_and_failed_config_recovery_stays_disabled() {
+        use std::cell::Cell;
+        let root = std::env::temp_dir().join(format!("arterm-setup-refusal-{}", uuid::Uuid::now_v7()));
+        let old = SetupConfig { schema: SCHEMA, name: "old".into(), code_path: r"C:\fixture\code-tunnel.exe".into(), accepted_server_license_terms: true };
+        save_config(&root, &old).unwrap();
+        let task = setup_task_fixture(&root, true);
+        let enabled = Cell::new(true);
+        let backend = |_: &crate::host_task::Task, op: &str| {
+            match op {
+                "disable" | "restore" => enabled.set(false),
+                "enable" => enabled.set(true),
+                "register" => assert!(!enabled.get()),
+                _ => panic!("unexpected operation"),
+            }
+            Ok(())
+        };
+        let result = setup_transaction(&root, &[task.clone()], None, backend, || {
+            prepare_setup_host(true, false, || Ok(true), || panic!("default setup must not stop sessions"))
+        });
+        assert!(result.is_err() && enabled.get());
+        let result = setup_transaction(&root, &[task], None, backend, || {
+            fs::remove_file(config_path(&root))?;
+            fs::create_dir(config_path(&root))?;
+            bail!("injected save/registration failure")
+        });
+        assert!(format!("{:#}", result.unwrap_err()).contains("configuration recovery failed"));
+        assert!(!enabled.get(), "unsafe configuration recovery must not re-enable checks");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn setup_preserves_saved_defaults_and_state_on_repeated_runs() {

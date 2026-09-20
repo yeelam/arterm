@@ -58,7 +58,21 @@ Do not change a running host's configuration while it has live sessions.
 
 ### Upgrade without registering again
 
-Rerun `arTerm-Host-Setup.exe` to update the binaries, then run `arterm-host start`.
+Rerun `arTerm-Host-Setup.exe` to update the binaries. Configured, enabled hosts
+receive an immediate ensure-running check through their per-user Task Scheduler
+registrations without rerunning setup. An expired sign-in or a failed dependency/
+network readiness probe is reported but does not disable a previously enabled
+schedule. Later checks can recover after explicit `arterm-host login` or network
+recovery; no login or provider change is performed automatically. Intentionally
+disabled tasks remain disabled.
+Fresh installations register a disabled task until explicit named setup, sign-in,
+and license acceptance are complete. Task Scheduler policy/permission failures
+are errors; there is no silent Run-key or elevated service fallback.
+The hidden task checks at user logon and every **10 minutes** afterward. It exits
+after leaving an existing broker alone or starting an absent broker; it does not
+monitor continuously. `arterm-host stop` allows the next check to start it again;
+use `arterm-host stop --disable` for a persistent stop. Windows Script Host with
+VBScript is required for the hidden bootstrap and is checked before registration.
 The installer does not reset setup, tunnel identity, registered client boxes,
 protected credentials, named session references, or certificates. Uninstall also
 retains user data. Keep the same Windows user and `VSTERM_REMOTE_HOME` (default:
@@ -86,7 +100,6 @@ runtime setup leaves the running host alone. To deliberately end its sessions:
 
 ```powershell
 .\arTerm-Host-Setup.exe --terminate-sessions
-arterm-host start
 # Or, to stop and restart as part of runtime setup:
 arterm-host setup --terminate-sessions
 ```
@@ -95,7 +108,9 @@ arterm-host setup --terminate-sessions
 their running state cannot be recovered.** Saved references and credentials are
 retained, but ended sessions need new references. Shutdown uses the existing
 control command scoped to the current Windows user, logon session and data root,
-not process-name or all-user kills. Hosts in other logons/roots are not stopped;
+not process-name or all-user kills. Owned tasks sharing this installation are
+paused before shutdown/write, including other data roots. Their brokers in this
+logon are stopped with the same session-refusal rules. Other logons are not killed;
 if they hold installed executables open, the upgrade fails rather than killing them.
 Setup waits at most 20 seconds for each stop command and installer upgrades wait
 up to 10 seconds for executable release. An unresponsive host cancels the ordinary

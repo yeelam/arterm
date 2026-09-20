@@ -1396,6 +1396,61 @@ fn run_at_with_transport<T>(root: PathBuf, start: impl FnOnce() -> Result<T>) ->
 pub fn stop(terminate_sessions: bool) -> Result<()> {
     stop_at(&deployment::data_root()?, terminate_sessions)
 }
+
+/// A bounded check, not a monitor. Never replace a locked/unresponsive broker.
+pub fn ensure_running() -> Result<()> {
+    use std::{os::windows::process::CommandExt, process::{Command, Stdio}};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    let root = deployment::data_root()?;
+    let exe = std::env::current_exe()?;
+    let task = arterm::host_task::Task::current(&exe, &root)?;
+    if !task.enabled()? {
+        eprintln!("[check] owned task disabled/removed; not starting host");
+        return Ok(());
+    }
+    let pipe = pipe_name(&root)?;
+    match bounded_status(&exe, &root) {
+        Ok(_) => { eprintln!("[check] broker already running; no action"); return Ok(()); }
+        Err(error) => {
+            let absent = acquire(&root, &pipe).with_context(|| format!(
+                "broker may be running but unresponsive; refusing replacement: {error:#}"))?;
+            drop(absent);
+        }
+    }
+    // Recheck after the absence probe so an installer pause suppresses new starts.
+    if !task.enabled()? { eprintln!("[check] task paused; not starting host"); return Ok(()); }
+    let mut child = Command::new(&exe).args(["run", "--data-root"]).arg(&root)
+        .env("VSTERM_REMOTE_HOME", &root)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW).spawn().context("start hidden broker")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if bounded_status(&exe, &root).is_ok() {
+            eprintln!("[check] host ready; launched PID {}; check exiting", child.id());
+            return Ok(());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            bail!("new broker exited before readiness ({status}); inspect host logs");
+        }
+        ensure!(Instant::now() < deadline,
+            "new broker PID {} did not become responsive; left untouched, inspect host logs", child.id());
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+fn bounded_status(exe: &Path, root: &Path) -> Result<()> {
+    use std::{os::windows::process::CommandExt, process::Command};
+    let mut command = Command::new(exe);
+    command.args(["status", "--json"]).env("VSTERM_REMOTE_HOME", root)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    // A broker can accept a pipe but never answer. Reap only our status helper.
+    let output = arterm::transport::output_bounded(command, Duration::from_secs(5))?;
+    ensure!(output.status.success(), "broker status failed: {}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(value["ok"] == true && value["sessions"].is_u64(), "invalid broker status response");
+    Ok(())
+}
+
 fn stop_at(root: &Path, terminate_sessions: bool) -> Result<()> {
     let pipe = pipe_name(root)?;
     match host_pipe::send_control(

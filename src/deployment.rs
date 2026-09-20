@@ -81,6 +81,36 @@ fn installed_runtimes(dir: &Path, role: Role) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn host_task_paths(dir: &Path) -> Vec<PathBuf> {
+    [exe_name(Role::Host), legacy_exe_name(Role::Host)].iter().map(|name| dir.join(name)).collect()
+}
+
+/// Alternate names are trusted only inside the same ownership-marked installation.
+pub(crate) fn host_runtime_paths(exe: &Path) -> Result<Vec<PathBuf>> {
+    let name = exe.file_name().and_then(|s| s.to_str()).context("host executable has no Unicode filename")?;
+    if ![exe_name(Role::Host), legacy_exe_name(Role::Host)].iter().any(|n| name.eq_ignore_ascii_case(n)) {
+        return Ok(vec![exe.to_owned()]);
+    }
+    let dir = exe.parent().context("host executable has no directory")?;
+    if !dir.join("installed.json").try_exists()? {
+        return Ok(vec![exe.to_owned()]);
+    }
+    verify_install_owner(dir, Role::Host)?;
+    let owned_dir = dir.canonicalize()?;
+    let mut paths = Vec::new();
+    for path in host_task_paths(&owned_dir) {
+        if path.try_exists()? {
+            let resolved = path.canonicalize()?;
+            ensure!(resolved.parent() == Some(owned_dir.as_path()),
+                "host alias resolves outside its owned installation: {}", path.display());
+            paths.push(resolved);
+        } else {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
 fn require_closed_runtimes(paths: &[PathBuf]) -> Result<()> {
     for path in paths {
         OpenOptions::new().write(true).share_mode(0).open(path)
@@ -89,12 +119,17 @@ fn require_closed_runtimes(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn stop_host_command(path: &Path, terminate_sessions: bool) -> Result<()> {
-    let mut command = Command::new(path);
-    command.args(host_stop_args(terminate_sessions)).stdin(Stdio::null());
+pub(crate) fn stop_host_command_paused(path: &Path, terminate_sessions: bool) -> Result<()> {
+    let mut command = paused_stop_command(path, terminate_sessions);
     let mut child = command.spawn().context("start scoped host stop command")?;
     wait_for_stop_child(&mut child, Duration::from_secs(20))
         .context("scoped graceful shutdown did not complete; the stop helper was reaped, but an already-delivered request may still finish. Check host status, or explicitly use --force-stop-host to end matching host processes")
+}
+
+fn paused_stop_command(path: &Path, terminate_sessions: bool) -> Command {
+    let mut command = Command::new(path);
+    command.args(host_stop_args(terminate_sessions)).env("ARTERM_TASK_PAUSED", "1").stdin(Stdio::null());
+    command
 }
 
 fn wait_for_stop_child(child: &mut Child, timeout: Duration) -> Result<()> {
@@ -132,14 +167,24 @@ fn host_stop_args(terminate_sessions: bool) -> Vec<&'static str> {
     if terminate_sessions { vec!["stop", "--terminate-sessions"] } else { vec!["stop"] }
 }
 
-pub(crate) fn force_stop_host_command(path: &Path) -> Result<()> {
-    let dir = path.parent().context("host executable has no parent directory")?;
-    let mut paths = installed_runtimes(dir, Role::Host)?;
-    if !paths.iter().any(|p| p == path) {
-        paths.push(path.to_owned());
+pub(crate) fn force_stop_host_command_paused(path: &Path) -> Result<()> {
+    let mut paths = Vec::new();
+    for candidate in host_runtime_paths(path)? {
+        if candidate.try_exists()? { paths.push(candidate); }
     }
     eprintln!("WARNING: force-stopping this installation's host processes for the current user/logon. ALL their sessions will end, including hosts using other data roots.");
     crate::host_shutdown::force_stop(&paths)?;
+    Ok(())
+}
+
+fn stop_task_roots(tasks: &[crate::host_task::Task], terminate_sessions: bool, force_stop: bool) -> Result<()> {
+    if force_stop { return Ok(()); }
+    for task in tasks {
+        let mut command = paused_stop_command(Path::new(&task.exe), terminate_sessions);
+        command.env("VSTERM_REMOTE_HOME", &task.root);
+        let mut child = command.spawn().context("start owned task's scoped stop helper")?;
+        wait_for_stop_child(&mut child, Duration::from_secs(20))?;
+    }
     Ok(())
 }
 
@@ -150,7 +195,9 @@ fn stop_installed_host(paths: &[PathBuf], terminate_sessions: bool, force_stop: 
         crate::host_shutdown::force_stop(paths)?;
     } else {
         for path in paths {
-            stop_host_command(path, terminate_sessions)?;
+            let mut command = paused_stop_command(path, terminate_sessions);
+            let mut child = command.spawn().context("start paused installation stop helper")?;
+            wait_for_stop_child(&mut child, Duration::from_secs(20))?;
         }
     }
     // Older installed stop commands acknowledge before the executable is released.
@@ -444,23 +491,23 @@ fn delete_value(key: &Key, name: &str) -> Result<()> {
     );
     Ok(())
 }
-pub fn set_startup(exe: Option<&Path>) -> Result<()> {
+pub(crate) fn remove_legacy_startup(paths: &[PathBuf]) -> Result<()> {
     let key = open_key("Software\\Microsoft\\Windows\\CurrentVersion\\Run", true)?;
-    if let Some(exe) = exe {
-        let exe = exe.canonicalize()?;
-        ensure!(
-            !exe.to_string_lossy().contains('"'),
-            "invalid executable path"
-        );
-        write_string(
-            &key,
-            "VsTermHost",
-            &format!("\"{}\" start", exe.display()),
-            false,
-        )
-    } else {
-        delete_value(&key, "VsTermHost")
+    let actual = read_string(&key, "VsTermHost")?;
+    for path in paths {
+        let mut candidates = vec![path.clone()];
+        if path.try_exists()? { candidates.push(path.canonicalize()?); }
+        for candidate in candidates {
+            let text = candidate.to_string_lossy();
+            for spelling in [text.as_ref(), text.trim_start_matches(r"\\?\")] {
+                if actual.eq_ignore_ascii_case(&format!("\"{spelling}\" start")) {
+                    delete_value(&key, "VsTermHost")?;
+                    return Ok(());
+                }
+            }
+        }
     }
+    Ok(())
 }
 fn update_path(dir: &Path, install: bool) -> Result<()> {
     let key = open_key("Environment", true)?;
@@ -579,14 +626,51 @@ fn uninstall(dir: &Path, role: Role, terminate_sessions: bool, force_stop: bool)
     verify_install_owner(dir, role)?;
     let existing = installed_runtimes(dir, role)?;
     if role == Role::Host {
-        stop_installed_host(&existing, terminate_sessions, force_stop)?;
-        set_startup(None)?;
+        let tasks = crate::host_task::installed(&host_task_paths(dir))?;
+        crate::host_task::paused(&tasks, false, |t, op| t.operation(op), || {
+            stop_task_roots(&tasks, terminate_sessions, force_stop)?;
+            stop_installed_host(&existing, terminate_sessions, force_stop)?;
+            let mut files = existing.clone();
+            let bootstrap = crate::host_task::bootstrap_path(&dir.join(exe_name(Role::Host)));
+            if bootstrap.try_exists()? {
+                crate::host_task::verify_bootstrap(&bootstrap)?;
+                files.push(bootstrap);
+            }
+            files.push(dir.join("installed.json"));
+            let backup = files.iter().map(|p| Ok((p.clone(), fs::read(p)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let removal = (|| -> Result<()> {
+                for task in &tasks { task.operation("remove")?; }
+                remove_legacy_startup(&existing)?;
+                for path in &files { fs::remove_file(path)?; }
+                Ok(())
+            })();
+            if let Err(error) = removal {
+                let mut recovery = Vec::new();
+                for (path, bytes) in backup {
+                    let restore = (|| -> Result<()> {
+                        if !path.try_exists()? {
+                            let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+                            file.write_all(&bytes)?;
+                            file.sync_all()?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = restore { recovery.push(format!("{}: {error:#}", path.display())); }
+                }
+                ensure!(recovery.is_empty(), "uninstall failed: {error:#}; payload recovery failed: {}", recovery.join("; "));
+                return Err(error);
+            }
+            Ok(())
+        })?;
     }
-    require_closed_runtimes(&existing)?;
-    for path in existing {
-        fs::remove_file(path).context("executable is in use; uninstall cancelled")?;
+    if role != Role::Host {
+        require_closed_runtimes(&existing)?;
+        for path in existing {
+            fs::remove_file(path).context("executable is in use; uninstall cancelled")?;
+        }
+        fs::remove_file(dir.join("installed.json"))?;
     }
-    fs::remove_file(dir.join("installed.json"))?;
     update_path(dir, false)?;
     let key_name = format!(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\VsTerm.{}",
@@ -652,6 +736,44 @@ pub fn installer(role: Role, payload: &[u8]) -> Result<()> {
     installer_with_args(role, payload, &args)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum HostStartup {
+    CheckRequested,
+    PreservedDisabled,
+    NeedsSetup,
+}
+
+fn resume_host_task(
+    previous_enabled: Option<bool>,
+    readiness: impl FnOnce() -> Result<bool>,
+    mut operation: impl FnMut(&str) -> Result<()>,
+) -> Result<HostStartup> {
+    if previous_enabled == Some(false) {
+        return Ok(HostStartup::PreservedDisabled);
+    }
+    match readiness() {
+        Ok(false) => {
+            operation("disable")?;
+            Ok(HostStartup::NeedsSetup)
+        }
+        Ok(true) => {
+            operation("start").context("immediate ensure-running check could not be requested; schedule enablement was not revoked")?;
+            Ok(HostStartup::CheckRequested)
+        }
+        Err(error) if previous_enabled == Some(true) => {
+            let start = operation("start");
+            match start {
+                Ok(()) => Err(error.context("startup readiness failed; previously enabled schedule is preserved and an immediate ensure-running check was requested. Later 10-minute checks can retry after explicit login/network recovery")),
+                Err(start) => bail!("startup readiness failed: {error:#}; immediate check request failed: {start:#}; previously enabled schedule was not disabled"),
+            }
+        }
+        Err(error) => {
+            operation("disable").context("cannot keep the new, unverified host task disabled")?;
+            Err(error.context("new task remains disabled because startup prerequisites could not be verified; use explicit login/start or setup"))
+        }
+    }
+}
+
 pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "/?") {
         println!("{}", installer_help(role));
@@ -694,17 +816,44 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
         }
         if role == Role::Client {
             crate::client_config::initialize(&data_root()?, None, no_download || quiet)?;
-        } else {
-            ensure_dependency(role, None, no_download || quiet)?;
         }
         let existing = installed_runtimes(&dir, role)?;
-        if role == Role::Host && !existing.is_empty() {
-            verify_install_owner(&dir, role)?;
-            stop_installed_host(&existing, terminate_sessions, force_stop)?;
+        if role == Role::Host {
+            if !existing.is_empty() { verify_install_owner(&dir, role)?; }
+            let tasks = crate::host_task::installed(&host_task_paths(&dir))?;
+            let registration = crate::host_task::Task::current(&dir.join(exe_name(role)), &data_root()?)?;
+            let new_task = if tasks.iter().any(|task| task.name == registration.name) { None } else { Some(&registration) };
+            crate::host_task::install_transaction(&tasks, new_task, |t, op| t.operation(op), || {
+                if !existing.is_empty() {
+                    stop_task_roots(&tasks, terminate_sessions, force_stop)?;
+                    stop_installed_host(&existing, terminate_sessions, force_stop)?;
+                }
+                write_payload(&dir, role, payload)?;
+                update_path(&dir, true)?;
+                register_uninstall(&dir, role)?;
+                remove_legacy_startup(&installed_runtimes(&dir, role)?)?;
+                Ok(())
+            })?;
+            let updated_tasks = crate::host_task::installed(&installed_runtimes(&dir, role)?)?;
+            let mut startup_errors = Vec::new();
+            for task in &updated_tasks {
+                let previous_enabled = tasks.iter().find(|previous| previous.name == task.name).map(|previous| previous.enabled);
+                match resume_host_task(previous_enabled,
+                    || crate::host_setup::configured_for_start(Path::new(&task.root)),
+                    |op| if op == "start" { task.start() } else { task.operation(op) },
+                ) {
+                    Ok(HostStartup::CheckRequested) => println!("Host task {}: immediate ensure-running check requested.", task.name),
+                    Ok(HostStartup::PreservedDisabled) => println!("Host task {} remains intentionally disabled.", task.name),
+                    Ok(HostStartup::NeedsSetup) => println!("Host task {} is disabled: complete explicit named setup and license acceptance.", task.name),
+                    Err(error) => startup_errors.push(format!("{}: {error:#}", task.name)),
+                }
+            }
+            ensure!(startup_errors.is_empty(), "binaries installed, but startup readiness/check requests failed: {}", startup_errors.join("; "));
+        } else {
+            write_payload(&dir, role, payload)?;
+            update_path(&dir, true)?;
+            register_uninstall(&dir, role)?;
         }
-        write_payload(&dir, role, payload)?;
-        update_path(&dir, true)?;
-        register_uninstall(&dir, role)?;
         if role == Role::Client {
             println!("Installed Client to {}. Local client ready; no arterm setup is required. Existing configuration and credentials were retained. Open a new terminal; use arterm login if not signed in, then arterm add to register a host.", dir.display());
         } else {
@@ -714,7 +863,7 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
                 dir.display(),
                 exe_name(role),
                 if data_root()?.join("host").join("setup.json").try_exists()? {
-                    "start (already configured; no registration required)"
+                    "status (see the task readiness result above)"
                 } else { "setup --name <your-box-name>" }
             );
         }
@@ -739,7 +888,7 @@ pub fn installer_with_args(role: Role, payload: &[u8], args: &[String]) -> Resul
 
 fn installer_help(role: Role) -> String {
     let host = if role == Role::Host {
-        "\n--terminate-sessions requests graceful shutdown of the current user/logon/data-root host, ending its sessions.\n--force-stop-host bypasses an unresponsive control pipe and force-stops only matching installed host executable paths for the current user/Windows logon. ALL sessions of those processes are lost, including hosts using other data roots. Other installations/users are not killed.\nForce-stop is never automatic; without it an unresponsive host cancels the operation."
+        "\nHost installation registers an owned per-user InteractiveToken Task Scheduler task. Fresh tasks remain disabled until explicit named setup/sign-in/license acceptance. Configured enabled tasks restart after update; no setup rerun is required.\n--terminate-sessions requests graceful shutdown in each owned task's current user/logon/data-root scope, ending its sessions.\n--force-stop-host bypasses an unresponsive control pipe and force-stops only matching installed host executable paths for the current user/Windows logon. ALL sessions of those processes are lost, including hosts using other data roots. Other installations/users are not killed.\nForce-stop is never automatic; without it an unresponsive host cancels the operation."
     } else { "" };
     let client = if role == Role::Client {
         "\nClient installation initializes local files; no arterm setup is required. Use arterm login if not signed in, then arterm add to register a host."
@@ -754,6 +903,94 @@ fn installer_help(role: Role) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_schedule_survives_readiness_faults_and_later_recovery() {
+        for fault in ["expired sign-in", "network unavailable", "dependency probe failed"] {
+            let operations = std::cell::RefCell::new(Vec::new());
+            let enabled = std::cell::Cell::new(true);
+            let backend = |op: &str| {
+                operations.borrow_mut().push(op.to_owned());
+                if op == "disable" { enabled.set(false); }
+                Ok(())
+            };
+            let failed = resume_host_task(Some(true), || bail!("{fault}"), backend);
+            let error = format!("{:#}", failed.unwrap_err());
+            assert!(error.contains(fault) && error.contains("previously enabled schedule is preserved"));
+            assert!(enabled.get());
+            assert_eq!(*operations.borrow(), ["start"]);
+            assert_eq!(resume_host_task(Some(true), || Ok(true), backend).unwrap(), HostStartup::CheckRequested);
+            assert_eq!(*operations.borrow(), ["start", "start"]);
+            assert!(enabled.get(), "recovery must not need setup or re-registration");
+        }
+    }
+
+    #[test]
+    fn readiness_and_check_request_errors_are_both_reported_without_disabling() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        let error = resume_host_task(Some(true), || bail!("expired sign-in"), |op| {
+            operations.borrow_mut().push(op.to_owned());
+            bail!("scheduler policy denied check")
+        }).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("expired sign-in") && text.contains("scheduler policy denied check"));
+        assert_eq!(*operations.borrow(), ["start"]);
+    }
+
+    #[test]
+    fn deliberately_disabled_schedules_are_not_probed_or_enabled() {
+        assert_eq!(resume_host_task(Some(false),
+            || -> Result<bool> { panic!("disabled task must not probe accounts") },
+            |_| -> Result<()> { panic!("disabled task must not change schedule or start") },
+        ).unwrap(), HostStartup::PreservedDisabled);
+    }
+
+    #[test]
+    fn missing_setup_or_license_stays_disabled_and_new_probe_errors_fail_closed() {
+        for previous in [None, Some(true)] {
+            let operations = std::cell::RefCell::new(Vec::new());
+            assert_eq!(resume_host_task(previous, || Ok(false), |op| {
+                operations.borrow_mut().push(op.to_owned()); Ok(())
+            }).unwrap(), HostStartup::NeedsSetup);
+            assert_eq!(*operations.borrow(), ["disable"]);
+        }
+        let operations = std::cell::RefCell::new(Vec::new());
+        let error = resume_host_task(None, || bail!("new account could not be verified"), |op| {
+            operations.borrow_mut().push(op.to_owned()); Ok(())
+        }).unwrap_err();
+        assert!(format!("{error:#}").contains("new task remains disabled"));
+        assert_eq!(*operations.borrow(), ["disable"]);
+    }
+
+    #[test]
+    fn host_aliases_require_same_owned_host_installation() {
+        let dir = std::env::temp_dir().join(format!("arterm-alias-scope-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&dir).unwrap();
+        let canonical = dir.join(exe_name(Role::Host));
+        let legacy = dir.join(legacy_exe_name(Role::Host));
+        fs::write(&canonical, b"MZfixture").unwrap();
+        fs::write(&legacy, b"MZfixture").unwrap();
+        assert_eq!(host_runtime_paths(&canonical).unwrap(), [canonical.clone()]);
+        for publisher in [INSTALL_PUBLISHER, VSTERM_INSTALL_PUBLISHER] {
+            fs::write(dir.join("installed.json"), serde_json::to_vec(&Installed {
+                publisher: publisher.into(), role: "Host".into(), version: "fixture".into(),
+            }).unwrap()).unwrap();
+            for caller in [&canonical, &legacy] {
+                let paths = host_runtime_paths(caller).unwrap();
+                assert_eq!(paths, [canonical.canonicalize().unwrap(), legacy.canonicalize().unwrap()]);
+            }
+        }
+        for (publisher, role) in [("foreign", "Host"), (INSTALL_PUBLISHER, "Client")] {
+            fs::write(dir.join("installed.json"), serde_json::to_vec(&Installed {
+                publisher: publisher.into(), role: role.into(), version: "fixture".into(),
+            }).unwrap()).unwrap();
+            assert!(host_runtime_paths(&canonical).is_err());
+            assert!(host_runtime_paths(&legacy).is_err());
+        }
+        let command = paused_stop_command(&canonical, true);
+        assert!(command.get_envs().any(|(key, value)| key == "ARTERM_TASK_PAUSED" && value == Some(std::ffi::OsStr::new("1"))));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     struct OwnedChild(Child);
     impl Drop for OwnedChild {
