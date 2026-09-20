@@ -501,14 +501,13 @@ mod exit_tests {
                 // synthetic-only IDs so their replies cannot collide with this case.
                 *state = console_queries::Replies::new(&[42420, 42421]);
             }
-            let handle = hin as usize;
-            let writer = thread::spawn(move || {
-                inject(handle, b"q\x1b[?42420;");
-                thread::sleep(Duration::from_millis(150));
-                inject(handle, b"1$y\x1b[?42421;2$yz");
-            });
+            inject(hin as usize, b"q\x1b[?42420;");
             collect_replies(hin, &mut replies.lock().unwrap(), Duration::from_millis(100)).unwrap();
             assert_eq!(replies.lock().unwrap().outstanding.len(), 2);
+            // Deliver the continuation only after discovery has timed out.
+            // Scheduling a sleeping writer is not a guarantee it runs within
+            // the production cleanup's deliberately bounded 200ms window.
+            inject(hin as usize, b"1$y\x1b[?42421;2$yz");
             if reading {
                 console.reading(true);
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -521,7 +520,6 @@ mod exit_tests {
                 assert_eq!(bytes, b"\x1b[0;0;113;1;0;1_z");
             }
             drop(console);
-            writer.join().unwrap();
             assert!(replies.lock().unwrap().outstanding.is_empty());
             if !reading {
                 let mut records: [INPUT_RECORD; 2] = unsafe { std::mem::zeroed() };
