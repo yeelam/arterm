@@ -499,6 +499,7 @@ pub fn transfer(
                     &check,
                 )?;
                 let receipt: PayloadReceipt = serde_json::from_value(receipt)?;
+                receipt.validate_completion()?;
                 ensure!(
                     receipt.source == *source.metadata()
                         && receipt.payload.session_id == state.id
@@ -572,6 +573,7 @@ pub fn transfer(
                 let receipt: PayloadReceipt = serde_json::from_value(receipt)?;
                 ensure!(
                     receipt.source == metadata
+                        && receipt.extracted_bytes.is_none()
                         && receipt.payload.session_id == state.id
                         && receipt.payload.transfer_id == status.transfer_id
                         && receipt.payload.bytes == status.expected_bytes,
@@ -590,6 +592,7 @@ pub fn transfer(
                     transfer_payload::PROGRESS_INTERVAL,
                     |extracting| {
                         transfer_payload::complete_payload(
+                            manager,
                             metadata,
                             receipt,
                             extracting,
@@ -605,10 +608,12 @@ pub fn transfer(
         Ok(PayloadReceipt {
             payload: receipt,
             source: metadata,
+            extracted_bytes,
         }) => Ok(serde_json::json!({
             "status":"completed", "transfer_id":receipt.transfer_id, "remote_transfer_id":remote_id,
             "source":source, "actual_path":receipt.actual_path, "bytes":receipt.bytes,
             "source_kind":metadata.kind, "original_basename":metadata.original_basename,
+            "extracted_bytes":extracted_bytes,
             "sha256":receipt.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         })),
         Err(error) => {

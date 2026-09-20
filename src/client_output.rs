@@ -83,6 +83,7 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         ("Source", &response["source"]),
         ("Destination", &response["actual_path"]),
         ("Bytes", &response["bytes"]),
+        ("Extracted bytes", &response["extracted_bytes"]),
         ("SHA-256", &response["sha256"]),
     ] {
         if !value.is_null() {

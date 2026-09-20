@@ -347,7 +347,8 @@ after size and SHA-256 validation. Traversal, ADS, reserved device names and
 reparse-point paths are rejected.
 
 Chunks are at most 64 KiB with one outstanding chunk request. Limits are 8 GiB
-per file, 16 GiB of retained uploads per manager, two active primitive transfers
+per file and 16 GiB of retained payloads plus extracted-byte publication charges
+per manager, two active primitive transfers
 and 256 retained records per manager; the local owner accepts one file operation
 at a time. Each operation has a four-hour deadline and each remote response a
 20-second timeout. These are protocol deadlines, not a guarantee against an
@@ -374,11 +375,22 @@ into an owned private stage, preserve the original basename and nested/empty
 directories, recheck cancellation/lease authorization immediately around its
 atomic no-replace directory rename, and return the actual published directory.
 The core never treats the intermediate ZIP receipt as directory completion.
+The extraction callback receives the remaining expansion budget (capped at the
+per-file limit) and must enforce it against actual streamed bytes, not ZIP header
+claims. Its final authorization factory must admit those measured bytes into
+the receiver's quota **before** the atomic directory rename. Both the retained
+compressed payload and expanded content count toward the 16 GiB budget, so many
+small ZIPs cannot bypass the quota. This uses the existing file-manager lock;
+no session/terminal lock is held during archive I/O. An admitted publication's
+charge is conservatively retained on later failure/uncertainty, and duplicate
+extraction is rejected rather than blindly published again.
 It rechecks the received directory payload's size/SHA-256 and retains its pinned
 handle through extraction, preventing a replaced payload path from being treated
 as the already-verified archive.
 The reported byte count and SHA-256 describe the transferred payload, not a
-recursive directory digest.
+recursive directory digest. A completed directory additionally reports
+`extracted_bytes`; a source-stream/ZIP-only receipt cannot satisfy this completion
+contract. Explicit ZIP files are charged and returned only as ordinary files.
 
 Archive code should reuse `file_transfer::{validate_basename,
 validate_absolute_path, extended_path, pin_source, pin_directories,

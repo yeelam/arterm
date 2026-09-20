@@ -586,3 +586,53 @@ fn unicode_case_variants_resolve_by_filesystem_identity() {
         receipt.actual_path
     );
 }
+
+#[test]
+fn tiny_archives_cannot_bypass_the_exact_sixteen_gib_retained_budget() {
+    fn tiny(manager: &mut TransferManager) -> Uuid {
+        let status = manager.begin_upload("tiny.zip", 1).unwrap();
+        manager.write_chunk(status.transfer_id, 0, b"x").unwrap();
+        manager.finish(status.transfer_id, hash(b"x")).unwrap();
+        status.transfer_id
+    }
+    let fixture = Fixture::new();
+    let mut manager = fixture.manager(Limits::default());
+    let gib = 1024u64 * 1024 * 1024;
+    let first = tiny(&mut manager);
+    assert_eq!(manager.extraction_budget(first).unwrap(), 8 * gib);
+    manager.reserve_extracted_bytes(first, 8 * gib).unwrap();
+    assert_eq!(manager.charged_bytes(), 8 * gib + 1);
+    let second = tiny(&mut manager);
+    assert_eq!(manager.extraction_budget(second).unwrap(), 8 * gib - 2);
+    assert_eq!(code(manager.reserve_extracted_bytes(second, 8 * gib).unwrap_err()), ErrorCode::LimitExceeded);
+    assert_eq!(manager.charged_bytes(), 8 * gib + 2);
+    manager.reserve_extracted_bytes(second, 8 * gib - 2).unwrap();
+    assert_eq!(manager.charged_bytes(), 16 * gib);
+    assert_eq!(code(manager.begin_upload("one-byte-too-many", 1).unwrap_err()), ErrorCode::LimitExceeded);
+}
+
+#[test]
+fn extraction_quota_requires_verified_receiver_payload_and_never_refunds_uncertainty() {
+    let fixture = Fixture::new();
+    let mut manager = fixture.manager(Limits {
+        max_file_bytes: 8, max_stored_bytes: 16, max_active: 2, max_records: 8,
+    });
+    let upload = manager.begin_upload("tiny.zip", 1).unwrap();
+    assert_eq!(code(manager.extraction_budget(upload.transfer_id).unwrap_err()), ErrorCode::InvalidState);
+    manager.write_chunk(upload.transfer_id, 0, b"x").unwrap();
+    let receipt = manager.finish(upload.transfer_id, hash(b"x")).unwrap();
+    assert_eq!(code(manager.reserve_extracted_bytes(upload.transfer_id, u64::MAX).unwrap_err()), ErrorCode::LimitExceeded);
+    assert_eq!(manager.charged_bytes(), 1);
+    manager.reserve_extracted_bytes(upload.transfer_id, 7).unwrap();
+    assert_eq!(manager.charged_bytes(), 8);
+    assert_eq!(code(manager.extraction_budget(upload.transfer_id).unwrap_err()), ErrorCode::OutcomeUnknown);
+    assert_eq!(manager.cancel(upload.transfer_id).unwrap().state, TransferState::Completed);
+    assert_eq!(manager.charged_bytes(), 8);
+    let download = manager.begin_download(&receipt.actual_path).unwrap();
+    manager.read_chunk(download.transfer_id, 0, 1).unwrap();
+    manager.close(download.transfer_id).unwrap();
+    assert_eq!(code(manager.extraction_budget(download.transfer_id).unwrap_err()), ErrorCode::InvalidState);
+    manager.shutdown().unwrap();
+    assert_eq!(manager.charged_bytes(), 8);
+    assert!(receipt.actual_path.exists());
+}

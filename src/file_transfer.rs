@@ -226,6 +226,7 @@ enum Active {
 struct Entry {
     status: Status,
     active: Option<Active>,
+    extracted_bytes: Option<u64>,
 }
 
 pub struct TransferManager {
@@ -267,6 +268,42 @@ impl TransferManager {
     }
     pub fn record_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Remaining receiver expansion budget, including already retained payloads.
+    /// An admitted publication is never implicitly retried or refunded: its
+    /// outcome may be unknown even if the response/cleanup later fails.
+    pub fn extraction_budget(&self, id: Uuid) -> Result<u64> {
+        if self.closed {
+            return Err(fail(ErrorCode::InvalidState, "transfer manager has shut down"));
+        }
+        let entry = self.entries.get(&id).ok_or_else(|| fail(ErrorCode::NotFound, "transfer"))?;
+        if entry.status.direction != Direction::Upload || entry.status.state != TransferState::Completed
+            || entry.status.receipt.is_none() {
+            return Err(fail(ErrorCode::InvalidState, "extraction requires a verified receiver payload"));
+        }
+        if entry.extracted_bytes.is_some() {
+            return Err(fail(ErrorCode::OutcomeUnknown,
+                "directory publication was already admitted; do not blindly retry"));
+        }
+        let remaining = self.limits.max_stored_bytes.checked_sub(self.charged_bytes)
+            .ok_or_else(|| fail(ErrorCode::InvalidState, "retained-byte accounting is inconsistent"))?;
+        Ok(remaining.min(self.limits.max_file_bytes))
+    }
+
+    /// Call with ACTUAL streamed expansion bytes under the final publication
+    /// guard, before rename. The caller already holds this manager exclusively;
+    /// no terminal/session lock is needed during decompression.
+    pub fn reserve_extracted_bytes(&mut self, id: Uuid, bytes: u64) -> Result<()> {
+        if bytes > self.extraction_budget(id)? {
+            return Err(fail(ErrorCode::LimitExceeded, "extracted data exceeds retained storage quota"));
+        }
+        let charged = self.charged_bytes.checked_add(bytes)
+            .ok_or_else(|| fail(ErrorCode::LimitExceeded, "retained storage quota overflow"))?;
+        self.entries.get_mut(&id).ok_or_else(|| fail(ErrorCode::NotFound, "transfer"))?
+            .extracted_bytes = Some(bytes);
+        self.charged_bytes = charged;
+        Ok(())
     }
 
     fn admission(&self, size: u64) -> Result<()> {
@@ -347,6 +384,7 @@ impl TransferManager {
             id,
             Entry {
                 status: status.clone(),
+                extracted_bytes: None,
                 active: Some(Active::Upload(Upload {
                     file,
                     directory,
@@ -507,6 +545,7 @@ impl TransferManager {
             id,
             Entry {
                 status: status.clone(),
+                extracted_bytes: None,
                 active: Some(Active::Download(Download {
                     file,
                     _pins: pins,
@@ -785,7 +824,9 @@ pub fn extended_path(path: &Path) -> Result<PathBuf> {
     extended.push(path.as_os_str());
     Ok(PathBuf::from(extended))
 }
-fn handle_identity(file: &File) -> Result<(u32, u64)> {
+/// Identity of an open non-reparse object, not an ownership proof by itself.
+/// Cleanup must also stay within a pinned, caller-owned staging scope.
+pub(crate) fn handle_identity(file: &File) -> Result<(u32, u64)> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
         return Err(io_error(

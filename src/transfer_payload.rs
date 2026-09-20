@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{io::Read, path::{Path, PathBuf}, time::Duration};
 
 use crate::{
-    file_transfer::{self, PinnedSource, Receipt, Status},
+    file_transfer::{self, PinnedSource, Receipt, Status, TransferManager},
     wire::{get, map, s, text},
 };
 
@@ -112,6 +112,18 @@ pub struct PayloadReceipt {
     #[serde(flatten)]
     pub payload: Receipt,
     pub source: SourceMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_bytes: Option<u64>,
+}
+
+impl PayloadReceipt {
+    pub fn validate_completion(&self) -> Result<()> {
+        self.source.validate()?;
+        ensure!(matches!((self.source.kind, self.extracted_bytes),
+            (SourceKind::File, None) | (SourceKind::Directory, Some(_))),
+            "receipt does not confirm the source kind's final publication");
+        Ok(())
+    }
 }
 
 /// Own the archive and its cleanup/pins until the transfer ends. The adapter must
@@ -167,7 +179,10 @@ impl PreparedArchive for UnavailableArchive {
 pub fn archive_unavailable(_: &PinnedSource, _: &dyn Fn() -> Result<()>) -> Result<UnavailableArchive> {
     bail!("directory archive adapter is not installed")
 }
-pub fn extraction_unavailable(_: &SourceMetadata, _: &Receipt, _: &dyn Fn() -> Result<()>) -> Result<PathBuf> {
+pub fn extraction_unavailable(
+    _: &SourceMetadata, _: &Receipt, _: u64, _: &dyn Fn() -> Result<()>,
+    _: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<PathBuf> {
     bail!("directory extraction adapter is not installed")
 }
 
@@ -177,15 +192,24 @@ pub fn extraction_unavailable(_: &SourceMetadata, _: &Receipt, _: &dyn Fn() -> R
 /// It must preserve empty/nested directories and never infer kind from `.zip`.
 /// The callback runs without a global/session lock; acquire that guard only for
 /// its final rename. Until it succeeds, the payload receipt is not completion.
+/// Stream under the supplied expansion limit; invoke `admit(actual_bytes)` under
+/// the final guard BEFORE rename. Once admitted, quota remains charged even on
+/// uncertainty. Never publish first and attempt quota admission afterward.
 pub fn complete_payload(
+    manager: &mut TransferManager,
     source: SourceMetadata,
     mut payload: Receipt,
     check: &dyn Fn() -> Result<()>,
-    publish_directory: impl FnOnce(&SourceMetadata, &Receipt, &dyn Fn() -> Result<()>) -> Result<PathBuf>,
+    publish_directory: impl FnOnce(
+        &SourceMetadata, &Receipt, u64, &dyn Fn() -> Result<()>,
+        &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<PathBuf>,
 ) -> Result<PayloadReceipt> {
     source.validate()?;
     check()?;
+    let mut extracted_bytes = None;
     if source.kind == SourceKind::Directory {
+        let budget = manager.extraction_budget(payload.transfer_id)?;
         let expected = source.completion_path(&payload.actual_path)?;
         // Retain byte integrity and path custody from verification through
         // extraction. A finished payload path alone is not a trusted ZIP.
@@ -207,7 +231,20 @@ pub fn complete_payload(
         let actual: [u8; 32] = hash.finalize().into();
         ensure!(actual == payload.sha256, "directory payload SHA-256 changed before extraction");
         check()?;
-        let published = publish_directory(&source, &payload, check)?;
+        let publication = {
+            let mut admit = |actual_bytes| {
+                manager.reserve_extracted_bytes(payload.transfer_id, actual_bytes)?;
+                extracted_bytes = Some(actual_bytes);
+                Ok(())
+            };
+            publish_directory(&source, &payload, budget, check, &mut admit)
+        };
+        let published = publication.with_context(|| if extracted_bytes.is_some() {
+            "directory publication failed after quota admission; charge retained; outcome may be unknown"
+        } else {
+            "directory publication failed before quota admission"
+        })?;
+        ensure!(extracted_bytes.is_some(), "directory publisher omitted retained-quota admission");
         let directory = file_transfer::pin_source(&published)
             .context("directory publication returned an invalid path; outcome may be unknown")?;
         ensure!(directory.is_directory() && directory.path() == expected,
@@ -215,5 +252,5 @@ pub fn complete_payload(
         payload.actual_path = directory.path().to_owned();
         drop(archive);
     }
-    Ok(PayloadReceipt { payload, source })
+    Ok(PayloadReceipt { payload, source, extracted_bytes })
 }

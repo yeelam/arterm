@@ -299,10 +299,12 @@ impl FileBridge {
                 let hash: [u8; 32] = binary(body, "sha256")?.try_into()
                     .map_err(|_| anyhow::anyhow!("FileInvalidDigest"))?;
                 let receipt = manager.finish_guarded(id, hash, || self.authorize())?;
-                serde_json::to_value(transfer_payload::complete_payload(source, receipt,
+                serde_json::to_value(transfer_payload::complete_payload(manager, source, receipt,
                     &|| { drop(self.authorize()?); progress() }, transfer_payload::extraction_unavailable)?)?
             }
-            "FileClose" => serde_json::to_value(PayloadReceipt { payload: manager.close(id)?, source })?,
+            "FileClose" => serde_json::to_value(PayloadReceipt {
+                payload: manager.close(id)?, source, extracted_bytes: None,
+            })?,
             "FileCancel" => serde_json::to_value(manager.cancel(id)?)?,
             _ => bail!("FileUnsupportedOperation"),
         };
@@ -314,6 +316,7 @@ impl FileBridge {
 
 impl Drop for FileBridge {
     fn drop(&mut self) {
+        if self.ids.is_empty() { return; }
         let mut files = self.session.transfers.lock().unwrap();
         if let Some(manager) = &mut files.manager {
             for id in &self.ids {
