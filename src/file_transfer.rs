@@ -249,7 +249,15 @@ impl TransferManager {
         let mut pins = pin_directories(temp_root)?;
         let root = temp_root.join(format!("{}-{}", auth.session_id, Uuid::now_v7()));
         create_private_directory(&root)?;
-        pins.push(pin_directory(&root).map_err(|e| cleanup_empty_directory(&root, e))?);
+        let root_pin = pin_directory(&root).map_err(|e| cleanup_empty_directory(&root, e))?;
+        let root = match actual_path(&root_pin) {
+            Ok(path) => path,
+            Err(error) => {
+                drop(root_pin);
+                return Err(cleanup_empty_directory(&root, error));
+            }
+        };
+        pins.push(root_pin);
         Ok(Self {
             session_id: auth.session_id,
             root,

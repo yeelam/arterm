@@ -35,11 +35,28 @@ impl Drop for Fixture {
 fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+fn assert_same_object(actual: &Path, expected: &Path) {
+    let pinned = pin_source(actual).unwrap();
+    verify_path_identity(pinned.file(), expected).unwrap();
+}
 fn code(error: anyhow::Error) -> ErrorCode {
     error
         .downcast_ref::<TransferError>()
         .expect("typed transfer failure")
         .code
+}
+
+#[test]
+fn destination_spelling_is_stable_for_an_equivalent_root_alias() {
+    let fixture = Fixture::new();
+    let alias = PathBuf::from(fixture.0.to_str().unwrap().to_ascii_uppercase());
+    let mut manager = TransferManager::new(
+        AuthorizedSession::after_authorization(Uuid::now_v7()), &alias, Limits::default(),
+    ).unwrap();
+    let upload = manager.begin_upload("stable.bin", 0).unwrap();
+    let completed = manager.finish(upload.transfer_id, hash(b"")).unwrap();
+    assert_eq!(upload.actual_path, completed.actual_path);
+    assert_eq!(fs::read(completed.actual_path).unwrap(), b"");
 }
 
 #[test]
@@ -234,7 +251,7 @@ fn shared_source_and_directory_helpers_pin_objects_and_reject_existing_destinati
     fs::write(&source, b"file bytes, not an extraction request").unwrap();
     let file = pin_source(&source).unwrap();
     assert!(!file.is_directory());
-    assert_eq!(file.path(), source);
+    assert_same_object(file.path(), &source);
     assert!(file.file().metadata().unwrap().is_file());
     file.verify_unchanged().unwrap();
     assert!(fs::write(&source, b"cannot replace pinned source").is_err());
@@ -245,7 +262,7 @@ fn shared_source_and_directory_helpers_pin_objects_and_reject_existing_destinati
     assert!(create_private_directory(&directory).is_err());
     let pinned = pin_source(&directory).unwrap();
     assert!(pinned.is_directory());
-    assert_eq!(actual_path(pinned.file()).unwrap(), directory);
+    assert_same_object(&actual_path(pinned.file()).unwrap(), &directory);
     pinned.verify_unchanged().unwrap();
     assert!(fs::rename(&directory, fixture.0.join("renamed")).is_err());
     assert!(extended_path(&directory).unwrap().to_str().unwrap().starts_with(r"\\?\"));
@@ -565,7 +582,7 @@ fn unicode_case_variants_resolve_by_filesystem_identity() {
     )
     .unwrap();
     let download = manager.begin_download(&alternate_source).unwrap();
-    assert_eq!(download.actual_path, source);
+    assert_same_object(&download.actual_path, &source);
     assert_eq!(
         manager
             .read_chunk(download.transfer_id, 0, 64)

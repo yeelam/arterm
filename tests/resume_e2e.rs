@@ -66,6 +66,11 @@ impl Fixture {
     pub(crate) fn new() -> Self {
         let home = std::env::temp_dir().join(format!("devbox-native-e2e-{}", Uuid::now_v7()));
         fs::create_dir_all(&home).unwrap();
+        // Hosted runners may spell TEMP with an 8.3 alias; receipts use the
+        // filesystem's resolved name, so establish the same fixture spelling.
+        let resolved = fs::canonicalize(&home).unwrap();
+        let text = resolved.to_str().unwrap();
+        let home = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
         let host = Command::new(host_executable())
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
