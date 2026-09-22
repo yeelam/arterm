@@ -2,6 +2,23 @@ use super::*;
 use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
 
+#[test]
+fn unchanged_input_still_records_rejection_and_backpressure() {
+    let mut before = Details::default();
+    before.state.human_dirty = Some(true);
+    before.state.revision = Some(1);
+    before.input.text = true;
+    let after = Details { state: arterm::readiness_diagnostics::Snapshot {
+        revision: Some(2), ..before.state
+    }, ..before };
+    assert!(input_event(Uuid::now_v7(), None, before, after, EventKind::Input).is_none());
+    for outcome in [EventKind::InputRejected, EventKind::InputBackpressure] {
+        let event = input_event(Uuid::now_v7(), None, before, after, outcome).unwrap();
+        assert_eq!(event.kind, outcome);
+        assert_eq!(event.input.unwrap().text, true);
+    }
+}
+
 struct Link {
     pair: host_pipe::PipePair,
     frames: Frames,

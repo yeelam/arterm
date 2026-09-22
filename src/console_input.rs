@@ -128,6 +128,10 @@ fn is_ctrl_close_bracket(bytes: &[u8]) -> bool {
         && fields[4] & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0
 }
 
+pub(crate) fn is_modifier_key(virtual_key: u32) -> bool {
+    matches!(virtual_key, 0x10..=0x12 | 0x5b | 0x5c | 0xa0..=0xa5)
+}
+
 pub(crate) fn win32_fields(bytes: &[u8]) -> Option<[u32; 6]> {
     let Some(body) = bytes
         .strip_prefix(b"\x1b[")

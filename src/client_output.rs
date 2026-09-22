@@ -99,6 +99,11 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
     if response["recipient_metadata"]["zone_identifier_absent"] == true {
         output.push_str("\nMark-of-the-Web absent on recipient files; this is not a malware scan or safety verdict.");
     }
+    if exit_code(response) != 0 {
+        if let Some(path) = response["diagnostic_log"].as_str() {
+            output.push_str(&format!("\nReadiness log: {}", text(&Value::String(path.into()))));
+        }
+    }
     if exit_code(response) != 0 && !response["shell_status"].is_null() {
         output.push_str(&format!("\n{}", readiness(response)));
     }

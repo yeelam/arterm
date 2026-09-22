@@ -5,6 +5,7 @@ use crate::peer_auth::test_fixture::FixtureIdentity as IpcIdentity;
 #[cfg(not(any(test, all(feature = "test-unsigned-ipc", debug_assertions))))]
 use crate::peer_auth::ClientIdentity as IpcIdentity;
 use crate::peer_auth::PeerEnd;
+use crate::readiness_diagnostics::{Details, Event, EventKind, ReadinessLog, ReadinessReason, Role, ShellStatus, Snapshot};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -218,6 +219,8 @@ impl Buffer {
 }
 
 struct Shared {
+    session_id: Uuid,
+    diagnostic_log: Option<ReadinessLog>,
     buffer: Mutex<Buffer>,
     state: Mutex<String>,
     detach: AtomicBool,
@@ -301,6 +304,29 @@ struct ControlState {
     delivered: u64,
     submitting: Option<Uuid>,
     capability_known: bool,
+    readiness_details: Option<Details>,
+    bad_diagnostic_reported: bool,
+}
+impl ControlState {
+    fn diagnostic_snapshot(&self) -> Snapshot {
+        Snapshot {
+            status: ShellStatus::from_wire(&self.shell_status),
+            reason: ReadinessReason::from_wire(self.readiness_reason.as_deref().unwrap_or("")),
+            ..self.readiness_details.map(|d| d.state).unwrap_or_default()
+        }
+    }
+}
+
+fn record_readiness(shared: &Shared, kind: EventKind, command_id: Option<Uuid>,
+    before: Option<Snapshot>, control: &ControlState, elapsed_ms: Option<u64>) {
+    if let Some(log) = &shared.diagnostic_log {
+        log.record(Event {
+            kind, session_id: shared.session_id, command_id, before,
+            after: Some(control.diagnostic_snapshot()),
+            input: control.readiness_details.map(|details| details.input),
+            elapsed_ms,
+        });
+    }
 }
 pub struct Owner {
     pub identity: Identity,
@@ -335,7 +361,19 @@ impl Owner {
             pipe: format!(r"\\.\pipe\arterm-client-{instance}"),
             pid: std::process::id(),
         };
+        let diagnostic_log = match ReadinessLog::open(root, Role::Client) {
+            Ok(log) => {
+                crate::statusln!("[readiness] client diagnostic log: {}", log.path().display());
+                Some(log)
+            }
+            Err(error) => {
+                crate::statusln!("[readiness] client diagnostic log unavailable: {error:#}");
+                None
+            }
+        };
         let shared = Arc::new(Shared {
+            session_id: session,
+            diagnostic_log,
             buffer: Mutex::new(Buffer::new()),
             state: Mutex::new("connecting".into()),
             detach: AtomicBool::new(false),
@@ -429,6 +467,8 @@ impl Owner {
     }
     pub fn set_state(&mut self, state: &str) {
         *self.shared.state.lock().unwrap() = state.into();
+        let control = self.shared.control.lock().unwrap();
+        record_readiness(&self.shared, EventKind::Connection, None, None, &control, None);
     }
     pub fn set_service(
         &mut self,
@@ -516,6 +556,7 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         let mut control = self.shared.control.lock().unwrap();
         control.creation_enabled = Some(enabled);
         control.host_version = host_version.map(str::to_owned);
+        control.readiness_details = None;
         control.shell_status = if enabled { "not_ready" } else { "unsupported" }.into();
         control.readiness_reason = Some(
             if enabled {
@@ -534,6 +575,8 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
     fn command_event(&mut self, kind: &str, body: &rmpv::Value) {
         let value = json_wire(body);
         let mut control = self.shared.control.lock().unwrap();
+        let before = control.diagnostic_snapshot();
+        let before_input = control.readiness_details.map(|details| details.input);
         if let Some(status) = value["shell_status"].as_str() {
             control.shell_status = status.into();
         }
@@ -544,6 +587,19 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
         }
         if let Some(enabled) = value["command_execution"].as_bool() {
             control.creation_enabled = Some(enabled);
+        }
+        if let Some(raw) = value.get("readiness_diagnostics").filter(|v| !v.is_null()) {
+            let parsed = raw.as_str().filter(|text| text.len() <= 4096)
+                .and_then(|text| serde_json::from_str::<Details>(text).ok());
+            if parsed.is_none() && !control.bad_diagnostic_reported {
+                crate::statusln!("[readiness] invalid host diagnostic details omitted");
+                control.bad_diagnostic_reported = true;
+            }
+            control.readiness_details = parsed;
+        }
+        if !before.same_state(control.diagnostic_snapshot())
+            || before_input != control.readiness_details.map(|details| details.input) {
+            record_readiness(&self.shared, EventKind::HostState, None, Some(before), &control, None);
         }
         let barrier = value["after_output_seq"].as_u64().unwrap_or(0);
         if let Some(records) = value["records"].as_array() {
@@ -607,7 +663,7 @@ fn readiness_error(control: &ControlState) -> String {
     let hint = match (control.shell_status.as_str(), control.readiness_reason.as_deref()) {
         ("busy", _) => "a managed command owns input; query its command ID or wait for completion",
         ("unsupported", _) => "the host reports no supported shell integration for this session; use a new compatible PowerShell session",
-        (_, Some("partial_human_input")) => "interactive input is pending; finish or clear the line in the owning terminal before sending a command",
+        (_, Some("partial_human_input")) => "the host input tracker recorded a possible line edit; this is not proof that visible text remains; inspect the readiness diagnostic log",
         (_, Some("partial_input_sequence")) => "an incomplete terminal input sequence is pending; wait for it to finish",
         (_, Some("unclassified_terminal_input")) => "terminal control/editing input could not be classified; inspect the owning terminal and shell integration; this is not proof that a person typed a partial command",
         (_, Some("human_command_pending")) => "an interactive invocation has not returned to an integrated prompt",
@@ -698,8 +754,16 @@ fn command_rpc(
             .checked_add(Duration::from_millis(budget))
             .context("timeout overflow")?;
         send_deadline = Some(deadline);
+        let wait_started = Instant::now();
+        let mut last_logged = None;
         let hash = format!("{:x}", Sha256::digest(command.as_bytes()));
         loop {
+            let observed = control.diagnostic_snapshot();
+            if last_logged.is_none_or(|previous: Snapshot| !previous.same_state(observed)) {
+                record_readiness(shared, EventKind::CommandWait, Some(id), last_logged, &control,
+                    Some(wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64));
+                last_logged = Some(observed);
+            }
             caller_alive()?;
             ensure!(
                 !shared.stop.load(Ordering::Acquire) && !shared.detach.load(Ordering::Acquire),
@@ -752,6 +816,8 @@ fn command_rpc(
                 submission = Some(ticket);
                 control.submitted.insert(id, hash);
                 control.submitting = Some(id);
+                record_readiness(shared, EventKind::CommandAdmitted, Some(id), last_logged, &control,
+                    Some(wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64));
                 break;
             }
             let now = Instant::now();
@@ -854,7 +920,9 @@ fn serve(
             && request.session_id == identity.session_id,
         "local IPC routing mismatch"
     );
+    let request_started = Instant::now();
     let state = shared.state.lock().unwrap().clone();
+    let command_request = matches!(&request.action, Operation::Send { .. });
     let mut result = json!({
         "schema_version": VERSION, "operation_id": request.operation_id,
         "identity": identity, "connection_state": state, "status": "ok"
@@ -945,6 +1013,17 @@ fn serve(
         result["readiness_reason"] = json!(control.readiness_reason);
         result["host_version"] = json!(control.host_version);
         result["control_waiters"] = shared.waiters.load(Ordering::Acquire).into();
+        result["readiness_diagnostics"] = serde_json::to_value(control.readiness_details)?;
+        if command_request && result["status"] == "rejected" {
+            record_readiness(shared, EventKind::CommandRejected, Some(request.operation_id), None, &control, None);
+        }
+        if command_request && result["status"] == "timeout" {
+            record_readiness(shared, EventKind::CommandTimeout, Some(request.operation_id), None, &control,
+                Some(request_started.elapsed().as_millis().min(u64::MAX as u128) as u64));
+        }
+    }
+    if let Some(log) = &shared.diagnostic_log {
+        result["diagnostic_log"] = log.path().to_string_lossy().into_owned().into();
     }
     result["connection_state"] = shared.state.lock().unwrap().clone().into();
     write_frame(pipe, &serde_json::to_vec(&result)?)?;
@@ -1297,6 +1376,64 @@ fn write_frame(file: &File, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn admitted_readiness_timeouts_are_logged_once_for_all_terminal_paths() {
+        for reply_instead_of_expire in [false, true] {
+            let root = std::env::temp_dir().join(format!("arterm-ready-log-{}", Uuid::now_v7()));
+            let mut owner = Owner::start(&root, "diagnostic-target", "fixture", Uuid::now_v7(), None).unwrap();
+            owner.set_state("connected");
+            {
+                let mut control = owner.shared.control.lock().unwrap();
+                control.supported = true;
+                control.capability_known = true;
+                control.creation_enabled = Some(true);
+                control.shell_status = "ready".into();
+                control.readiness_reason = Some("ready".into());
+            }
+            let responder = if reply_instead_of_expire {
+                let shared = owner.shared.clone();
+                Some(thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        let mut control = shared.control.lock().unwrap();
+                        if let Some(message) = control.queue.pop_front() {
+                            message.submission.as_ref().unwrap().cancel_pending();
+                            control.submitted.remove(&message.operation_id);
+                            control.submitting = None;
+                            control.replies.insert(message.operation_id, json!({
+                                "kind":"CommandNotSubmitted", "body":{"code":"ReadinessDeadline"}
+                            }));
+                            shared.changed.notify_all();
+                            break;
+                        }
+                        drop(control);
+                        assert!(Instant::now() < deadline, "no admitted command");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }))
+            } else { None };
+            let response = request(&owner.identity, Operation::Send {
+                command: "PRIVATE_COMMAND_CANARY".into(),
+                timeout_ms: Some(if reply_instead_of_expire { 2000 } else { 30 }),
+            }).unwrap();
+            if let Some(responder) = responder { responder.join().unwrap(); }
+            assert_eq!(response["status"], "timeout");
+            assert_eq!(response["phase"], "readiness");
+            assert_eq!(response["submitted"], false);
+            let log = owner.shared.diagnostic_log.as_ref().unwrap();
+            assert!(log.flush(Duration::from_secs(2)));
+            let data = fs::read_to_string(log.path()).unwrap();
+            assert!(!data.contains("PRIVATE_COMMAND_CANARY"));
+            let events: Vec<Value> = data.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            for kind in ["CommandAdmitted", "CommandTimeout"] {
+                assert_eq!(events.iter().filter(|event| event["event"]["kind"] == kind
+                    && event["event"]["command_id"] == response["command_id"]).count(), 1);
+            }
+            drop(owner);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn readiness_admission_expires_cancels_and_dispatches_at_most_once() {
         assert_eq!(READINESS_TIMEOUT_MS, 30_000);
         let cancelled = Arc::new(Submission {
@@ -1385,7 +1522,7 @@ mod tests {
             (
                 "not_ready",
                 Some("partial_human_input"),
-                "interactive input is pending",
+                "host input tracker recorded a possible line edit",
             ),
             (
                 "not_ready",

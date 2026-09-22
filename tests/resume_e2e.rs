@@ -1304,6 +1304,84 @@ fn single_file_owner_death_reports_unknown_without_waiting_for_transfer_deadline
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn readiness_diagnostics_explain_pending_input_without_recording_content() {
+    let fixture = Fixture::new();
+    let (address, _) = relay(fixture.home.clone(), 1);
+    let mut owner = fixture.client("connect", Some("diagnostic"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':diagnostic')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":diagnostic").is_some());
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+    let wait_reason = |reason: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let listed = control(&["list", "--client", "--json"]);
+            assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+            let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+            if owners[0]["readiness_reason"] == reason { break; }
+            assert!(Instant::now() < deadline, "readiness did not reach {reason}: {owners}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_reason("ready");
+    owner.input.write_all(b"\x1b[16;42;0;1;16;1_\x1b[16;42;0;0;0;1_").unwrap();
+    owner.input.flush().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    owner.input.write_all(b"INPUT_PRIVATE_SENTINEL_0601").unwrap();
+    owner.input.flush().unwrap();
+    wait_reason("partial_human_input");
+    let timed = control(&["send", "fixture", "diagnostic", "--command",
+        "Write-Output 'COMMAND_PRIVATE_SENTINEL_0601'", "--timeout", "1s", "--json"]);
+    assert_eq!(timed.status.code(), Some(124), "{} {}", String::from_utf8_lossy(&timed.stdout), String::from_utf8_lossy(&timed.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&timed.stdout).unwrap();
+    assert_eq!(response["submitted"], false);
+    assert_eq!(response["readiness_diagnostics"]["input"]["text"], true);
+    assert_eq!(response["readiness_diagnostics"]["state"]["human_dirty"], true);
+    let log = PathBuf::from(response["diagnostic_log"].as_str().unwrap());
+    assert!(log.starts_with(fixture.home.join("client").join("diagnostics")));
+    let command_id = response["command_id"].as_str().unwrap();
+    owner.input.write_all(b"\x03").unwrap();
+    owner.input.flush().unwrap();
+    wait_reason("ready");
+    let sent = control(&["send", "fixture", "diagnostic", "--command",
+        "Write-Output 'EXECUTED_PRIVATE_SENTINEL_0601'", "--wait", "--timeout", "10s", "--json"]);
+    assert!(sent.status.success(), "{} {}", String::from_utf8_lossy(&sent.stdout), String::from_utf8_lossy(&sent.stderr));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut events = Vec::new();
+        let mut all_text = String::new();
+        for role in ["host", "client"] {
+            for entry in fs::read_dir(fixture.home.join(role).join("diagnostics")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|extension| extension != "jsonl") { continue; }
+                let raw = fs::read_to_string(path).unwrap();
+                all_text.push_str(&raw);
+                let complete = raw.rfind('\n').map_or("", |end| &raw[..=end]);
+                for line in complete.lines() {
+                    events.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+                }
+            }
+        }
+        for forbidden in ["INPUT_PRIVATE_SENTINEL", "COMMAND_PRIVATE_SENTINEL",
+            "EXECUTED_PRIVATE_SENTINEL", "Write-Output", "request_hash", "resume_token", "lease_id"] {
+            assert!(!all_text.contains(forbidden), "diagnostic privacy failure: {forbidden}");
+        }
+        let timeout = events.iter().any(|v| v["role"] == "Client"
+            && v["event"]["kind"] == "CommandTimeout" && v["event"]["command_id"] == command_id);
+        let dirty = events.iter().any(|v| v["role"] == "Host"
+            && v["event"]["kind"] == "Input" && v["event"]["after"]["human_dirty"] == true
+            && v["event"]["input"]["text"] == true);
+        let modifier = events.iter().any(|v| v["role"] == "Host"
+            && v["event"]["input"]["modifier"] == true && v["event"]["after"]["human_dirty"] == false);
+        if timeout && dirty && modifier { break; }
+        assert!(Instant::now() < deadline, "missing correlated readiness events");
+        thread::sleep(Duration::from_millis(20));
+    }
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn interactive_win32_keyup_preserves_command_readiness() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     struct Interactive(Box<dyn portable_pty::Child + Send + Sync>);
@@ -1376,7 +1454,7 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(focus_reporting.load(std::sync::atomic::Ordering::Acquire), "parent must enable terminal focus reporting");
-        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap();
+        writer.lock().unwrap().write_all(b"\x1b[O\x1b[I\x1b[16;42;0;1;16;1_\x1b[16;42;0;0;0;1_").unwrap();
         let traffic_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let observed = trace.lock().unwrap();
@@ -1401,7 +1479,8 @@ fn interactive_win32_keyup_preserves_command_readiness() {
             assert!(Instant::now() < manual_deadline, "manual interactive command did not finish: {owners}; synthetic input={:?}", trace.lock().unwrap());
             thread::sleep(Duration::from_millis(20));
         }
-        writer.lock().unwrap().write_all(b"\x1b[16;42;0;0;0;1_").unwrap(); // Shift key release, no edit.
+        // Modifier presses/releases carry no text and must not dirty the line.
+        writer.lock().unwrap().write_all(b"\x1b[16;42;0;1;16;1_\x1b[16;42;0;0;0;1_").unwrap();
         assert!(focus_reporting.load(std::sync::atomic::Ordering::Acquire), "terminal must observe focus-mode negotiation before generating focus reports");
         writer.lock().unwrap().write_all(b"\x1b[O\x1b[I").unwrap(); // Terminal focus loss/gain, not typed text.
         thread::sleep(Duration::from_millis(250));

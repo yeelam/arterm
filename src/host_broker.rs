@@ -12,7 +12,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -35,6 +35,7 @@ use crate::host_pipe;
 use arterm::{
     deployment, store,
     recipient_metadata,
+    readiness_diagnostics::{Details, Event, EventKind, ReadinessLog, Role},
     file_transfer::{AuthorizedSession, Limits, TransferManager, TransferState, MAX_CHUNK_BYTES},
     transfer_payload::{self, PayloadReceipt, PayloadStatus, PreparedSource, SourceMetadata},
     shell_integration::{Commands, CAPABILITY as COMMAND_CAPABILITY},
@@ -199,6 +200,7 @@ struct SessionState {
 }
 struct Session {
     id: Uuid,
+    diagnostic_log: Weak<ReadinessLog>,
     token: Vec<u8>,
     state: Mutex<SessionState>,
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
@@ -368,6 +370,7 @@ struct Reservation {
 
 struct Broker {
     root: PathBuf,
+    diagnostic_log: Option<Arc<ReadinessLog>>,
     pipe: String,
     instance: Vec<u8>,
     sessions: Mutex<HashMap<Uuid, Arc<Session>>>,
@@ -446,7 +449,7 @@ fn load_reservation(root: &Path, request: Uuid) -> Result<Option<Reservation>> {
 }
 
 impl Session {
-    fn spawn(id: Uuid, token: Vec<u8>, fp: &Fingerprint) -> Result<Arc<Self>> {
+    fn spawn(id: Uuid, token: Vec<u8>, fp: &Fingerprint, diagnostic_log: Weak<ReadinessLog>) -> Result<Arc<Self>> {
         let job = Job::new()?;
         let pair = native_pty_system().openpty(PtySize {
             rows: fp.rows,
@@ -479,6 +482,7 @@ impl Session {
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(MAX_INPUT_QUEUE);
         let session = Arc::new(Self {
             id,
+            diagnostic_log,
             token,
             transfers: Mutex::new(FileState::default()),
             state: Mutex::new(SessionState {
@@ -500,6 +504,13 @@ impl Session {
             child: Mutex::new(child),
             job,
         });
+        let initial = session.state.lock().unwrap().commands.as_ref().map(|c| c.diagnostic_details().state);
+        if let Some(after) = initial {
+            session.record_diagnostic(Event {
+                kind: EventKind::Connection, session_id: id, command_id: None,
+                before: None, after: Some(after), input: None, elapsed_ms: None,
+            });
+        }
         let weak = Arc::downgrade(&session);
         thread::spawn(move || {
             while let Ok(bytes) = input_rx.recv() {
@@ -560,10 +571,26 @@ impl Session {
     }
     fn push_output(&self, bytes: Vec<u8>) {
         let mut state = self.state.lock().unwrap();
+        let mut diagnostic = None;
         let bytes = if let Some(commands) = &mut state.commands {
-            commands.output(&bytes)
+            let before = commands.diagnostic_details();
+            let markers = commands.diagnostic_marker_count();
+            let command_id = commands.active();
+            let output = commands.output(&bytes);
+            if markers != commands.diagnostic_marker_count() {
+                diagnostic = Some(Event {
+                    kind: EventKind::ShellMarker, session_id: self.id, command_id,
+                    before: Some(before.state), after: Some(commands.diagnostic_details().state),
+                    input: None, elapsed_ms: None,
+                });
+            }
+            output
         } else { bytes };
-        if bytes.is_empty() { return; }
+        if bytes.is_empty() {
+            drop(state);
+            if let Some(event) = diagnostic { self.record_diagnostic(event); }
+            return;
+        }
         let seq = state.next_output;
         state.next_output = state.next_output.saturating_add(1);
         state.output_bytes += bytes.len();
@@ -584,11 +611,34 @@ impl Session {
                 break;
             }
         }
+        drop(state);
+        if let Some(event) = diagnostic { self.record_diagnostic(event); }
+    }
+    fn record_diagnostic(&self, event: Event) {
+        if let Some(log) = self.diagnostic_log.upgrade() { log.record(event); }
+    }
+    fn record_input(&self, details: Option<(Option<Uuid>, Details, Details)>, kind: EventKind) {
+        if let Some((command_id, before, after)) = details {
+            if let Some(event) = input_event(self.id, command_id, before, after, kind) {
+                self.record_diagnostic(event);
+            }
+        }
     }
     fn terminate(&self) -> Result<()> {
         self.input.lock().unwrap().take();
         self.job.terminate()
     }
+}
+
+fn input_event(id: Uuid, command_id: Option<Uuid>, before: Details, after: Details, kind: EventKind) -> Option<Event> {
+    if kind == EventKind::Input && before.state.same_state(after.state) && before.input == after.input {
+        return None;
+    }
+    Some(Event {
+        kind, session_id: id, command_id,
+        before: Some(before.state), after: Some(after.state),
+        input: Some(after.input), elapsed_ms: None,
+    })
 }
 
 fn command_snapshot(id: Uuid, state: &SessionState, requested: Option<Uuid>) -> Value {
@@ -601,6 +651,8 @@ fn command_snapshot(id: Uuid, state: &SessionState, requested: Option<Uuid>) -> 
         ("session_id", s(&id.to_string())),
         ("shell_status", s(commands.map_or("unsupported", Commands::shell_status))),
         ("readiness_reason", s(commands.map_or("integration_disabled", Commands::readiness_reason))),
+        ("readiness_diagnostics", commands.map(|c| s(&serde_json::to_string(&c.diagnostic_details())
+            .expect("typed readiness details contain only JSON scalar values"))).unwrap_or(Value::Nil)),
         ("command_execution", commands.is_some().into()),
         ("input_ready", commands.map_or(true, Commands::input_ready).into()),
         ("after_output_seq", (state.next_output - 1).into()),
@@ -643,8 +695,16 @@ impl Broker {
         }).collect())
     }
     fn new(root: PathBuf, pipe: String) -> Result<Arc<Self>> {
+        let diagnostic_log = match ReadinessLog::open(&root, Role::Host) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(error) => {
+                eprintln!("[readiness] host diagnostic log unavailable: {error:#}");
+                None
+            }
+        };
         Ok(Arc::new(Self {
             root,
+            diagnostic_log,
             pipe,
             instance: random16()?,
             sessions: Mutex::new(HashMap::new()),
@@ -754,7 +814,8 @@ impl Broker {
             active: false,
         };
         save_reservation(&self.root, &reservation)?;
-        let session = Session::spawn(session_id, token, &fp)?;
+        let session = Session::spawn(session_id, token, &fp,
+            self.diagnostic_log.as_ref().map(Arc::downgrade).unwrap_or_default())?;
         reservation.active = true;
         save_reservation(&self.root, &reservation)?;
         self.reservations
@@ -1298,15 +1359,21 @@ impl Broker {
                                     )?;
                                     continue;
                                 }
+                                let mut input_diagnostic = None;
                                 if seq == st.input_committed + 1 {
                                     if let Some(commands) = &mut st.commands {
-                                        if let Err(error) = commands.input(&bytes) {
+                                        let before = commands.diagnostic_details();
+                                        let command_id = commands.active();
+                                        let classified = commands.input(&bytes);
+                                        input_diagnostic = Some((command_id, before, commands.diagnostic_details()));
+                                        if let Err(error) = classified {
                                             let detail = if commands.input_ready() {
                                                 "human input rejected while managed command owns input"
                                             } else {
                                                 "shell integration has not emitted its first supported ready marker; input was not injected"
                                             };
                                             drop(st);
+                                            session.record_input(input_diagnostic, EventKind::InputRejected);
                                             send(&mut output, message(
                                                 if command_capable { "InputRejected" } else { "Error" }, map(vec![
                                                 ("session_id", s(&session.id.to_string())),
@@ -1324,6 +1391,7 @@ impl Broker {
                                         Ok(()) => st.input_committed = seq,
                                         Err(TrySendError::Full(_)) => {
                                             drop(st);
+                                            session.record_input(input_diagnostic, EventKind::InputBackpressure);
                                             send(
                                                 &mut output,
                                                 message(
@@ -1339,6 +1407,8 @@ impl Broker {
                                             continue;
                                         }
                                         Err(TrySendError::Disconnected(_)) => {
+                                            drop(st);
+                                            session.record_input(input_diagnostic, EventKind::InputRejected);
                                             bail!("PTY input closed")
                                         }
                                     }
@@ -1359,6 +1429,7 @@ impl Broker {
                                 }
                                 let committed = st.input_committed;
                                 drop(st);
+                                session.record_input(input_diagnostic, EventKind::Input);
                                 send(
                                     &mut output,
                                     message(

@@ -1,4 +1,4 @@
-//! Typed, opt-in readiness diagnostics. No terminal content is accepted.
+//! Typed readiness diagnostics. No terminal content is accepted.
 //!
 //! `record` only attempts a bounded queue send. Call `open`, `flush`, and final
 //! drop outside terminal/protocol locks. Flush acknowledges prior writes, not
@@ -37,7 +37,10 @@ pub enum Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Input,
+    InputRejected,
+    InputBackpressure,
     ShellMarker,
+    HostState,
     CommandWait,
     CommandAdmitted,
     CommandTimeout,
@@ -94,6 +97,47 @@ pub struct InputSummary {
     pub focus: bool,
     pub unclassified: bool,
     pub incomplete: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Details {
+    pub state: Snapshot,
+    pub input: InputSummary,
+}
+
+impl Snapshot {
+    pub fn same_state(self, other: Self) -> bool {
+        Self { revision: None, ..self } == Self { revision: None, ..other }
+    }
+}
+
+impl ShellStatus {
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "ready" => Self::Ready,
+            "not_ready" => Self::NotReady,
+            "busy" => Self::Busy,
+            "unsupported" => Self::Unsupported,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl ReadinessReason {
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "ready" => Self::Ready,
+            "initializing" => Self::Initializing,
+            "managed_command" => Self::ManagedCommand,
+            "partial_input_sequence" => Self::PartialInputSequence,
+            "unclassified_terminal_input" => Self::UnclassifiedTerminalInput,
+            "partial_human_input" => Self::PartialHumanInput,
+            "human_command_pending" => Self::HumanCommandPending,
+            "integration_disabled" => Self::IntegrationDisabled,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

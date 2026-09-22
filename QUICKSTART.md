@@ -324,6 +324,37 @@ interactive/protocol processing available.
 Replacing the adapter's prompt or entering nested input can prevent readiness
 or completion reporting; do not treat silence as success.
 
+### Readiness diagnostic logs
+
+When `send --command` times out, keep its **Command ID** and the printed
+**Readiness log** path. Starting with 0.6.1, an owning client and host write
+privacy-limited JSONL diagnostics automatically:
+
+- Client: `%LOCALAPPDATA%\VsTerm\client\diagnostics`
+- Host: `%LOCALAPPDATA%\VsTerm\host\diagnostics`
+
+If `VSTERM_REMOTE_HOME` is set, use that root instead. Collect the matching
+`readiness-v1-*.jsonl` and rotated `.jsonl.1` files from both endpoints soon after
+the failure. Each role retains at most eight process-instance pairs of 1 MiB
+files; active instances are not evicted. Queue losses appear as `dropped_events`;
+storage failures produce a warning rather than holding up the terminal.
+
+Events contain timestamps, process/session/command IDs, readiness flags, and
+categories such as text present, modifier, editing, key release, focus, or
+unclassified control input. They never contain typed characters/key codes,
+command text or its hash, shell output, integration nonces, or credentials.
+They still describe activity, so treat them as internal diagnostic data.
+
+A `partial_human_input` timeout means the tracker recorded a possible edit;
+it does not prove visible text remains. Logs show which category changed that
+state and whether later shell markers cleared it. These are observations, not
+permission to clear another person's input automatically.
+
+Update both endpoints for complete input-origin evidence. A new client can log
+waits against an older host, but cannot reconstruct events that happened before
+diagnostics were installed. Upgrading the host still protects live sessions;
+do not force-stop useful work merely to collect logs.
+
 The command ledger holds **256 commands for the remote session's lifetime**,
 with no eviction. At capacity, new commands are rejected, not silently
 forgotten or run in a replacement shell. Completed records still occupy slots.

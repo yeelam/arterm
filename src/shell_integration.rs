@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+use crate::readiness_diagnostics::{Details, InputSummary, ReadinessReason, ShellStatus, Snapshot};
 
 pub const CAPABILITY: &str = "command-execution-v1";
 const MAX_COMMAND: usize = 16 * 1024;
@@ -43,9 +44,20 @@ pub struct Commands {
     last_cr: bool,
     input_sequence: Vec<u8>,
     unclassified_input: bool,
+    last_input: InputSummary,
+    marker_count: u64,
     active: Option<Uuid>,
     records: BTreeMap<Uuid, Record>,
     pub revision: u64,
+}
+
+fn summarize_character(value: u32, summary: &mut InputSummary) {
+    match value {
+        3 | 10 | 13 => summary.submit_or_interrupt = true,
+        8 | 9 | 27 | 127 => summary.editing = true,
+        0..=31 => summary.nontext_key = true,
+        _ => summary.text = true,
+    }
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -84,6 +96,8 @@ impl Commands {
             last_cr: false,
             input_sequence: Vec::new(),
             unclassified_input: false,
+            last_input: InputSummary::default(),
+            marker_count: 0,
             active: None,
             records: BTreeMap::new(),
             revision: 0,
@@ -159,6 +173,22 @@ function global:prompt {
     pub fn records(&self) -> Vec<Record> {
         self.records.values().cloned().collect()
     }
+    pub fn diagnostic_details(&self) -> Details {
+        Details {
+            state: Snapshot {
+                status: ShellStatus::from_wire(self.shell_status()),
+                reason: ReadinessReason::from_wire(self.readiness_reason()),
+                initialized: Some(self.initialized),
+                human_dirty: Some(self.human_dirty),
+                unclassified_input: Some(self.unclassified_input),
+                pending_sequence: Some(!self.input_sequence.is_empty()),
+                human_pending: Some(self.human_pending),
+                revision: Some(self.revision),
+            },
+            input: self.last_input,
+        }
+    }
+    pub fn diagnostic_marker_count(&self) -> u64 { self.marker_count }
     pub fn submit(&mut self, id: Uuid, command: &str) -> Result<(Record, Option<Vec<u8>>)> {
         ensure!(
             !command.is_empty() && command.len() <= MAX_COMMAND,
@@ -209,9 +239,13 @@ function global:prompt {
         let mut pending = self.input_sequence.clone();
         let mut keys = Vec::new();
         let mut unclassified = self.unclassified_input;
+        let mut summary = InputSummary::default();
         for &byte in bytes {
             if pending.is_empty() {
-                if byte == 27 { pending.push(byte); } else { keys.push((u32::from(byte), 1)); }
+                if byte == 27 { pending.push(byte); } else {
+                    summarize_character(u32::from(byte), &mut summary);
+                    keys.push((u32::from(byte), 1));
+                }
                 continue;
             }
             pending.push(byte);
@@ -222,15 +256,29 @@ function global:prompt {
                 // The local parent may enable these reports without remote output.
                 // Preserve their bytes for ConPTY, but do not treat focus as typing.
                 pending.clear();
+                summary.focus = true;
             } else if let Some(fields) = crate::console::console_input::win32_fields(&pending) {
-                if fields[3] == 1 { keys.push((fields[2], fields[5])); }
+                let modifier = fields[2] == 0
+                    && crate::console::console_input::is_modifier_key(fields[0]);
+                if fields[3] == 0 { summary.key_release = true; }
+                else if modifier { summary.modifier = true; }
+                else {
+                    summarize_character(fields[2], &mut summary);
+                    if fields[2] == 0 && matches!(fields[0], 0x08 | 0x09 | 0x21..=0x28 | 0x2d | 0x2e) {
+                        summary.editing = true;
+                    }
+                }
+                if fields[3] == 1 && !modifier { keys.push((fields[2], fields[5])); }
                 // Key-up still reaches ConPTY unchanged; it does not edit a shell line.
                 pending.clear();
             } else {
                 unclassified = true;
+                summary.unclassified = true;
                 keys.extend(pending.drain(..).map(|byte| (u32::from(byte), 1)));
             }
         }
+        summary.incomplete = !pending.is_empty();
+        self.last_input = summary;
         if !keys.is_empty() || !pending.is_empty() {
             ensure!(self.initialized, "IntegrationNotEstablished");
             ensure!(self.active.is_none(), "CommandBusy");
@@ -291,6 +339,7 @@ function global:prompt {
                         .active
                         .is_some_and(|id| self.records[&id].state == "finishing") =>
             {
+                self.marker_count = self.marker_count.saturating_add(1);
                 if let Some(id) = self.active.take() {
                     self.records.get_mut(&id).unwrap().state = "completed".into();
                 }
@@ -311,6 +360,7 @@ function global:prompt {
                     if self.active == Some(id) {
                         let record = self.records.get_mut(&id).unwrap();
                         if record.state == "accepted" {
+                            self.marker_count = self.marker_count.saturating_add(1);
                             record.state = "running".into();
                             self.revision += 1;
                         }
@@ -322,6 +372,7 @@ function global:prompt {
                     if self.active == Some(id) && matches!(*success, "True" | "False") {
                         let record = self.records.get_mut(&id).unwrap();
                         if record.state == "running" {
+                            self.marker_count = self.marker_count.saturating_add(1);
                             record.state = "finishing".into();
                             record.succeeded = Some(*success == "True");
                             record.exit_code = exit.parse().ok();
@@ -374,6 +425,30 @@ function global:prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn modifier_key_down_without_text_never_marks_the_line_dirty() {
+        let mut commands = Commands::new();
+        let ready = format!("\x1b]633;arterm;{};ready\x07", commands.nonce);
+        commands.output(ready.as_bytes());
+        for key in [16, 17, 18, 91, 92, 160, 161, 162, 163, 164, 165] {
+            commands.input(format!("\x1b[{key};0;0;1;0;1_").as_bytes()).unwrap();
+            assert_eq!(commands.readiness_reason(), "ready", "modifier {key} dirtied an empty line");
+        }
+        commands.input(b"\x1b[16;42;97;1;16;1_").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_human_input", "text-bearing records remain guarded");
+        commands.input(b"\r").unwrap();
+        commands.output(ready.as_bytes());
+        commands.input(b"private-input").unwrap();
+        commands.input(b"\x1b[16;42;0;1;0;1_").unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        commands.input(b"\r").unwrap();
+        commands.output(ready.as_bytes());
+        commands.submit(Uuid::now_v7(), "Start-Sleep -Seconds 1").unwrap();
+        commands.input(b"\x1b[17;29;0;1;8;1_").unwrap();
+        assert_eq!(commands.shell_status(), "busy");
+        assert!(commands.input(b"\x1b[37;75;0;1;0;1_").is_err(), "navigation must remain guarded");
+    }
+
     #[test]
     fn focus_notifications_do_not_require_remote_mode_or_clear_edits_or_busy() {
         fn ready() -> Commands {

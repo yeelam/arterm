@@ -228,6 +228,16 @@ parent terminal enabled focus reporting before arTerm started. The remote host
 cannot observe that local negotiation. Other unrecognized terminal input remains
 guarded, and focus notifications never clear a pending edit or busy command.
 
+Readiness diagnostics are written automatically beneath the data root in
+`client\diagnostics` and `host\diagnostics`. Failed command responses include
+the owning client's exact log path. Logs correlate session/command IDs with
+state transitions and input categories, **not input text, command contents,
+terminal output, key codes, hashes of commands, credentials, or tokens**.
+`partial_human_input` describes the host tracker's state, not proof that visible
+text remains in the prompt. See the diagnostic collection steps in QUICKSTART.
+Pure modifier-key presses carrying no character are now nonediting, like key
+releases and focus reports; actual edits remain guarded.
+
 For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.
 
