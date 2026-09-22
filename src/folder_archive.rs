@@ -745,6 +745,35 @@ fn extract_with_limit<G>(
     exact_basename: bool,
     authorize_publish: impl FnOnce(&ArchiveSummary) -> Result<G>,
 ) -> Result<PublishedFolder> {
+    extract_with_metadata_impl(zip, parent, original_basename, check_cancel,
+        byte_limit, exact_basename, None, authorize_publish)
+}
+
+/// Applies recipient metadata only to newly created regular staging files while
+/// their identity handles remain pinned, before the final publication guard.
+pub fn extract_archive_with_metadata<G>(
+    zip: &Path,
+    parent: &Path,
+    original_basename: &str,
+    max_uncompressed_bytes: u64,
+    mut check_cancel: impl FnMut() -> Result<()>,
+    metadata: &mut dyn FnMut(&File) -> Result<()>,
+    authorize_publish: impl FnOnce(&ArchiveSummary) -> Result<G>,
+) -> Result<PublishedFolder> {
+    extract_with_metadata_impl(zip, parent, original_basename, &mut check_cancel,
+        max_uncompressed_bytes.min(MAX_UNCOMPRESSED_BYTES), true, Some(metadata), authorize_publish)
+}
+
+fn extract_with_metadata_impl<G>(
+    zip: &Path,
+    parent: &Path,
+    original_basename: &str,
+    check_cancel: &mut impl FnMut() -> Result<()>,
+    byte_limit: u64,
+    exact_basename: bool,
+    mut metadata: Option<&mut dyn FnMut(&File) -> Result<()>>,
+    authorize_publish: impl FnOnce(&ArchiveSummary) -> Result<G>,
+) -> Result<PublishedFolder> {
     check_cancel()?;
     validate_basename(original_basename)?;
     let source = pin_source(zip)?;
@@ -815,6 +844,9 @@ fn extract_with_limit<G>(
         }
         if let Some(output) = output {
             output.sync_all()?;
+            if let Some(metadata) = metadata.as_mut() {
+                metadata(&output).context("recipient metadata failed before folder publication")?;
+            }
         }
     }
     let entry_count = names.0.len();

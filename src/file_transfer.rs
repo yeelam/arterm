@@ -19,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
+use crate::recipient_metadata::{self, Applied};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE},
     Security::{
@@ -118,6 +119,8 @@ pub struct Receipt {
     pub actual_path: PathBuf,
     pub bytes: u64,
     pub sha256: [u8; 32],
+    #[serde(default)]
+    pub recipient_metadata: Option<Applied>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TransferState {
@@ -499,6 +502,10 @@ impl TransferManager {
         if let Err(error) = validation {
             return Err(self.abort_failure(id, error));
         }
+        let metadata = match recipient_metadata::ensure_unblocked(&upload.file) {
+            Ok(applied) => applied,
+            Err(error) => return Err(self.abort_failure(id, error.context("recipient metadata unblocking failed before publication"))),
+        };
         let guard = match authorize() {
             Ok(guard) => guard,
             Err(error) => return Err(self.abort_failure(id, error)),
@@ -533,6 +540,7 @@ impl TransferManager {
                     actual_path: path,
                     bytes: entry.status.bytes,
                     sha256: digest,
+                    recipient_metadata: Some(metadata),
                 };
                 entry.status.actual_path = receipt.actual_path.clone();
                 entry.status.state = TransferState::Completed;
@@ -659,6 +667,7 @@ impl TransferManager {
                 actual_path: entry.status.actual_path.clone(),
                 bytes: entry.status.bytes,
                 sha256: download.hash.clone().finalize().into(),
+                recipient_metadata: None,
             })
         })();
         match result {

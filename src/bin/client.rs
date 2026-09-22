@@ -64,7 +64,9 @@ Send waits up to 30s for readiness by default; --timeout overrides it. --wait re
 Command IDs are retained for the session lifetime; capacity is 256, with no silent eviction or replacement.\n\
 Local IPC requires OS trust, the pinned certificate, and byte-identical client builds; cross-elevation is rejected.\n\
 Transfers use unique session TEMP destinations, not terminal paste. An explicit ZIP file stays a file.\n\
-Directory sources require directory-transfer-zip-v1; this development build has no archive adapter installed.\n\
+All received files, including extracted folder files, are automatically unblocked before publication; sources are unchanged.\n\
+This is not a malware scan, safety verdict, execution-policy change, or an open-file-lock unlock.\n\
+Directory sources require directory-transfer-zip-v1; independent archive review remains a release blocker.\n\
 Ctrl+] detaches without terminating the remote session.",
         env!("CARGO_PKG_VERSION")
     );

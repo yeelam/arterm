@@ -312,6 +312,8 @@ struct CreationGate {
     hide_file_capability: bool,
     hide_metadata_capability: bool,
     hide_directory_capability: bool,
+    hide_recipient_capability: bool,
+    corrupt_recipient_receipt: bool,
     hold_session_exit: bool,
     exit_observed: std::sync::atomic::AtomicBool,
     exit_release: std::sync::atomic::AtomicBool,
@@ -397,6 +399,20 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                             frames.push(&data[..n]).unwrap();
                             while let Some(mut frame) = frames.next().unwrap() {
                                 if let Some(gate) = &gate {
+                                    if gate.corrupt_recipient_receipt
+                                        && get(&frame, "type").as_str() == Some("FileResult") {
+                                        if let Value::Map(fields) = &mut frame {
+                                            if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("body")) {
+                                                if let Some((_, json)) = body.iter_mut().find(|(k, _)| k.as_str() == Some("json")) {
+                                                    let mut value: serde_json::Value = serde_json::from_str(json.as_str().unwrap()).unwrap();
+                                                    if gate.corrupt_recipient_receipt && value["recipient_metadata"].is_object() {
+                                                        value["recipient_metadata"]["zone_identifier_absent"] = false.into();
+                                                    }
+                                                    *json = s(&serde_json::to_string(&value).unwrap());
+                                                }
+                                            }
+                                        }
+                                    }
                                     if get(&frame, "type").as_str() == Some("FileProgress") {
                                         gate.file_progress.lock().unwrap().push((
                                             get(get(&frame, "body"), "phase").as_str().unwrap().into(), Instant::now()));
@@ -410,12 +426,13 @@ fn relay_with_creation_gate(home: PathBuf, attachments: usize, trace: Option<Arc
                                             thread::sleep(Duration::from_millis(10));
                                         }
                                     }
-                                    if (gate.hide_file_capability || gate.hide_metadata_capability || gate.hide_directory_capability) && get(&frame, "type").as_str() == Some("HelloOk") {
+                                    if (gate.hide_file_capability || gate.hide_metadata_capability || gate.hide_directory_capability || gate.hide_recipient_capability) && get(&frame, "type").as_str() == Some("HelloOk") {
                                         if let Value::Map(fields) = &mut frame {
                                             if let Some((_, Value::Map(body))) = fields.iter_mut().find(|(k, _)| k.as_str() == Some("body")) {
                                                 if let Some((_, Value::Array(caps))) = body.iter_mut().find(|(k, _)| k.as_str() == Some("capabilities")) {
                                                     caps.retain(|v| !(gate.hide_file_capability && v.as_str() == Some(arterm::transfer_admission::CAPABILITY))
                                                         && !(gate.hide_metadata_capability && v.as_str() == Some(arterm::transfer_payload::METADATA_CAPABILITY))
+                                                        && !(gate.hide_recipient_capability && v.as_str() == Some(arterm::recipient_metadata::CAPABILITY))
                                                         && !(gate.hide_directory_capability && v.as_str() == Some(arterm::transfer_payload::DIRECTORY_CAPABILITY)));
                                                 }
                                             }
@@ -518,6 +535,205 @@ fn pid_marker(text: &str, prefix: &str, suffix: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn zone_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    let mut ads = path.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    match fs::read(ads) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.raw_os_error() == Some(2) => None,
+        Err(error) => panic!("read owned fixture Zone.Identifier: {error}"),
+    }
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn recipient_metadata_all_types_both_directions_and_folder_files() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    let (address, _) = relay(fixture.home.clone(), 29);
+    let mut owner = fixture.client("connect", Some("zones"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':zones')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":zones").is_some());
+    let transfer = |direction: &str, source: &std::path::Path, files: u64| {
+        let mut command = Command::new(controller_executable());
+        command.env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args([direction, "fixture", "zones", "--file", source.to_str().unwrap(), "--json"]);
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{} {}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["status"], "completed");
+        assert_eq!(receipt["recipient_metadata"]["files"], files);
+        assert_eq!(receipt["recipient_metadata"]["zone_identifier_absent"], true);
+        let destination = PathBuf::from(receipt["actual_path"].as_str().unwrap());
+        assert!(destination.starts_with(&fixture.home) && destination != source);
+        (destination, receipt)
+    };
+    for direction in ["send", "receive"] {
+            for zone in [None, Some(3), Some(4)] {
+                for extension in ["txt", "ps1", "exe", "zip"] {
+                    let source = fixture.home.join(format!("{direction}-{zone:?}.{extension}"));
+                    let bytes = if extension == "zip" { vec![80, 75, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+                        else { b"dummy bytes; never execute\r\n\0\xff".to_vec() };
+                    fs::write(&source, &bytes).unwrap();
+                    if let Some(zone) = zone {
+                        fs::write(format!("{}:Zone.Identifier", source.display()),
+                            format!("[ZoneTransfer]\r\nZoneId={zone}\r\nHostUrl=https://fixture.invalid/private\r\n")).unwrap();
+                    }
+                    let original_zone = zone_bytes(&source);
+                    fs::write(format!("{}:unrelated", source.display()), b"source only").unwrap();
+                    let (destination, receipt) = transfer(direction, &source, 1);
+                    assert_eq!(receipt["source_kind"], "file");
+                    assert!(receipt.get("source_zone").is_none());
+                    assert_eq!(receipt["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+                    assert_eq!(fs::read(&destination).unwrap(), bytes);
+                    assert_eq!(fs::read(&source).unwrap(), bytes);
+                    assert_eq!(zone_bytes(&source), original_zone);
+                    assert_eq!(fs::read(format!("{}:unrelated", source.display())).unwrap(), b"source only");
+                    assert_eq!(zone_bytes(&destination), None);
+                }
+            }
+            let source = fixture.home.join(format!("folder-{direction}"));
+            fs::create_dir_all(source.join("nested").join("empty")).unwrap();
+            let names = ["plain.txt", "nested\\script.ps1", "nested\\dummy.exe",
+                "nested\\ordinary.zip", "nested\\\u{65e5}\u{672c}.txt", "zero"];
+            for (index, name) in names.iter().enumerate() {
+                let path = source.join(name);
+                fs::write(&path, if index == 5 { &b""[..] } else { &b"folder bytes"[..] }).unwrap();
+                if index % 2 == 0 {
+                    fs::write(format!("{}:Zone.Identifier", path.display()), b"[ZoneTransfer]\r\nZoneId=4\r\n").unwrap();
+                }
+            }
+            let before: Vec<_> = names.iter().map(|name| zone_bytes(&source.join(name))).collect();
+            let (destination, receipt) = transfer(direction, &source, names.len() as u64);
+            assert_eq!(receipt["source_kind"], "directory");
+            assert!(destination.join("nested").join("empty").is_dir());
+            for (index, name) in names.iter().enumerate() {
+                assert_eq!(Sha256::digest(fs::read(destination.join(name)).unwrap()),
+                    Sha256::digest(fs::read(source.join(name)).unwrap()));
+                assert_eq!(zone_bytes(&source.join(name)), before[index]);
+                assert_eq!(zone_bytes(&destination.join(name)), None);
+            }
+            let empty = fixture.home.join(format!("empty-{direction}"));
+            fs::create_dir(&empty).unwrap();
+            let (destination, _) = transfer(direction, &empty, 0);
+            assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn recipient_metadata_old_host_rejected_before_staging() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { hide_recipient_capability: true, ..Default::default() });
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 3, None, Some(gate));
+    let mut owner = fixture.client("connect", Some("old-zone"), &address);
+    owner.command("Write-Output ('READY=' + $PID + ':old-zone')");
+    owner.wait_for(|out, _| pid_marker(out, "READY=", ":old-zone").is_some());
+    let source = fixture.home.join("owned.txt");
+    fs::write(&source, b"not transferred").unwrap();
+    for direction in ["send", "receive"] {
+            let mut command = Command::new(controller_executable());
+            command.env("VSTERM_REMOTE_HOME", &fixture.home)
+                .args([direction, "fixture", "old-zone", "--file", source.to_str().unwrap(), "--json"]);
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("recipient-unblock-v1"));
+            assert!(owned_partials(&fixture.home).is_empty());
+            assert_eq!(zone_bytes(&source), None);
+    }
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn recipient_metadata_unconfirmed_receipt_is_unknown_and_preserves_data() {
+        let fixture = Fixture::new();
+        let gate = Arc::new(CreationGate { corrupt_recipient_receipt: true, ..Default::default() });
+        let (address, _) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate));
+        let mut owner = fixture.client("connect", Some("policy"), &address);
+        owner.command("Write-Output ('READY=' + $PID + ':policy')");
+        owner.wait_for(|out, _| pid_marker(out, "READY=", ":policy").is_some());
+        let source = fixture.home.join("owned.txt");
+        fs::write(&source, b"fixture").unwrap();
+        let output = Command::new(controller_executable()).env("VSTERM_REMOTE_HOME", &fixture.home)
+            .args(["send", "fixture", "policy", "--file", source.to_str().unwrap(), "--json"])
+            .output().unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let destination = PathBuf::from(response["actual_path"].as_str().unwrap());
+        assert_eq!(zone_bytes(&destination), None);
+        assert_eq!(zone_bytes(&source), None);
+            assert_eq!(output.status.code(), Some(6), "{response}");
+            assert_eq!(response["status"], "unknown");
+            assert!(response["recipient_metadata"].is_null());
+        owner.detach();
+        assert_eq!(fs::read(destination).unwrap(), b"fixture");
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn recipient_metadata_marked_stage_injection_and_io_failure_both_directions() {
+    use std::{os::windows::fs::OpenOptionsExt, sync::atomic::Ordering};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_DELETE};
+    for direction in ["send", "receive"] {
+        for locked in [false, true] {
+            let fixture = Fixture::new();
+            let gate = Arc::new(CreationGate { frame: "FileResult",
+                occurrence: if direction == "send" { 0 } else { 1 }, ..Default::default() });
+            struct Release(Arc<CreationGate>);
+            impl Drop for Release { fn drop(&mut self) { self.0.release.store(true, Ordering::Release); } }
+            let _release = Release(gate.clone());
+            let (address, _) = relay_with_creation_gate(fixture.home.clone(), 2, None, Some(gate.clone()));
+            let mut owner = fixture.client("connect", Some("io-zone"), &address);
+            owner.command("Write-Output ('READY=' + $PID + ':io-zone')");
+            owner.wait_for(|out, _| pid_marker(out, "READY=", ":io-zone").is_some());
+            let source = fixture.home.join("owned.txt");
+            fs::write(&source, b"fixture").unwrap();
+            let mut command = Command::new(controller_executable());
+            command.env("VSTERM_REMOTE_HOME", &fixture.home)
+                .args([direction, "fixture", "io-zone", "--file", source.to_str().unwrap(), "--json"])
+                .stdout(Stdio::piped()).stderr(Stdio::piped());
+            let pending = Pending(Some(command.spawn().unwrap()));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !gate.observed.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "receiver staging gate was not reached");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let partials = owned_partials(&fixture.home);
+            assert_eq!(partials.len(), 1);
+            let destination = partials[0].parent().unwrap().join("owned.txt");
+            let ads = format!("{}:Zone.Identifier", partials[0].display());
+            fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=4\r\n").unwrap();
+            fs::write(format!("{}:unrelated", partials[0].display()), b"keep receiver stream").unwrap();
+            assert!(zone_bytes(&partials[0]).is_some(), "fixture must inject a real receiver mark");
+            let lock = locked.then(|| fs::OpenOptions::new().read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE).open(&ads).unwrap());
+            gate.release.store(true, Ordering::Release);
+            let output = pending.output();
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if locked {
+                assert!(!output.status.success(), "metadata failure claimed completion");
+                assert_ne!(response["status"], "completed", "{response}");
+                assert!(response["recipient_metadata"].is_null());
+                assert!(response["error"].as_str().unwrap().contains("metadata"), "{response}");
+                assert!(!destination.exists());
+            } else {
+                assert!(output.status.success(), "{response}");
+                assert_eq!(response["recipient_metadata"]["zone_identifier_absent"], true);
+                assert_eq!(zone_bytes(&destination), None);
+                assert_eq!(fs::read(&destination).unwrap(), b"fixture");
+                assert_eq!(fs::read(format!("{}:unrelated", destination.display())).unwrap(), b"keep receiver stream");
+            }
+            assert_eq!(zone_bytes(&source), None);
+            assert_eq!(fs::read(&source).unwrap(), b"fixture");
+            drop(lock);
+            owner.detach();
+            assert_eq!(destination.exists(), !locked);
+        }
+    }
 }
 
 #[test]
@@ -847,11 +1063,12 @@ fn caller_abort_and_transport_disconnect(folder: bool) {
                 state as u8
             }).collect();
             fs::write(&data_path, &data).unwrap();
-            let mut controller = Command::new(controller_executable())
-                .env("VSTERM_REMOTE_HOME", &fixture.home)
+            fs::write(format!("{}:Zone.Identifier", data_path.display()), b"[ZoneTransfer]\r\nZoneId=4\r\n").unwrap();
+            let mut command = Command::new(controller_executable());
+            command.env("VSTERM_REMOTE_HOME", &fixture.home)
                 .args([direction, "fixture", "cancel", "--file", source.to_str().unwrap(), "--json"])
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                .spawn().unwrap();
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut controller = command.spawn().unwrap();
             let transfer_link = connections.recv_timeout(Duration::from_secs(10)).unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !gate.observed.load(Ordering::Acquire) {
@@ -878,6 +1095,7 @@ fn caller_abort_and_transport_disconnect(folder: bool) {
             }
             assert!(!destination.exists(), "cancelled transfer must not publish");
             assert_eq!(fs::read(&data_path).unwrap(), data);
+            assert_eq!(zone_bytes(&data_path), Some(b"[ZoneTransfer]\r\nZoneId=4\r\n".to_vec()));
             gate.release.store(true, Ordering::Release);
             owner.command("Write-Output ('AFTER=' + $PID + ':cancel')");
             owner.wait_for(|out, _| pid_marker(out, "AFTER=", ":cancel").is_some());
@@ -933,6 +1151,7 @@ fn single_file_lost_commit_receipt_is_unknown_and_preserves_published_file() {
     let _primary = connections.recv_timeout(Duration::from_secs(10)).unwrap();
     let source = fixture.home.join("commit.bin");
     fs::write(&source, b"abc").unwrap();
+    fs::write(format!("{}:Zone.Identifier", source.display()), b"[ZoneTransfer]\r\nZoneId=4\r\n").unwrap();
     let controller = Command::new(controller_executable())
         .env("VSTERM_REMOTE_HOME", &fixture.home)
         .args(["send", "fixture", "commit", "--file", source.to_str().unwrap(), "--json"])
@@ -955,6 +1174,9 @@ fn single_file_lost_commit_receipt_is_unknown_and_preserves_published_file() {
     assert!(destination.starts_with(&fixture.home) && destination != source);
     assert_eq!(fs::read(&destination).unwrap(), b"abc");
     assert_eq!(fs::read(&source).unwrap(), b"abc");
+    assert_eq!(zone_bytes(&source), Some(b"[ZoneTransfer]\r\nZoneId=4\r\n".to_vec()));
+    assert_eq!(zone_bytes(&destination), None);
+    assert!(response["recipient_metadata"].is_null(), "lost receipt cannot confirm applied policy");
     assert!(owned_partials(&fixture.home).is_empty());
     gate.release.store(true, Ordering::Release);
     owner.detach();

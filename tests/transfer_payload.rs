@@ -84,7 +84,7 @@ fn cancellation_prevents_extraction_callback_and_no_false_directory_receipt_is_p
     let (mut other_manager, receipt) = fixture.payload();
     let not_a_directory = receipt.actual_path.clone();
     let result = transfer_payload::complete_payload(&mut other_manager, source, receipt,
-        &|| Ok(()), |_, _, _, _, admit| { admit(0)?; Ok(not_a_directory) });
+        &|| Ok(()), |_, _, _, _, admit| { admit(0, 0)?; Ok(not_a_directory) });
     assert!(result.is_err(), "a transferred ZIP is not a completed directory");
 }
 
@@ -106,6 +106,77 @@ fn metadata_is_exact_validated_and_roundtrips_without_extension_inference() {
         vec![("kind", s("directory"))],
     ] {
         assert!(SourceMetadata::from_wire(&map(vec![("source", map(fields))])).is_err());
+    }
+}
+
+#[test]
+fn folder_metadata_hook_failure_cancellation_and_collision_preserve_unrelated_marks() {
+    use arterm::{folder_archive, recipient_metadata};
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    for mode in ["success", "metadata_failure", "cancel", "collision"] {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let out = fixture.0.join("out");
+        let temp = fixture.0.join("temp");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir(&out).unwrap();
+        fs::create_dir(&temp).unwrap();
+        fs::write(source.join("nested").join("owned.txt"), b"fixture").unwrap();
+        let zip = folder_archive::pack_directory(&source, &temp, || Ok(())).unwrap();
+        let unrelated = out.join("keep.txt");
+        fs::write(&unrelated, b"untouched").unwrap();
+        fs::write(format!("{}:Zone.Identifier", unrelated.display()), b"keep mark").unwrap();
+        let destination = out.join("source");
+        if mode == "collision" {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("existing.txt"), b"existing").unwrap();
+            fs::write(format!("{}:Zone.Identifier", destination.join("existing.txt").display()), b"existing mark").unwrap();
+        }
+        let called = Cell::new(false);
+        let mut hook = |file: &fs::File| {
+            called.set(true);
+            let path = file_transfer::actual_path(file)?;
+            let ads = format!("{}:Zone.Identifier", path.display());
+            fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=4\r\n")?;
+            fs::write(format!("{}:unrelated", path.display()), b"keep stream")?;
+            if mode == "metadata_failure" {
+                let lock = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&ads)?;
+                let result = recipient_metadata::ensure_unblocked(file);
+                drop(lock);
+                result?;
+            } else {
+                recipient_metadata::ensure_unblocked(file)?;
+            }
+            assert_eq!(fs::read(&ads).unwrap_err().raw_os_error(), Some(2));
+            assert_eq!(fs::read(format!("{}:unrelated", path.display()))?, b"keep stream");
+            Ok(())
+        };
+        let result = folder_archive::extract_archive_with_metadata(zip.path(), &out, "source",
+            1024, || {
+                anyhow::ensure!(mode != "cancel" || !called.get(), "cancel after owned metadata");
+                Ok(())
+            }, &mut hook, |_| Ok(()));
+        assert_eq!(result.is_ok(), mode == "success");
+        assert!(called.get());
+        if mode == "success" {
+            let file = destination.join("nested").join("owned.txt");
+            assert_eq!(fs::read(&file).unwrap(), b"fixture");
+            assert_eq!(fs::read(format!("{}:Zone.Identifier", file.display())).unwrap_err().raw_os_error(), Some(2));
+            assert_eq!(fs::read(format!("{}:unrelated", file.display())).unwrap(), b"keep stream");
+        } else {
+            assert!(!destination.join("nested").exists());
+        }
+        assert_eq!(fs::read(format!("{}:Zone.Identifier", unrelated.display())).unwrap(), b"keep mark");
+        if mode == "collision" {
+            assert_eq!(fs::read(format!("{}:Zone.Identifier", destination.join("existing.txt").display())).unwrap(), b"existing mark");
+        } else if mode != "success" {
+            assert!(!destination.exists());
+        }
+        assert!(fs::read_dir(&out).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            name == "keep.txt" || name == "source"
+        }), "owned extraction stage was not cleaned");
     }
 }
 
@@ -151,7 +222,7 @@ fn expansion_budget_is_passed_to_extractor_and_admission_precedes_publication() 
         receipt, &|| Ok(()), |_, _, budget, check, admit| {
             assert_eq!(budget, 1, "compressed and prior extracted bytes must both count");
             check()?;
-            admit(2)?;
+            admit(2, 1)?;
             published.set(true);
             fs::create_dir(&expected)?;
             Ok(expected.clone())
@@ -168,7 +239,7 @@ fn uncertain_publication_keeps_quota_and_rejects_duplicate_extraction_before_cal
     let metadata = SourceMetadata { kind: SourceKind::Directory, original_basename: "reports".into() };
     let result = transfer_payload::complete_payload(&mut manager, metadata.clone(), receipt.clone(),
         &|| Ok(()), |_, _, _, _, admit| {
-            admit(7)?;
+            admit(7, 1)?;
             anyhow::bail!("publication outcome unknown")
         });
     assert!(format!("{:#}", result.err().unwrap()).contains("charge retained"));
@@ -222,7 +293,7 @@ fn successful_folder_publication_charges_actual_expansion_and_returns_only_folde
             fs::write(stage.join("data.bin"), b"12345678")?;
             let actual = fs::metadata(stage.join("data.bin"))?.len();
             check()?;
-            admit(actual)?;
+            admit(actual, 1)?;
             let target = parent.join(&metadata.original_basename);
             file_transfer::rename_no_replace(&handle, &target)?;
             drop(handle);

@@ -122,6 +122,11 @@ impl PayloadReceipt {
         ensure!(matches!((self.source.kind, self.extracted_bytes),
             (SourceKind::File, None) | (SourceKind::Directory, Some(_))),
             "receipt does not confirm the source kind's final publication");
+        let applied = self.payload.recipient_metadata.as_ref()
+            .context("receipt does not confirm recipient unblocking")?;
+        ensure!(self.source.kind == SourceKind::Directory || applied.files == 1,
+            "invalid recipient metadata file count");
+        ensure!(applied.zone_identifier_absent, "receipt does not confirm Zone.Identifier absence");
         Ok(())
     }
 }
@@ -200,16 +205,23 @@ pub fn prepare_directory(
 
 pub fn publish_directory<G>(
     source: &SourceMetadata, payload: &Receipt, budget: u64,
-    check: &dyn Fn() -> Result<()>, admit: &mut dyn FnMut(u64) -> Result<()>,
+    check: &dyn Fn() -> Result<()>, admit: &mut dyn FnMut(u64, u64) -> Result<()>,
     authorize: impl FnOnce() -> Result<G>,
 ) -> Result<PathBuf> {
-    let published = crate::folder_archive::extract_archive_with_limit(
+    let files = std::cell::Cell::new(0);
+    let mut metadata = |file: &std::fs::File| {
+        check()?;
+        crate::recipient_metadata::ensure_unblocked(file)?;
+        files.set(files.get() + 1);
+        check()
+    };
+    let published = crate::folder_archive::extract_archive_with_metadata(
         &payload.actual_path,
         payload.actual_path.parent().context("payload has no parent")?,
-        &source.original_basename, budget, check,
+        &source.original_basename, budget, check, &mut metadata,
         |summary| {
             let guard = authorize()?;
-            admit(summary.uncompressed_bytes)?;
+            admit(summary.uncompressed_bytes, files.get())?;
             Ok(guard)
         },
     )?;
@@ -227,7 +239,7 @@ pub fn archive_unavailable(_: &PinnedSource, _: &dyn Fn() -> Result<()>) -> Resu
 }
 pub fn extraction_unavailable(
     _: &SourceMetadata, _: &Receipt, _: u64, _: &dyn Fn() -> Result<()>,
-    _: &mut dyn FnMut(u64) -> Result<()>,
+    _: &mut dyn FnMut(u64, u64) -> Result<()>,
 ) -> Result<PathBuf> {
     bail!("directory extraction adapter is not installed")
 }
@@ -238,7 +250,7 @@ pub fn extraction_unavailable(
 /// It must preserve empty/nested directories and never infer kind from `.zip`.
 /// The callback runs without a global/session lock; acquire that guard only for
 /// its final rename. Until it succeeds, the payload receipt is not completion.
-/// Stream under the supplied expansion limit; invoke `admit(actual_bytes)` under
+/// Stream under the supplied expansion limit; invoke `admit(actual_bytes, files)` under
 /// the final guard BEFORE rename. Once admitted, quota remains charged even on
 /// uncertainty. Never publish first and attempt quota admission afterward.
 pub fn complete_payload(
@@ -248,12 +260,13 @@ pub fn complete_payload(
     check: &dyn Fn() -> Result<()>,
     publish_directory: impl FnOnce(
         &SourceMetadata, &Receipt, u64, &dyn Fn() -> Result<()>,
-        &mut dyn FnMut(u64) -> Result<()>,
+        &mut dyn FnMut(u64, u64) -> Result<()>,
     ) -> Result<PathBuf>,
 ) -> Result<PayloadReceipt> {
     source.validate()?;
     check()?;
     let mut extracted_bytes = None;
+    let published_files = std::cell::Cell::new(None);
     if source.kind == SourceKind::Directory {
         let budget = manager.extraction_budget(payload.transfer_id)?;
         let expected = source.completion_path(&payload.actual_path)?;
@@ -278,9 +291,10 @@ pub fn complete_payload(
         ensure!(actual == payload.sha256, "directory payload SHA-256 changed before extraction");
         check()?;
         let publication = {
-            let mut admit = |actual_bytes| {
+            let mut admit = |actual_bytes, files| {
                 manager.reserve_extracted_bytes(payload.transfer_id, actual_bytes)?;
                 extracted_bytes = Some(actual_bytes);
+                published_files.set(Some(files));
                 Ok(())
             };
             publish_directory(&source, &payload, budget, check, &mut admit)
@@ -296,7 +310,11 @@ pub fn complete_payload(
         ensure!(directory.is_directory() && directory.path() == expected,
             "directory publication returned the wrong destination; outcome may be unknown");
         payload.actual_path = directory.path().to_owned();
+        payload.recipient_metadata.as_mut().context("missing receiver metadata")?.files =
+            published_files.get().context("missing recipient file count")?;
         drop(archive);
     }
-    Ok(PayloadReceipt { payload, source, extracted_bytes })
+    let receipt = PayloadReceipt { payload, source, extracted_bytes };
+    receipt.validate_completion()?;
+    Ok(receipt)
 }

@@ -352,10 +352,35 @@ No manual ZIP step is needed for directories.
 An explicitly supplied ZIP file remains a regular file and is never extracted
 based on its extension.
 
+**Automatic receiver-side unblocking:** every received regular file is
+unblocked on the **host destination for send** or the **client destination for
+receive**, without an option. This has Windows `Unblock-File` semantics: remove
+exactly `Zone.Identifier` if present and verify its absence. Byte/ZIP transport
+normally drops source ADS already; an absent mark is a valid already-unblocked
+result, not an error. arTerm does not add an artificial mark first or read,
+parse, or transport source-zone provenance.
+
+The check/removal runs only on new owned staging files with identity pins
+retained, before publication. For folders it also runs on every newly extracted
+regular file before the atomic directory rename, not just the transport ZIP.
+It never recursively unblocks an existing directory, changes a source mark, or
+removes unrelated streams. Source ADS, URLs and ACLs are not preserved.
+
+Automatic unblocking is **not a malware scan or safety verdict** and does not
+make files benign or execute them. It does not release open-file locks or
+change execution policy, antivirus, certificate trust, or permissions. Review
+received content before opening or running it; signing and matching SHA-256
+do not prove it benign.
+
 The destination is a unique per-session/per-transfer directory under the
 receiving endpoint's TEMP directory. The result reports its actual absolute
 path, source, transfer ID, byte count, SHA-256 and completion status; `--json`
 preserves structured fields and keeps transfer IDs separate from command IDs.
+Human and JSON results include `recipient_metadata`:
+`zone_identifier_absent: true` and the number of regular `files` checked.
+An empty folder reports zero. Metadata errors prevent final publication and
+completion; unknown outcomes never claim confirmed unblocking.
+Unblocking does not change main-stream bytes or their hash.
 Existing files are never replaced. Publication is an atomic no-replace rename
 after size and SHA-256 validation. Traversal, ADS, reserved device names and
 reparse-point paths are rejected.
@@ -370,9 +395,12 @@ unresponsive filesystem.
 
 File control uses the existing strict same-build signed local IPC and a separate
 remote capability, bound to the session secret and current client/attachment/
-lease/epoch. Both `file-transfer-v1` and `transfer-source-metadata-v1` are required.
+lease/epoch. `file-transfer-v1`, `transfer-source-metadata-v1`, and
+`recipient-unblock-v1` are all required and negotiated before staging.
 The immutable metadata contains `kind` (`file` or `directory`) and
-`original_basename`, and is checked in admission and receipts. Directory
+`original_basename`, and is checked in admission and receipts. The receiver
+always unblocks; completion receipts must confirm `Zone.Identifier` absence.
+Directory
 preparation additionally requires `directory-transfer-zip-v1`, advertised only
 with the installed archive adapter. Old hosts
 fail explicitly before local staging publication. Busy commands do not block file control. Caller exit or connection

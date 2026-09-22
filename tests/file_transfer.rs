@@ -1,5 +1,7 @@
 #[path = "../src/file_transfer.rs"]
 mod file_transfer;
+#[path = "../src/recipient_metadata.rs"]
+mod recipient_metadata;
 
 use file_transfer::*;
 use sha2::{Digest, Sha256};
@@ -57,6 +59,54 @@ fn destination_spelling_is_stable_for_an_equivalent_root_alias() {
     let completed = manager.finish(upload.transfer_id, hash(b"")).unwrap();
     assert_eq!(upload.actual_path, completed.actual_path);
     assert_eq!(fs::read(completed.actual_path).unwrap(), b"");
+}
+
+#[test]
+fn marked_staging_is_unblocked_before_commit_and_metadata_failure_never_publishes() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_DELETE};
+    for locked in [false, true] {
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager(Limits::default());
+        let upload = manager.begin_upload("owned.txt", 3).unwrap();
+        manager.write_chunk(upload.transfer_id, 0, b"abc").unwrap();
+        let partial = upload.actual_path.parent().unwrap().join(".arterm-partial");
+        let ads = format!("{}:Zone.Identifier", partial.display());
+        fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=4\r\n").unwrap();
+        let unrelated = fixture.0.join("unrelated.txt");
+        fs::write(&unrelated, b"keep").unwrap();
+        fs::write(format!("{}:Zone.Identifier", unrelated.display()), b"unrelated zone").unwrap();
+        let lock = locked.then(|| OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE).open(&ads).unwrap());
+        let authorized = std::cell::Cell::new(false);
+        let result = manager.finish_guarded(upload.transfer_id, hash(b"abc"), || {
+            authorized.set(true);
+            assert_eq!(fs::read(&ads).unwrap_err().raw_os_error(), Some(2));
+            Ok(())
+        });
+        if locked {
+            assert!(format!("{:#}", result.unwrap_err()).contains("recipient metadata unblocking failed"));
+            assert!(!authorized.get(), "metadata must precede commit guard");
+            assert!(!upload.actual_path.exists());
+            assert!(manager.status(upload.transfer_id).unwrap().receipt.is_none());
+        } else {
+            let receipt = result.unwrap();
+            assert!(authorized.get());
+            assert!(receipt.recipient_metadata.unwrap().zone_identifier_absent);
+            assert_eq!(fs::read(&upload.actual_path).unwrap(), b"abc");
+        }
+        assert_eq!(fs::read(format!("{}:Zone.Identifier", unrelated.display())).unwrap(), b"unrelated zone");
+        drop(lock);
+        manager.cancel(upload.transfer_id).unwrap();
+        assert!(!partial.exists());
+
+        let upload = manager.begin_upload("success.txt", 0).unwrap();
+        let first = manager.finish(upload.transfer_id, hash(b"")).unwrap();
+        assert!(first.recipient_metadata.as_ref().unwrap().zone_identifier_absent);
+        assert_eq!(manager.finish(upload.transfer_id, hash(b"")).unwrap(), first);
+        assert_eq!(manager.cancel(upload.transfer_id).unwrap().receipt, Some(first.clone()));
+        assert!(first.actual_path.exists());
+    }
 }
 
 #[test]

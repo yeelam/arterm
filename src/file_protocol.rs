@@ -4,6 +4,7 @@ use arterm::{
         pin_source, AuthorizedSession, Limits, TransferManager, TransferState, MAX_CHUNK_BYTES,
     },
     local_control::Operation,
+    recipient_metadata,
     store::State,
     transfer_admission::{Ticket, CAPABILITY},
     transfer_payload::{self, PayloadReceipt, PayloadStatus},
@@ -337,7 +338,7 @@ pub fn transfer(
             (
                 "capabilities",
                 Value::Array(
-                    [CAPABILITY, transfer_payload::METADATA_CAPABILITY]
+                    [CAPABILITY, transfer_payload::METADATA_CAPABILITY, recipient_metadata::CAPABILITY]
                         .into_iter()
                         .chain(
                             transfer_payload::DIRECTORY_ADAPTER_INSTALLED
@@ -363,7 +364,7 @@ pub fn transfer(
     let capabilities = get(body, "capabilities")?
         .as_array()
         .context("invalid capabilities")?;
-    for capability in [CAPABILITY, transfer_payload::METADATA_CAPABILITY] {
+    for capability in [CAPABILITY, transfer_payload::METADATA_CAPABILITY, recipient_metadata::CAPABILITY] {
         ensure!(
             capabilities.iter().any(|v| v.as_str() == Some(capability)),
             "host does not support {capability}"
@@ -574,6 +575,7 @@ pub fn transfer(
                 ensure!(
                     receipt.source == metadata
                         && receipt.extracted_bytes.is_none()
+                        && receipt.payload.recipient_metadata.is_none()
                         && receipt.payload.session_id == state.id
                         && receipt.payload.transfer_id == status.transfer_id
                         && receipt.payload.bytes == status.expected_bytes,
@@ -621,15 +623,18 @@ pub fn transfer(
             "source":source, "actual_path":receipt.actual_path, "bytes":receipt.bytes,
             "source_kind":metadata.kind, "original_basename":metadata.original_basename,
             "extracted_bytes":extracted_bytes,
+            "recipient_metadata":receipt.recipient_metadata,
             "sha256":receipt.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         })),
-        Err(error) => {
+        Err(mut error) => {
             if let Some(id) = local_id {
                 if matches!(
                     manager.status(id)?.state,
                     TransferState::Uploading | TransferState::Downloading
                 ) {
-                    manager.cancel(id).context("local partial cleanup failed")?;
+                    if let Err(cleanup) = manager.cancel(id) {
+                        error = error.context(format!("local partial cleanup also failed: {cleanup:#}"));
+                    }
                 }
             }
             Ok(serde_json::json!({

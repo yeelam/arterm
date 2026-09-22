@@ -24,6 +24,8 @@ organizational network policy.
 - **Files and folders:** send or receive either through the existing connected
   session, with SHA-256 verification and unique TEMP destinations. Directories
   are automatically packed, transferred, and extracted; ordinary ZIP files stay files.
+  Received files are automatically unblocked on the receiving endpoint,
+  including newly extracted folder files. Sources are unchanged.
   **Development release gate:** independent archive review remains blocked;
   this integration is not release-qualified.
 
@@ -156,6 +158,28 @@ arterm list --server my-devbox
 arterm send my-devbox MyWork --command 'Get-Location' --wait --timeout 60s
 arterm read my-devbox MyWork --lines 20
 ```
+
+File transfers use the same active owner:
+
+```powershell
+arterm send my-devbox MyWork --file C:\work\report.txt
+arterm receive my-devbox MyWork --file C:\work\results --json
+```
+
+All received files are **automatically unblocked** at the **host** for send and
+the **client** for receive, including every newly extracted regular folder file.
+Before publication, arTerm removes exactly `Zone.Identifier` if present and
+verifies it is absent; an already absent stream is valid. Source files and
+their marks are unchanged. No option is required. Both endpoints must support
+`recipient-unblock-v1`; older peers fail explicitly rather than falsely
+confirm unblocking.
+
+This removes Mark-of-the-Web; it does **not** scan for malware, make files
+benign, execute them, release open-file locks, or change execution policy,
+antivirus, or certificate trust. Review files before opening or running them;
+a signature or matching hash does not prove benign content. Byte/ZIP transport
+does not preserve source ADS, URLs or ACLs. See [transfer details](QUICKSTART.md#automation) for publication,
+receipts, limits, and unknown-outcome handling.
 
 `connect` is a normal running native process. Your caller, Copilot, or OS owns
 backgrounding; arTerm has no `--background`, `start`, or `resume` command.

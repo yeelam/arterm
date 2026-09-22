@@ -89,10 +89,15 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         ("Bytes", &response["bytes"]),
         ("Extracted bytes", &response["extracted_bytes"]),
         ("SHA-256", &response["sha256"]),
+        ("Recipient Zone.Identifier absent", &response["recipient_metadata"]["zone_identifier_absent"]),
+        ("Recipient files", &response["recipient_metadata"]["files"]),
     ] {
         if !value.is_null() {
             output.push_str(&format!("\n{label}: {}", text(value)));
         }
+    }
+    if response["recipient_metadata"]["zone_identifier_absent"] == true {
+        output.push_str("\nMark-of-the-Web absent on recipient files; this is not a malware scan or safety verdict.");
     }
     if exit_code(response) != 0 && !response["shell_status"].is_null() {
         output.push_str(&format!("\n{}", readiness(response)));
@@ -219,6 +224,21 @@ pub fn server(inventory: &Value, json: bool) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn recipient_unblocking_is_reported_without_a_safety_verdict() {
+        for files in [0, 1, 6] {
+            let response = json!({"status":"completed", "transfer_id":"owned",
+                "recipient_metadata":{"zone_identifier_absent":true,"files":files}});
+            let human = result(&response, "fixture", "session", false).unwrap();
+            assert!(human.contains("Recipient Zone.Identifier absent: yes"));
+            assert!(human.contains(&format!("Recipient files: {files}")));
+            assert!(human.contains("not a") && human.contains("safety verdict"));
+            assert_eq!(human.matches("safety verdict").count(), 1);
+            assert!(!human.contains("FileIsSafe"));
+            assert_eq!(serde_json::from_str::<Value>(&result(&response, "fixture", "session", true).unwrap()).unwrap(), response);
+        }
+    }
 
     #[test]
     fn folder_results_keep_json_schema_and_distinguish_human_completion() {

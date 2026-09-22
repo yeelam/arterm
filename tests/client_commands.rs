@@ -89,6 +89,7 @@ fn help_version_and_validation_do_not_require_setup() {
     assert!(run(&home, &["--help"]).status.success());
     let help = String::from_utf8(run(&home, &["--help"]).stdout).unwrap();
     assert!(help.contains("--file") && help.contains("arterm receive"));
+    assert!(!help.contains("--unblock") && help.contains("automatically unblocked") && help.contains("not a malware scan"));
     assert!(run(&home, &["--version"]).status.success());
     assert!(!run(
         &home,
@@ -119,6 +120,32 @@ fn help_version_and_validation_do_not_require_setup() {
     }
 
     assert!(!home.exists(), "invalid CLI must not create local state");
+}
+
+#[test]
+fn removed_unblock_option_is_rejected_before_configuration_or_side_effects() {
+    let home = std::env::temp_dir().join(format!("arterm-unblock-cli-{}", Uuid::now_v7()));
+    for args in [
+        vec!["send", "work", "session", "--file", r"C:\owned.txt", "--unblock"],
+        vec!["receive", "work", "session", "--file", r"C:\owned.txt", "--unblock"],
+        vec!["send", "work", "session", "--command", "echo should-not-run", "--unblock"],
+        vec!["send", "work", "session", "--unblock"],
+        vec!["receive", "work", "session", "--unblock"],
+        vec!["read", "work", "session", "--unblock"],
+        vec!["detach", "work", "session", "--unblock"],
+        vec!["connect", "work", "session", "--unblock"],
+        vec!["send", "work", "session", "--file", r"C:\owned.txt", "--unblock", "--wait"],
+        vec!["send", "work", "session", "--file", r"C:\owned.txt", "--unblock", "--timeout", "1s"],
+        vec!["send", "work", "session", "--file", r"C:\owned.txt", "--unblock", "--unblock"],
+        vec!["receive", "work", "session", "--file", r"C:\owned.txt", "--unblock", "--command", "echo no"],
+    ] {
+        let result = run(&home, &args);
+        assert!(!result.status.success(), "{args:?}");
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("--unblock") || error.contains("--file") || error.contains("--command"),
+            "{args:?}: {error}");
+        assert!(!home.exists(), "invalid CLI invocation created local state");
+    }
 }
 
 #[test]

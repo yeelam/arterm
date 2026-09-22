@@ -34,6 +34,7 @@ use windows_sys::Win32::{
 use crate::host_pipe;
 use arterm::{
     deployment, store,
+    recipient_metadata,
     file_transfer::{AuthorizedSession, Limits, TransferManager, TransferState, MAX_CHUNK_BYTES},
     transfer_payload::{self, PayloadReceipt, PayloadStatus, PreparedSource, SourceMetadata},
     shell_integration::{Commands, CAPABILITY as COMMAND_CAPABILITY},
@@ -56,6 +57,7 @@ const CAPS: &[&str] = &[
     "session-termination-confirmed",
     arterm::transfer_admission::CAPABILITY,
     transfer_payload::METADATA_CAPABILITY,
+    recipient_metadata::CAPABILITY,
 ];
 const MAX_SESSIONS: usize = 16;
 const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
@@ -913,7 +915,7 @@ impl Broker {
         let mut attached: Option<(Arc<Session>, Vec<u8>, u64)> = None;
         let result = (|| -> Result<()> {
         let file_caps = get(hello_body, "capabilities")?.as_array().context("invalid capabilities")?;
-        let file_capable = [arterm::transfer_admission::CAPABILITY, transfer_payload::METADATA_CAPABILITY]
+        let file_capable = [arterm::transfer_admission::CAPABILITY, transfer_payload::METADATA_CAPABILITY, recipient_metadata::CAPABILITY]
             .iter().all(|cap| file_caps.iter().any(|v| v.as_str() == Some(cap)));
         let mut file_bridge: Option<FileBridge> = None;
         let mut cursor = 0u64;
