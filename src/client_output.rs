@@ -45,6 +45,7 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
             "Folder transfer completed.",
         Some("completed") if response["transfer_id"].is_string() => "File transfer completed.",
         Some("accepted") => "Command accepted; completion not yet confirmed.",
+        Some("not_submitted") => "Command was not submitted; the shell declined or did not accept the original source.",
         Some("completed") if response["record"]["succeeded"] == true => {
             "Command completed successfully."
         }

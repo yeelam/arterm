@@ -4,10 +4,11 @@
 //! Only ordinary PowerShell interactive startup (-NoLogo/-NoProfile) is supported.
 //! The adapter reserves __arTerm globals and wraps the existing profile prompt.
 //! LASTEXITCODE is temporarily cleared to distinguish this invocation's native
-//! status, and restored if no new native status is observed. Replacing prompt or
-//! entering nested input stops managed readiness; there is no prompt-text fallback.
-//! Raw typeahead remains usable. Managed readiness requires observed line
-//! submissions to reach prompt boundaries and no partial input to remain.
+//! status, and restored if no new native status is observed. Replacing prompt
+//! stops managed readiness; there is no prompt-text fallback.
+//! A private mailbox supplies data to PSReadLine, which returns the original
+//! source to the existing shell. Foreground application input is not counted as
+//! submitted shell lines. The hook checks the real editor buffer before insertion.
 //! Focus notifications are non-editing. Their mode may be enabled by the local
 //! parent terminal, outside the remote output stream. Other unknown replies stay guarded.
 //! Records are never evicted within a live session: admission stops at the cap
@@ -38,6 +39,7 @@ pub struct Commands {
     pending_marker: Vec<u8>,
     ready: bool,
     initialized: bool,
+    unsupported: bool,
     human_dirty: bool,
     waiting_prompt: bool,
     human_pending: u64,
@@ -47,6 +49,9 @@ pub struct Commands {
     last_input: InputSummary,
     marker_count: u64,
     active: Option<Uuid>,
+    pending_command: Option<(String, std::time::Instant)>,
+    start_confirmation: Option<(Uuid, std::time::Instant)>,
+    late_confirmation: Option<Uuid>,
     records: BTreeMap<Uuid, Record>,
     pub revision: u64,
 }
@@ -83,6 +88,14 @@ fn base64(bytes: &[u8]) -> String {
     result
 }
 
+fn history_setup(history: Option<&std::path::Path>) -> Result<String> {
+    if let Some(path) = history {
+        let text = path.to_str().ok_or_else(|| anyhow::anyhow!("ShellHistoryPathInvalid"))?;
+        ensure!(path.is_absolute() && !text.contains('\0'), "ShellHistoryPathMustBeAbsolute");
+        Ok(format!("Set-PSReadLineOption -HistorySavePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))) -ErrorAction Stop", base64(text.as_bytes())))
+    } else { Ok(String::new()) }
+}
+
 impl Commands {
     pub fn new() -> Self {
         Self {
@@ -90,6 +103,7 @@ impl Commands {
             pending_marker: Vec::new(),
             ready: false,
             initialized: false,
+            unsupported: false,
             human_dirty: false,
             waiting_prompt: false,
             human_pending: 0,
@@ -99,6 +113,9 @@ impl Commands {
             last_input: InputSummary::default(),
             marker_count: 0,
             active: None,
+            pending_command: None,
+            start_confirmation: None,
+            late_confirmation: None,
             records: BTreeMap::new(),
             revision: 0,
         }
@@ -116,13 +133,81 @@ impl Commands {
             .iter()
             .all(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-nologo" | "-noprofile"))
     }
-    pub fn bootstrap_encoded(&self) -> String {
+    pub fn bootstrap_mailbox(&self, pipe: &str, host_started: u64) -> String {
+        self.bootstrap_mailbox_with_history(pipe, host_started, None).expect("no history override")
+    }
+    pub fn bootstrap_history(history: &std::path::Path) -> Result<String> {
+        let script = format!("Import-Module PSReadLine -ErrorAction Stop\n{}", history_setup(Some(history))?);
+        Ok(base64(&script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()))
+    }
+    pub fn bootstrap_mailbox_with_history(&self, pipe: &str, host_started: u64,
+        history: Option<&std::path::Path>) -> Result<String> {
+        let history_setup = history_setup(history)?;
         // The prompt runs after PowerShell has formatted the preceding pipeline.
         // Preserve a profile-defined prompt, but reserve these adapter globals.
         let script = r#"
+$global:__arTermDisabled=$true
+try {
+Import-Module PSReadLine -ErrorAction Stop
+HISTORY_SETUP
+if (-not (Get-Command PSConsoleHostReadLine -ErrorAction SilentlyContinue)) { throw 'ShellIntegrationUnsupported' }
+$methods=[Microsoft.PowerShell.PSConsoleReadLine].GetMethods().Name
+foreach ($required in 'GetBufferState','Insert','AcceptLine') {
+    if ($methods -notcontains $required) { throw 'ShellIntegrationUnsupported' }
+}
+Add-Type -TypeDefinition @'
+using System;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Text;
+public static class ArTermShellMailbox {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetNamedPipeServerProcessId(IntPtr h, out uint pid);
+    public static string Exchange(string name, int host, long started, string request) {
+        using (var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous)) {
+            pipe.Connect(1000);
+            uint pid;
+            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out pid) || pid != host)
+                throw new InvalidOperationException("ShellMailboxHostRejected");
+            using (var process = Process.GetProcessById(host)) {
+                if (process.StartTime.ToUniversalTime().ToFileTimeUtc() != started)
+                    throw new InvalidOperationException("ShellMailboxHostChanged");
+            }
+            byte[] bytes = Encoding.ASCII.GetBytes(request + "\n");
+            var write = pipe.WriteAsync(bytes, 0, bytes.Length);
+            if (!write.Wait(2000)) throw new TimeoutException("ShellMailboxWriteTimeout");
+            var result = new StringBuilder();
+            var buffer = new byte[1024];
+            var timer = Stopwatch.StartNew();
+            while (result.Length <= 24576 && timer.ElapsedMilliseconds < 2000) {
+                var read = pipe.ReadAsync(buffer, 0, buffer.Length);
+                if (!read.Wait(2000)) throw new TimeoutException("ShellMailboxReadTimeout");
+                if (read.Result == 0) throw new InvalidOperationException("ShellMailboxClosed");
+                result.Append(Encoding.ASCII.GetString(buffer, 0, read.Result));
+                if (result[result.Length - 1] == '\n') {
+                    pipe.WriteByte(10);
+                    return result.ToString().TrimEnd('\n');
+                }
+            }
+            throw new InvalidOperationException("ShellMailboxResponseLimit");
+        }
+    }
+}
+'@ -ErrorAction Stop
+function global:__arTermExchange([string]$request) {
+    [ArTermShellMailbox]::Exchange('MAILBOX', HOSTPID, HOSTSTART, $request)
+}
 $global:__arTermOriginalPrompt = (Get-Item Function:\prompt).ScriptBlock
 $global:__arTermCommand = $null
+$global:__arTermHistoryOverride=$false
 function global:prompt {
+    $global:__arTermSuccess = $?
+    if ($global:__arTermDisabled) { return (& $global:__arTermOriginalPrompt) }
+    if ($global:__arTermHistoryOverride) {
+        Set-PSReadLineOption -AddToHistoryHandler $global:__arTermOriginalHistory
+        $global:__arTermHistoryOverride=$false
+    }
     if ($null -ne $global:__arTermCommand) {
         $global:__arTermSuccess = $global:__arTermSuccess -and [Object]::ReferenceEquals($global:__arTermError, $global:Error[0])
         $global:__arTermNative = $global:LASTEXITCODE
@@ -135,16 +220,71 @@ function global:prompt {
     [Console]::Write(([string][char]27 + ']633;arterm;NONCE;ready' + [char]7))
     $global:__arTermPromptText
 }
-"#.replace("NONCE", &self.nonce);
-        base64(
+Set-PSReadLineKeyHandler -Chord F24 -ScriptBlock {
+    $line=$null; $cursor=0
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line,[ref]$cursor)
+    try {
+        $offer=__arTermExchange 'offer'
+        if ($offer -eq '-') { return }
+        $parts=$offer.Split(';',2)
+        if ($parts.Length -ne 2) { throw 'ShellMailboxInvalid' }
+        $id=$parts[0]
+        if ($line.Length -ne 0) { $null=__arTermExchange ('partial;'+$id); return }
+        $source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+        $tokens=$null; $errors=$null
+        $null=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+        if ($errors.Count -ne 0) {
+            $null=__arTermExchange ('syntax;'+$id)
+            [Console]::WriteLine('arTerm: CommandSyntaxInvalid')
+            return
+        }
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line,[ref]$cursor)
+        if ($line.Length -ne 0) { $null=__arTermExchange ('partial;'+$id); return }
+        if ((__arTermExchange ('commit;'+$id)) -ne 'committed') { return }
+        $global:__arTermError=$global:Error[0]
+        $global:__arTermPreviousNative=$global:LASTEXITCODE
+        $global:LASTEXITCODE=$null
+        $global:__arTermOriginalHistory=(Get-PSReadLineOption).AddToHistoryHandler
+        $global:__arTermHistoryOverride=$true
+        Set-PSReadLineOption -AddToHistoryHandler {
+            param($line)
+            Set-PSReadLineOption -AddToHistoryHandler $global:__arTermOriginalHistory
+            $global:__arTermHistoryOverride=$false
+            return $false
+        } -ErrorAction Stop
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert($source)
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+        $global:__arTermCommand=$id
+        $null=__arTermExchange ('started;'+$id)
+    } catch {
+        if ($global:__arTermHistoryOverride) {
+            Set-PSReadLineOption -AddToHistoryHandler $global:__arTermOriginalHistory
+            $global:__arTermHistoryOverride=$false
+        }
+        [Console]::WriteLine('arTerm: ShellMailboxUnavailable; command outcome may be unknown')
+    }
+} -ErrorAction Stop
+$global:__arTermDisabled=$false
+} catch {
+    [Console]::WriteLine('arTerm: ShellIntegrationUnsupported')
+    [Console]::Write(([string][char]27 + ']633;arterm;NONCE;unsupported' + [char]7))
+}
+"#.replace("NONCE", &self.nonce)
+    .replace("MAILBOX", pipe)
+    .replace("HOSTPID", &std::process::id().to_string())
+    .replace("HOSTSTART", &host_started.to_string())
+    .replace("HISTORY_SETUP", &history_setup);
+        Ok(base64(
             &script
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
-        )
+        ))
     }
     pub fn shell_status(&self) -> &'static str {
-        if self.active.is_some() {
+        if self.unsupported {
+            "unsupported"
+        } else if self.active.is_some() {
             "busy"
         } else if self.ready {
             "ready"
@@ -162,12 +302,14 @@ function global:prompt {
         self.initialized
     }
     pub fn readiness_reason(&self) -> &'static str {
-        if !self.initialized { "initializing" }
+        if self.unsupported { "integration_disabled" }
+        else if !self.initialized { "initializing" }
         else if self.active.is_some() { "managed_command" }
         else if !self.input_sequence.is_empty() { "partial_input_sequence" }
         else if self.human_dirty && self.unclassified_input { "unclassified_terminal_input" }
         else if self.human_dirty { "partial_human_input" }
         else if self.human_pending > 0 { "human_command_pending" }
+        else if !self.ready && self.late_confirmation.is_some() { "command_outcome_unknown" }
         else { "ready" }
     }
     pub fn records(&self) -> Vec<Record> {
@@ -203,16 +345,8 @@ function global:prompt {
         ensure!(self.ready && self.active.is_none(), "CommandBusy");
         // Never evict deduplication identities then accidentally execute them again.
         ensure!(self.records.len() < MAX_RECORDS, "CommandHistoryFull");
-        let script = format!(
-            "$global:__arTermCommand='{id}';$global:__arTermSuccess=$false;$global:__arTermError=$global:Error[0];\
-             $global:__arTermPreviousNative=$global:LASTEXITCODE;$global:LASTEXITCODE=$null;\
-             [Console]::Write(([string][char]27+']633;arterm;{};started;{id}'+[char]7));\
-             . ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))));\
-             $global:__arTermSuccess=$?",
-            self.nonce, base64(command.as_bytes()));
-        let line = format!(
-            ". ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))))\r",
-            base64(script.as_bytes()));
+        self.pending_command = Some((base64(command.as_bytes()), std::time::Instant::now()));
+        self.late_confirmation = None;
         let record = Record {
             command_id: id,
             request_hash: hash,
@@ -225,10 +359,81 @@ function global:prompt {
         self.active = Some(id);
         self.ready = false;
         self.revision += 1;
-        Ok((record, Some(line.into_bytes())))
+        Ok((record, Some(b"\x1b[135;0;0;1;0;1_\x1b[135;0;0;0;0;1_".to_vec())))
+    }
+    pub fn mailbox_exchange(&mut self, request: &str) -> Result<String> {
+        self.expire_pending();
+        if let Some(requested) = request.strip_prefix("started;") {
+            let id = Uuid::parse_str(requested)?;
+            ensure!(self.confirm_started(id), "ShellMailboxCommandChanged");
+            return Ok("started".into());
+        }
+        let Some(id) = self.active else { return Ok("-".into()); };
+        if request == "offer" {
+            return Ok(self.pending_command.as_ref().map_or("-".into(), |(payload, _)| format!("{id};{payload}")));
+        }
+        let Some((operation, requested)) = request.split_once(';') else { anyhow::bail!("ShellMailboxRequestInvalid"); };
+        ensure!(requested == id.to_string() && self.records[&id].state == "accepted"
+            && self.pending_command.is_some(), "ShellMailboxCommandChanged");
+        match operation {
+            "commit" => {
+                self.pending_command = None;
+                self.records.get_mut(&id).unwrap().state = "committed".into();
+                self.start_confirmation = Some((id, std::time::Instant::now()));
+                self.revision += 1;
+                Ok("committed".into())
+            }
+            "partial" | "syntax" => {
+                self.pending_command = None;
+                let record = self.records.get_mut(&id).unwrap();
+                record.state = "not_submitted".into();
+                self.active = None;
+                self.human_dirty = operation == "partial";
+                self.ready = !self.human_dirty;
+                self.revision += 1;
+                Ok("rejected".into())
+            }
+            _ => anyhow::bail!("ShellMailboxRequestInvalid"),
+        }
+    }
+    pub fn expire_pending(&mut self) {
+        if self.start_confirmation.is_some_and(|(_, since)| since.elapsed() >= std::time::Duration::from_secs(5)) {
+            let (id, _) = self.start_confirmation.take().unwrap();
+            self.records.get_mut(&id).unwrap().state = "unknown".into();
+            self.late_confirmation = Some(id);
+            self.active = None;
+            self.ready = false;
+            self.revision += 1;
+        }
+        if self.pending_command.as_ref().is_some_and(|(_, since)| since.elapsed() >= std::time::Duration::from_secs(5)) {
+            self.pending_command = None;
+            if let Some(id) = self.active.take() {
+                self.records.get_mut(&id).unwrap().state = "not_submitted".into();
+            }
+            // No cooperating hook proved an empty editor. Do not claim readiness.
+            self.unsupported = true;
+            self.ready = false;
+            self.revision += 1;
+        }
+    }
+    fn confirm_started(&mut self, id: Uuid) -> bool {
+        let eligible = self.active == Some(id) && self.records[&id].state == "committed"
+            || self.active.is_none() && self.late_confirmation == Some(id)
+                && self.records.get(&id).is_some_and(|record| record.state == "unknown");
+        if eligible {
+            self.records.get_mut(&id).unwrap().state = "running".into();
+            self.active = Some(id);
+            self.ready = false;
+            self.start_confirmation = None;
+            self.late_confirmation = None;
+            self.revision += 1;
+        }
+        eligible
     }
     pub fn submission_failed(&mut self, id: Uuid) {
         if self.active == Some(id) {
+            self.pending_command = None;
+            self.start_confirmation = None;
             if let Some(record) = self.records.get_mut(&id) {
                 record.state = "unknown".into();
             }
@@ -268,7 +473,8 @@ function global:prompt {
                         summary.editing = true;
                     }
                 }
-                if fields[3] == 1 && !modifier { keys.push((fields[2], fields[5])); }
+                let private_hook = fields[0] == 135 && fields[2] == 0;
+                if fields[3] == 1 && !modifier && !private_hook { keys.push((fields[2], fields[5])); }
                 // Key-up still reaches ConPTY unchanged; it does not edit a shell line.
                 pending.clear();
             } else {
@@ -281,7 +487,17 @@ function global:prompt {
         self.last_input = summary;
         if !keys.is_empty() || !pending.is_empty() {
             ensure!(self.initialized, "IntegrationNotEstablished");
-            ensure!(self.active.is_none(), "CommandBusy");
+            ensure!(self.active.is_none()
+                || self.active.is_some_and(|id| matches!(self.records[&id].state.as_str(),
+                    "committed" | "running" | "finishing")), "CommandBusy");
+        }
+        if self.active.is_some_and(|id| matches!(self.records[&id].state.as_str(), "committed" | "running"))
+            || self.active.is_none() && self.late_confirmation.is_some() && !self.ready {
+            // Foreground input belongs to the running application, not to the
+            // PSReadLine editor. The next mailbox hook checks the actual buffer.
+            self.input_sequence = pending;
+            self.revision += 1;
+            return Ok(());
         }
         self.input_sequence = pending;
         self.unclassified_input = unclassified;
@@ -333,21 +549,28 @@ function global:prompt {
         };
         let fields = body.split(';').collect::<Vec<_>>();
         match fields.as_slice() {
+            ["unsupported"] => {
+                self.unsupported = true;
+                self.initialized = false;
+                self.ready = false;
+                self.revision += 1;
+            }
             ["ready"]
-                if self.active.is_none()
+                if !self.unsupported && (self.active.is_none()
                     || self
                         .active
-                        .is_some_and(|id| self.records[&id].state == "finishing") =>
+                        .is_some_and(|id| self.records[&id].state == "finishing")) =>
             {
                 self.marker_count = self.marker_count.saturating_add(1);
+                let managed_prompt = self.active.is_some();
                 if let Some(id) = self.active.take() {
                     self.records.get_mut(&id).unwrap().state = "completed".into();
                 }
-                if self.human_pending > 0 {
+                if !managed_prompt && self.human_pending > 0 {
                     self.human_pending -= 1;
                 }
                 let ready = self.human_pending == 0 && !self.human_dirty && self.input_sequence.is_empty();
-                let changed = self.ready != ready;
+                let changed = self.ready != ready || managed_prompt || !self.initialized;
                 self.ready = ready;
                 self.initialized = true;
                 self.waiting_prompt = self.human_pending > 0;
@@ -357,18 +580,14 @@ function global:prompt {
             }
             ["started", id] => {
                 if let Ok(id) = Uuid::parse_str(id) {
-                    if self.active == Some(id) {
-                        let record = self.records.get_mut(&id).unwrap();
-                        if record.state == "accepted" {
-                            self.marker_count = self.marker_count.saturating_add(1);
-                            record.state = "running".into();
-                            self.revision += 1;
-                        }
+                    if self.confirm_started(id) {
+                        self.marker_count = self.marker_count.saturating_add(1);
                     }
                 }
             }
             ["done", id, success, exit] => {
                 if let Ok(id) = Uuid::parse_str(id) {
+                    if matches!(*success, "True" | "False") { self.confirm_started(id); }
                     if self.active == Some(id) && matches!(*success, "True" | "False") {
                         let record = self.records.get_mut(&id).unwrap();
                         if record.state == "running" {
@@ -425,6 +644,129 @@ function global:prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ready_marker_publishes_completion_while_a_partial_tail_blocks_readiness() {
+        let mut commands = Commands::new();
+        let ready = format!("\x1b]633;arterm;{};ready\x07", commands.nonce);
+        commands.output(ready.as_bytes());
+        let id = Uuid::now_v7();
+        commands.submit(id, "owned command").unwrap();
+        commands.mailbox_exchange(&format!("commit;{id}")).unwrap();
+        commands.mailbox_exchange(&format!("started;{id}")).unwrap();
+        commands.output(format!("\x1b]633;arterm;{};done;{id};True;\x07", commands.nonce).as_bytes());
+        commands.input(b"$Tail='").unwrap();
+        assert_eq!(commands.record(id).unwrap().state, "finishing");
+        let before = commands.revision;
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.record(id).unwrap().state, "completed");
+        assert!(commands.active().is_none());
+        assert_eq!(commands.shell_status(), "not_ready");
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        assert_eq!(commands.revision, before + 1, "completion must publish even when ready remains false");
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.revision, before + 1, "an unchanged prompt must not publish another transition");
+        assert!(commands.submit(Uuid::now_v7(), "must not overwrite").is_err());
+        commands.input(b"retained'\r").unwrap();
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.shell_status(), "ready");
+    }
+
+    #[test]
+    fn ready_marker_publishes_initialization_even_when_readiness_stays_false() {
+        let mut commands = Commands::new();
+        commands.human_dirty = true;
+        let before = commands.revision;
+        commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());
+        assert!(commands.input_ready());
+        assert_eq!(commands.shell_status(), "not_ready");
+        assert_eq!(commands.revision, before + 1);
+    }
+
+    #[test]
+    fn committed_watchdog_is_ambiguous_and_late_confirmation_is_id_scoped() {
+        let mut commands = Commands::new();
+        let ready = format!("\x1b]633;arterm;{};ready\x07", commands.nonce);
+        commands.output(ready.as_bytes());
+        let id = Uuid::now_v7();
+        commands.submit(id, "owned command").unwrap();
+        commands.mailbox_exchange(&format!("commit;{id}")).unwrap();
+        assert_eq!(commands.record(id).unwrap().state, "committed");
+        commands.start_confirmation.as_mut().unwrap().1 -= std::time::Duration::from_secs(6);
+        commands.expire_pending();
+        assert_eq!(commands.record(id).unwrap().state, "unknown");
+        assert_ne!(commands.shell_status(), "busy");
+        assert!(commands.submit(id, "owned command").unwrap().1.is_none());
+        commands.input(b"possible foreground answer\r").unwrap();
+        assert_eq!(commands.human_pending, 0);
+        assert!(commands.mailbox_exchange(&format!("started;{}", Uuid::now_v7())).is_err());
+        commands.mailbox_exchange(&format!("started;{id}")).unwrap();
+        assert_eq!(commands.record(id).unwrap().state, "running");
+        commands.output(format!("\x1b]633;arterm;{};done;{id};True;\x07", commands.nonce).as_bytes());
+        commands.input(b"next partial").unwrap();
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.record(id).unwrap().state, "completed");
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        assert!(commands.submit(Uuid::now_v7(), "cannot overwrite").is_err());
+    }
+
+    #[test]
+    fn history_override_requires_absolute_data_path() {
+        let commands = Commands::new();
+        assert!(commands.bootstrap_mailbox_with_history("fixture", 1,
+            Some(std::path::Path::new("relative-history.txt"))).is_err());
+        assert!(commands.bootstrap_mailbox_with_history("fixture", 1,
+            Some(std::path::Path::new(r"C:\owned\quote'and-unicode-history.txt"))).is_ok());
+    }
+
+    #[test]
+    fn mailbox_commit_allows_foreground_answers_without_phantom_lines() {
+        let mut commands = Commands::new();
+        let ready = format!("\x1b]633;arterm;{};ready\x07", commands.nonce);
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.mailbox_exchange("offer").unwrap(), "-");
+        let id = Uuid::now_v7();
+        let (_, wake) = commands.submit(id, "Read-Host; Read-Host").unwrap();
+        assert_eq!(wake.unwrap(), b"\x1b[135;0;0;1;0;1_\x1b[135;0;0;0;0;1_");
+        assert!(commands.input(b"early\r").is_err());
+        assert!(commands.mailbox_exchange("commit;wrong").is_err());
+        assert!(commands.mailbox_exchange("offer").unwrap().starts_with(&id.to_string()));
+        assert_eq!(commands.mailbox_exchange(&format!("commit;{id}")).unwrap(), "committed");
+        commands.input(b"first\rsecond\r#tail").unwrap();
+        assert_eq!(commands.human_pending, 0);
+        assert!(commands.submit(Uuid::now_v7(), "must not answer").is_err());
+        commands.output(format!("\x1b]633;arterm;{};done;{id};True;\x07", commands.nonce).as_bytes());
+        commands.output(ready.as_bytes());
+        assert_eq!(commands.shell_status(), "ready");
+        let next = Uuid::now_v7();
+        commands.submit(next, "must not overwrite").unwrap();
+        commands.mailbox_exchange(&format!("partial;{next}")).unwrap();
+        assert_eq!(commands.readiness_reason(), "partial_human_input");
+        assert!(commands.submit(Uuid::now_v7(), "must not overwrite").is_err());
+        assert!(commands.submit(id, "Read-Host; Read-Host").unwrap().1.is_none());
+    }
+
+    #[test]
+    fn unsupported_integration_cannot_become_ready() {
+        let mut commands = Commands::new();
+        commands.output(format!("\x1b]633;arterm;{};unsupported\x07", commands.nonce).as_bytes());
+        commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());
+        assert_eq!(commands.shell_status(), "unsupported");
+        assert!(commands.submit(Uuid::now_v7(), "must not run").is_err());
+    }
+    #[test]
+    fn mailbox_deadline_and_manual_private_key_do_not_execute() {
+        let mut commands = Commands::new();
+        commands.output(format!("\x1b]633;arterm;{};ready\x07", commands.nonce).as_bytes());
+        commands.input(b"\x1b[135;0;0;1;0;1_\x1b[135;0;0;0;0;1_").unwrap();
+        assert_eq!(commands.shell_status(), "ready");
+        let id = Uuid::now_v7();
+        commands.submit(id, "must expire").unwrap();
+        commands.pending_command.as_mut().unwrap().1 -= std::time::Duration::from_secs(6);
+        assert_eq!(commands.mailbox_exchange(&format!("commit;{id}")).unwrap(), "-");
+        assert_eq!(commands.record(id).unwrap().state, "not_submitted");
+        assert_eq!(commands.mailbox_exchange("offer").unwrap(), "-");
+        assert!(commands.submit(id, "must expire").unwrap().1.is_none());
+    }
     #[test]
     fn modifier_key_down_without_text_never_marks_the_line_dirty() {
         let mut commands = Commands::new();
@@ -531,6 +873,7 @@ mod tests {
         assert!(commands.submit(Uuid::now_v7(), "bad").is_err());
         assert!(commands.submit(id, "$x=2").is_err());
         assert!(commands.submit(id, "$x=1").unwrap().1.is_none());
+        commands.mailbox_exchange(&format!("commit;{id}")).unwrap();
         let events = format!("\x1b]633;arterm;{};started;{id}\x1b\\visible\r\n\x1b]633;arterm;{};done;{id};True;0\x07\x1b]633;arterm;{};ready\x07",
             commands.nonce, commands.nonce, commands.nonce);
         let mut visible = Vec::new();

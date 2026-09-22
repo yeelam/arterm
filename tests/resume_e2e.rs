@@ -74,6 +74,7 @@ impl Fixture {
         let host = Command::new(host_executable())
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
+            .env("ARTERM_SHELL_HISTORY_PATH", home.join("shell-history.txt"))
             .env("TEMP", &home).env("TMP", &home)
             .stdin(Stdio::null())
             .stdout(fs::File::create(home.join("host.stdout")).unwrap())
@@ -151,7 +152,6 @@ impl Fixture {
         command
             .env("VSTERM_REMOTE_HOME", &self.home)
             .env("TEMP", &self.home).env("TMP", &self.home)
-            .env("VSTERM_HISTORY_PATH", self.home.join("powershell-history.txt"))
             .args([verb, "fixture"]);
         if let Some(id) = id {
             command.arg(id);
@@ -241,7 +241,9 @@ impl RunningClient {
     }
     pub(crate) fn command(&mut self, command: &str) {
         self.input.write_all(command.as_bytes()).unwrap();
-        self.input.write_all(b"\r\n").unwrap();
+        // A terminal Enter is CR. LF is a separate PSReadLine editing key,
+        // not a second byte of a line-oriented pipe record.
+        self.input.write_all(b"\r").unwrap();
         self.input.flush().unwrap();
     }
     pub(crate) fn detach(&mut self) {
@@ -1338,6 +1340,123 @@ fn single_file_owner_death_reports_unknown_without_waiting_for_transfer_deadline
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn direct_input_read_host_accepts_owner_without_warmup() {
+    let fixture = Fixture::new();
+    let (address, _) = relay(fixture.home.clone(), 1);
+    let mut owner = fixture.client("connect", Some("direct-input-baseline"), &address);
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = control(&["list", "--client", "--json"]);
+        if output.status.success() {
+            let owners: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if owners.as_array().unwrap().iter().any(|v| v["readiness_reason"] == "ready") { break; }
+        }
+        assert!(Instant::now() < deadline, "fresh owner never became ready");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let sent = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "if ((Get-PSReadLineOption).HistorySavePath -ne $env:ARTERM_SHELL_HISTORY_PATH) { throw 'fixture history isolation failed' }; $global:DirectPid=$PID; $global:DirectCwd=$PWD.Path; $global:DirectState='retained'; $null=Read-Host 'BASELINE_QUESTION'; $null=Read-Host 'SECOND_QUESTION'", "--timeout", "5s", "--json"]);
+    assert!(sent.status.success(), "baseline command admission failed");
+    // Keep all terminal content, including fixture responses, out of failure output.
+    let wait_private = |owner: &mut RunningClient, expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !owner.out.contains(expected) && !owner.err.contains(expected) {
+            assert!(Instant::now() < deadline, "missing baseline category");
+            match owner.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((stderr, bytes)) => {
+                    if stderr { owner.err.push_str(&String::from_utf8_lossy(&bytes)); }
+                    else { owner.out.push_str(&String::from_utf8_lossy(&bytes)); }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => panic!("baseline owner exited"),
+            }
+        }
+    };
+    wait_private(&mut owner, "BASELINE_QUESTION: ");
+    assert!(owner.out.contains("Read-Host"), "original command was not visible");
+    assert!(!owner.out.contains("FromBase64String") && !owner.out.contains("ScriptBlock"),
+        "transport wrapper must not be visible");
+    let queued = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "Write-Output 'MUST_NOT_ANSWER'", "--timeout", "1s", "--json"]);
+    assert_eq!(queued.status.code(), Some(124), "second automation must wait");
+    let receipt: serde_json::Value = serde_json::from_slice(&queued.stdout).unwrap();
+    assert_eq!(receipt["submitted"], false);
+    owner.input.write_all(b"fixture-one\r").unwrap();
+    owner.input.flush().unwrap();
+    wait_private(&mut owner, "SECOND_QUESTION: ");
+    owner.input.write_all(b"fixture-two\r").unwrap();
+    owner.input.flush().unwrap();
+    let followup = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "if ($PID -ne $global:DirectPid -or $PWD.Path -ne $global:DirectCwd -or $global:DirectState -ne 'retained') { throw 'state changed' }; Write-Output ('DIRECT_'+'RETAINED')",
+        "--wait", "--timeout", "10s", "--json"]);
+    assert!(followup.status.success(), "direct followup failed");
+    wait_private(&mut owner, "DIRECT_RETAINED");
+    let interruptible = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "Read-Host 'INTERRUPT_QUESTION'", "--timeout", "5s", "--json"]);
+    assert!(interruptible.status.success(), "interrupt case admission failed");
+    wait_private(&mut owner, "INTERRUPT_QUESTION: ");
+    let interrupted = control(&["interrupt", "fixture", "direct-input-baseline", "--json"]);
+    assert!(interrupted.status.success(), "existing interrupt request failed");
+    let recovered = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "Write-Output ('DIRECT_'+'INTERRUPTED')", "--wait", "--timeout", "5s", "--json"]);
+    assert!(recovered.status.success(), "Read-Host did not recover through existing interrupt path");
+    wait_private(&mut owner, "DIRECT_INTERRUPTED");
+    let slow_prompt = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "direct-input-baseline", "--command",
+            "$global:__arTermOriginalPrompt={ if ($global:SlowNextPrompt) { [Console]::WriteLine(('SLOW_'+'PROMPT_WINDOW')); Start-Sleep -Seconds 3; $global:SlowNextPrompt=$false }; 'PS> ' }; $global:SlowNextPrompt=$true",
+            "--wait", "--timeout", "8s", "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap()));
+    wait_private(&mut owner, "SLOW_PROMPT_WINDOW");
+    owner.input.write_all(b"$global:SlowTail='").unwrap();
+    owner.input.flush().unwrap();
+    let blocked = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "$global:MustNotOverwrite=$true", "--timeout", "1s", "--json"]);
+    assert_eq!(blocked.status.code(), Some(124));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&blocked.stdout).unwrap()["submitted"], false);
+    // Do not type another byte or query status to make completion observable.
+    let completed = slow_prompt.output();
+    assert!(completed.status.success(), "unsolicited completion missing while partial tail remains unsubmitted");
+    let completed: serde_json::Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["record"]["state"], "completed");
+    assert_eq!(completed["shell_status"], "not_ready");
+    let still_blocked = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "$global:MustNotOverwrite=$true", "--timeout", "1s", "--json"]);
+    assert_eq!(still_blocked.status.code(), Some(124));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&still_blocked.stdout).unwrap()["submitted"], false);
+    owner.command("retained'; Write-Output ('TAIL_'+'PRESERVED')");
+    wait_private(&mut owner, "TAIL_PRESERVED");
+    assert!(!owner.err.contains("Host rejected human input"), "finishing-state input was rejected");
+    let tail_proof = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "if ($global:SlowTail -ne 'retained' -or $null -ne $global:MustNotOverwrite) { throw 'finishing tail changed' }",
+        "--wait", "--timeout", "10s", "--json"]);
+    assert!(tail_proof.status.success(), "finishing tail proof failed");
+    let invalid = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "if (", "--wait", "--timeout", "10s", "--json"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let invalid: serde_json::Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(invalid["status"], "not_submitted");
+    assert_eq!(invalid["submitted"], false);
+    assert_eq!(invalid["record"]["state"], "not_submitted");
+    owner.command("Set-PSReadLineKeyHandler -Chord F24 -ScriptBlock {}; Write-Output ('NOOP_'+'INSTALLED')");
+    wait_private(&mut owner, "NOOP_INSTALLED");
+    let started = Instant::now();
+    let noop = control(&["send", "fixture", "direct-input-baseline", "--command",
+        "throw 'no-op hook must not execute'", "--wait", "--timeout", "8s", "--json"]);
+    assert_eq!(noop.status.code(), Some(1));
+    let noop: serde_json::Value = serde_json::from_slice(&noop.stdout).unwrap();
+    assert_eq!(noop["status"], "not_submitted");
+    assert_eq!(noop["submitted"], false);
+    assert!(started.elapsed() < Duration::from_secs(8), "no-op hook did not fail boundedly");
+    println!("{}: direct input, interruption, retained state, and unsolicited completion before partial-tail submission", test_shell());
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn readiness_diagnostics_explain_pending_input_without_recording_content() {
     let fixture = Fixture::new();
     let (address, _) = relay(fixture.home.clone(), 1);
@@ -1610,7 +1729,6 @@ fn local_shell_accepts_command_after_detach_failure_and_remote_exit() {
         let pair = native_pty_system().openpty(PtySize { rows: 40, cols: 160, pixel_width: 0, pixel_height: 0 }).unwrap();
         let mut command = CommandBuilder::new("cmd.exe");
         command.env("VSTERM_REMOTE_HOME", &fixture.home);
-        command.env("VSTERM_HISTORY_PATH", fixture.home.join("exit-history.txt"));
         command.cwd(&fixture.home);
         command.args(["/d", "/q", "/v:on"]);
         let mut shell = Shell(pair.slave.spawn_command(command).unwrap());

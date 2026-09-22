@@ -984,8 +984,11 @@ impl Engine {
                         }
                         if let Ok(records) = get(body, "records").and_then(|v| v.as_array().context("invalid command records")) {
                             for record in records {
-                                if matches!(text(record, "state")?, "accepted" | "running") {
+                                if matches!(text(record, "state")?, "accepted" | "committed" | "running") {
                                     self.active_command = Some(uuid::Uuid::parse_str(text(record, "command_id")?)?);
+                                } else if self.active_command.is_some_and(|id|
+                                    text(record, "command_id").ok() == Some(id.to_string().as_str())) {
+                                    self.active_command = None;
                                 }
                             }
                         }

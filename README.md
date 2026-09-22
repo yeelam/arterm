@@ -34,6 +34,50 @@ reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.
 arTerm does not checkpoint or resurrect processes after those events.
 Managed command execution requires a newly created, supported PowerShell/pwsh
 session; existing sessions are not retrofitted.
+The direct-input integration additionally requires PSReadLine's F24 handler,
+buffer inspection, insertion, and accept-line APIs. An authenticated, bounded
+in-memory pipe delivers command data only to the owned shell process; the handler
+checks the real edit buffer and inserts the original source for ordinary
+top-level execution. Base64 is transport data, not an execution wrapper.
+Managed source is excluded from PSReadLine history with a one-line handler that
+restores the exact current user handler before the next manual line. Manual
+history, save settings, and user filters are not globally disabled or replaced.
+Keyboard input is permitted while a managed command is running (including
+`Read-Host` answers) and while its profile prompt is finishing, but remains guarded before dispatch; other automated
+commands wait. Partial edit buffers are never cleared or overwritten.
+Command completion is published even when a preserved partial line keeps
+automation not ready; waiting for completion does not require submitting that line.
+Unsupported integration and invalid syntax fail explicitly without a wrapper
+fallback. Replacing the prompt or PSReadLine integration can stop managed
+completion/readiness.
+Cancellation is checked at the existing client queue-to-delivery boundary.
+Once dispatched, caller exit does not cancel queued work; delivery uncertainty
+must be queried by command ID, never retried under a new identity. Admission is
+not proof of execution: a real-buffer rejection, invalid syntax, or a hook that
+does not accept within five seconds records `not_submitted` (`submitted:false`).
+The payload is revoked and cannot run later. Timeout disables managed readiness
+instead of leaving an indefinitely accepted command or guessing the edit buffer.
+Mailbox commitment is distinct from confirmed PSReadLine acceptance. If start
+confirmation is missing for five seconds after commitment, the outcome becomes
+`unknown`, never `not_submitted`: the command may have executed. Its identity
+cannot be replayed. Manual input remains usable; a subsequent real prompt can
+restore readiness without falsely completing the unknown record. Late start or
+completion evidence is accepted only for the same still-eligible command ID.
+
+**Advanced local-host opt-in:** `ARTERM_SHELL_HISTORY_PATH` may specify an absolute
+PowerShell history path for newly created supported interactive shells, including
+unmanaged ones. The host validates and encodes this path as data and applies it
+before the first ReadLine; it does not change history save style or user filters.
+Unset preserves the user's normal path. This is a host-process setting, not a
+remote-client option; `VSTERM_HISTORY_PATH` remains unsupported. Test fixtures set
+unique owned paths explicitly because changing `APPDATA` alone does not isolate
+PSReadLine history on either supported shell.
+
+**Direct-input development gate:** this branch is not release-qualified.
+Fresh host/client/controller tests cover two `Read-Host` answers and recovery
+through the existing interrupt request on Windows PowerShell and PowerShell 7.
+Earlier minimal F24-only interruption probes are archived outside shipping tests;
+arbitrary TUI behavior and all custom profile/read-line handlers are not certified.
 
 ## What you need
 

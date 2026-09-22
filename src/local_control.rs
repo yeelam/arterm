@@ -707,6 +707,14 @@ fn command_rpc(
         loop {
             caller_alive()?;
             if let Some(record) = control.records.get(&command_id) {
+                if record["state"] == "not_submitted" {
+                    return Ok(json!({"status":"not_submitted","command_id":command_id,
+                        "submitted":false,"record":record}));
+                }
+                if record["state"] == "unknown" {
+                    return Ok(json!({"status":"unknown","command_id":command_id,
+                        "submitted":true,"record":record}));
+                }
                 if record["state"] == "unknown" {
                     return Ok(json!({"status":"unknown","command_id":command_id,"record":record}));
                 }
@@ -849,13 +857,27 @@ fn command_rpc(
         action: actual,
         submission: submission.clone(),
     });
-    let deadline = send_deadline.map_or(Instant::now() + Duration::from_secs(2), |deadline| {
-        deadline.min(Instant::now() + Duration::from_secs(2))
+    let deadline = send_deadline.map_or(Instant::now() + Duration::from_secs(6), |deadline| {
+        deadline.min(Instant::now() + Duration::from_secs(6))
     });
     loop {
         caller_alive()?;
+        if let Some(record) = control.records.get(&command_id) {
+            if record["state"] == "not_submitted" {
+                return Ok(json!({"status":"not_submitted","command_id":command_id,
+                    "submitted":false,"record":record}));
+            }
+            if submission.is_some() && matches!(record["state"].as_str(), Some("running" | "completed")) {
+                return Ok(json!({"status":"accepted","command_id":command_id,
+                    "submitted":true,"record":record}));
+            }
+        }
         if let Some(reply) = control.replies.remove(&id) {
             let kind = reply["kind"].as_str().unwrap_or("");
+            if kind == "CommandAccepted" && control.records.get(&command_id)
+                .is_some_and(|record| matches!(record["state"].as_str(), Some("accepted" | "committed"))) {
+                continue;
+            }
             let status = match kind {
                 "CommandRejected" => "rejected",
                 "CommandInterruptAccepted" | "SessionInterruptAccepted" => "interrupt_requested",
@@ -1249,7 +1271,7 @@ fn process_sid(pid: u32) -> Result<String> {
 fn server_pipe(name: &str) -> Result<File> {
     server_pipe_instance(name, true)
 }
-fn server_pipe_instance(name: &str, first: bool) -> Result<File> {
+pub(crate) fn server_pipe_instance(name: &str, first: bool) -> Result<File> {
     let sid = process_sid(std::process::id())?;
     let sddl = wide(&format!("D:P(A;;GA;;;{sid})"));
     let mut descriptor = std::ptr::null_mut();
@@ -1300,7 +1322,7 @@ fn server_pipe_instance(name: &str, first: bool) -> Result<File> {
 fn transfer(file: &File, bytes: &mut [u8], writing: bool) -> Result<()> {
     transfer_timeout(file, bytes, writing, RPC_TIMEOUT)
 }
-fn transfer_timeout(file: &File, bytes: &mut [u8], writing: bool, timeout: Duration) -> Result<()> {
+pub(crate) fn transfer_timeout(file: &File, bytes: &mut [u8], writing: bool, timeout: Duration) -> Result<()> {
     transfer_timeout_checked(file, bytes, writing, timeout, &|| Ok(()))
 }
 fn transfer_timeout_checked(

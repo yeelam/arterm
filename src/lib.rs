@@ -23,5 +23,6 @@ pub mod transport;
 pub mod wire;
 pub mod local_control;
 pub mod shell_integration;
+pub mod shell_mailbox;
 pub mod peer_auth;
 mod host_shutdown;

@@ -459,12 +459,23 @@ impl Session {
         })?;
         let mut command = CommandBuilder::new(&fp.shell);
         command.args(&fp.args);
+        let history = std::env::var_os("ARTERM_SHELL_HISTORY_PATH").map(PathBuf::from);
+        let mailbox = if fp.command_execution { Some(arterm::shell_mailbox::Mailbox::new()?) } else { None };
         let commands = if fp.command_execution {
             ensure!(Commands::supported(&fp.shell, &fp.args), "CommandShellUnsupported");
             let commands = Commands::new();
-            command.args(["-NoExit", "-EncodedCommand", &commands.bootstrap_encoded()]);
+            let mailbox = mailbox.as_ref().unwrap();
+            command.args(["-NoExit", "-EncodedCommand",
+                &commands.bootstrap_mailbox_with_history(&mailbox.name, mailbox.host_started, history.as_deref())?]);
             Some(commands)
-        } else { None };
+        } else {
+            if let Some(history) = &history {
+                if Commands::supported(&fp.shell, &fp.args) {
+                    command.args(["-NoExit", "-EncodedCommand", &Commands::bootstrap_history(history)?]);
+                }
+            }
+            None
+        };
         if let Some(cwd) = &fp.cwd {
             command.cwd(cwd);
         }
@@ -512,6 +523,20 @@ impl Session {
             });
         }
         let weak = Arc::downgrade(&session);
+        if let Some(mailbox) = mailbox {
+            let target = weak.clone();
+            if let Err(error) = mailbox.start(pid, move |request| {
+                let session = target.upgrade().context("ShellMailboxSessionEnded")?;
+                let mut state = session.state.lock().unwrap();
+                let commands = state.commands.as_mut().context("ShellMailboxUnsupported")?;
+                // The authenticated CommandSubmit delivery is the commitment
+                // boundary. Later caller loss does not revoke already queued work.
+                commands.mailbox_exchange(request)
+            }) {
+                session.child.lock().unwrap().kill()?;
+                return Err(error);
+            }
+        }
         thread::spawn(move || {
             while let Ok(bytes) = input_rx.recv() {
                 if writer
@@ -557,7 +582,12 @@ impl Session {
                     state.exited_at = Some(Instant::now());
                     return;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    if let Some(commands) = &mut session.state.lock().unwrap().commands {
+                        commands.expire_pending();
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 Err(_) => {
                     let mut state = session.state.lock().unwrap();
                     state.exit = Some(1);

@@ -5,7 +5,8 @@ use std::{
     io::{Read, Write},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -38,6 +39,7 @@ impl Host {
         let child = Command::new(env!("CARGO_BIN_EXE_arterm-host"))
             .arg("run")
             .env("VSTERM_REMOTE_HOME", &home)
+            .env("ARTERM_SHELL_HISTORY_PATH", home.join("shell-history.txt"))
             .env("TEMP", &home).env("TMP", &home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -85,7 +87,7 @@ impl Drop for Host {
 struct Bridge {
     child: Child,
     input: Option<ChildStdin>,
-    output: ChildStdout,
+    output: mpsc::Receiver<Value>,
 }
 impl Bridge {
     fn start(home: &PathBuf) -> Self {
@@ -98,7 +100,20 @@ impl Bridge {
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
-        let output = child.stdout.take().unwrap();
+        let mut reader = child.stdout.take().unwrap();
+        let (tx, output) = mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                let mut len = [0; 4];
+                if reader.read_exact(&mut len).is_err() { break; }
+                let length = u32::from_be_bytes(len) as usize;
+                assert!(length <= wire::MAX_FRAME);
+                let mut bytes = vec![0; length];
+                if reader.read_exact(&mut bytes).is_err() { break; }
+                let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+                if tx.send(value).is_err() { break; }
+            }
+        });
         Self {
             child,
             input: Some(input),
@@ -106,16 +121,26 @@ impl Bridge {
         }
     }
     fn send(&mut self, value: Value) {
+        if std::env::var_os("ARTERM_TEST_TRACE").is_some() {
+            eprintln!("[host-core] send={}", text(&value, "type").unwrap());
+        }
         let input = self.input.as_mut().unwrap();
         input.write_all(&wire::encode(&value).unwrap()).unwrap();
         input.flush().unwrap();
     }
     fn recv(&mut self) -> Value {
-        let mut len = [0u8; 4];
-        self.output.read_exact(&mut len).unwrap();
-        let mut bytes = vec![0u8; u32::from_be_bytes(len) as usize];
-        self.output.read_exact(&mut bytes).unwrap();
-        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+        let value = self.output.recv_timeout(Duration::from_secs(15))
+            .expect("host-core protocol receive deadline or closed bridge");
+        if std::env::var_os("ARTERM_TEST_TRACE").is_some() {
+            let kind = text(&value, "type").unwrap();
+            if kind != "Output" {
+                let body = get(&value, "body").unwrap();
+                let states = get(body, "records").ok().and_then(Value::as_array)
+                    .map(|records| records.iter().filter_map(|r| text(r, "state").ok()).collect::<Vec<_>>());
+                eprintln!("[host-core] reply={kind} shell={:?} states={states:?}", text(body, "shell_status").ok());
+            }
+        }
+        value
     }
     fn hello(&mut self, client: &[u8]) -> Vec<u8> {
         self.hello_capabilities(client, false)
@@ -156,7 +181,7 @@ fn receive_command_state(bridge: &mut Bridge, id: Option<Uuid>, expected: &str) 
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(Instant::now() < deadline, "command event deadline: {}", String::from_utf8_lossy(&output));
+        assert!(Instant::now() < deadline, "command event deadline; expected={expected}; output_bytes={}", output.len());
         let response = bridge.recv();
         let kind = text(&response, "type").unwrap();
         let body = get(&response, "body").unwrap();
@@ -454,10 +479,10 @@ fn managed_commands_preserve_runspace_and_report_real_completion() {
         vec![("connection_epoch", 1.into()), ("command_id", s(&slow.to_string()))]));
     receive_command_state(&mut bridge, Some(slow), "running");
     bridge.send(writer_message(session, &attachment, &lease, &client, "Input",
-        vec![("input_seq", 1.into()), ("bytes", Value::Binary(b"$Keep=999\r".to_vec()))]));
+        vec![("input_seq", 1.into()), ("bytes", Value::Binary(b"\x1b[16;42;0;0;0;1_".to_vec()))]));
     loop {
         let response = bridge.recv();
-        if text(&response, "type").unwrap() == "InputRejected" { break; }
+        if text(&response, "type").unwrap() == "InputAck" { break; }
     }
     bridge.send(submit(Uuid::now_v7(), "$Keep=999"));
     loop {
@@ -502,8 +527,14 @@ fn managed_commands_preserve_runspace_and_report_real_completion() {
         }
     }
     bridge.send(writer_message(session, &new_attachment, &new_lease, &client, "Input",
-        vec![("input_seq", 1.into()), ("bytes", Value::Binary(b"$partial".to_vec()))]));
-    loop { if text(&bridge.recv(), "type").unwrap() == "InputAck" { break; } }
+        vec![("input_seq", 2.into()), ("bytes", Value::Binary(b"$partial".to_vec()))]));
+    loop {
+        let reply = bridge.recv();
+        if text(&reply, "type").unwrap() == "InputAck" {
+            assert_eq!(num(get(&reply, "body").unwrap(), "committed_through").unwrap(), 2);
+            break;
+        }
+    }
     bridge.send(writer_message(session, &new_attachment, &new_lease, &client, "CommandSubmit",
         vec![("connection_epoch", 2.into()), ("command_id", s(&Uuid::now_v7().to_string())), ("command", s("$Keep=999"))]));
     loop {

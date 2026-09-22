@@ -503,6 +503,16 @@ pub(crate) fn same_user_logon(process: &OwnedHandle) -> Result<bool> {
     let candidate = token_context(process)?;
     Ok(same_logon(&current, &candidate))
 }
+pub(crate) fn owned_shell(pid: u32) -> Result<OwnedHandle> {
+    let process = open_process(pid)?;
+    let owner = token_context(&open_process(unsafe { GetCurrentProcessId() })?)?;
+    check_context(&owner, &token_context(&process)?)?;
+    Ok(process)
+}
+
+pub(crate) fn own_creation_time() -> Result<u64> {
+    creation_time(&open_process(unsafe { GetCurrentProcessId() })?)
+}
 fn same_logon(current: &TokenContext, candidate: &TokenContext) -> bool {
     current.sid == candidate.sid
         && current.session == candidate.session
