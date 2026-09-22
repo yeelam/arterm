@@ -250,7 +250,12 @@ timeout reports `IntegrationNotEstablished` with `submitted: false`; unknown
 startup input is not classified as a busy managed command. Explicitly unsupported
 sessions fail immediately instead of consuming the readiness budget.
 
-Machine always precedes session. Plain `list` lists registered machines;
+Machine always precedes session. Plain `list` lists registered machines and
+locally saved **session names and session IDs**; `list --json` provides the same
+inventory structurally. This reads public local name mappings and recovery-file
+presence, not credentials, and does not connect or sign in. A saved record is
+not proof that the remote session still exists or is resumable. GUID-only
+sessions are labelled `(unnamed)`; incomplete mappings are `reservation only`.
 `list --client` lists active managed local connections; `list --server MACHINE`
 queries the authorized host inventory, including detached sessions. Each
 `connect` owns a separate local named pipe: no broadcast or shared client daemon.

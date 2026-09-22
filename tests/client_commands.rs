@@ -44,7 +44,8 @@ fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
     assert!(!duplicate.status.success());
     let listed = run(&home, &["list"]);
     let stdout = String::from_utf8_lossy(&listed.stdout);
-    assert!(stdout.contains("work\ttunnel-1"));
+    assert!(stdout.contains("MACHINE") && stdout.contains("TUNNEL"));
+    assert!(stdout.contains("work") && stdout.contains("tunnel-1"));
     assert!(home.join("client").join("config.json").is_file());
     let removed = run(&home, &["remove", "work"]);
     assert!(
@@ -52,7 +53,7 @@ fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
         "{}",
         String::from_utf8_lossy(&removed.stderr)
     );
-    assert!(!String::from_utf8_lossy(&run(&home, &["list"]).stdout).contains("work\t"));
+    assert_eq!(String::from_utf8_lossy(&run(&home, &["list"]).stdout).trim(), "No registered boxes.");
     fs::remove_dir_all(home).unwrap();
 }
 
@@ -80,6 +81,67 @@ fn concurrent_registration_processes_preserve_all_successful_writes() {
     for index in 0..8 {
         assert_eq!(config.targets[&format!("box-{index}")].tunnel_id, "my-box");
     }
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn plain_list_shows_named_and_unnamed_saved_sessions_without_opening_them() {
+    use arterm::{client_config, store::{SessionReference, Store}};
+    let home = std::env::temp_dir().join(format!("arterm-named-list-{}", Uuid::now_v7()));
+    assert!(run(&home, &["add", "work", "--tunnel", "example",
+        "--host-path", r"C:\Tools\arterm-host.exe"]).status.success());
+    client_config::update(&home, |config| {
+        config.devtunnel_path = Some(r"C:\missing-no-network\devtunnel.exe".into());
+        Ok(())
+    }).unwrap();
+    let config = client_config::load(&home).unwrap();
+    let target = &config.targets["work"];
+    let dir = client_config::state_dir(&home, target);
+    let (store, state) = Store::resolve(&dir, &target.target_id,
+        &SessionReference::parse("MyWork01").unwrap(), true, None, None).unwrap();
+    let record = dir.join(format!("{}.dpapi", state.id));
+    let before = fs::read(&record).unwrap();
+    let unnamed = Uuid::now_v7();
+    fs::write(dir.join(format!("{unnamed}.dpapi")), b"PRIVATE_RECORD_NOT_TO_BE_READ").unwrap();
+    let reserved = Uuid::now_v7();
+    fs::write(dir.join("ref-pending.json"), serde_json::to_vec(&reserved).unwrap()).unwrap();
+    let output = run(&home, &["list"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("SESSION NAME") && text.contains("mywork01") && text.contains(&state.id.to_string()));
+    assert!(text.contains("(unnamed)") && text.contains(&unnamed.to_string()));
+    assert!(text.contains("pending") && text.contains("reservation only"));
+    assert!(text.contains("remote state unknown"));
+    assert!(!text.contains("PRIVATE_RECORD") && !text.contains("resume_token") && !text.contains("claim"));
+    let json = run(&home, &["list", "--json"]);
+    assert!(json.status.success());
+    let values: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let sessions = values[0]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 3);
+    assert!(sessions.iter().any(|s| s["session_name"] == "mywork01"
+        && s["session_id"] == state.id.to_string() && s["recovery_record_present"] == true));
+    assert!(sessions.iter().any(|s| s["session_name"] == "pending"
+        && s["recovery_record_present"] == false));
+    assert_eq!(fs::read(&record).unwrap(), before);
+    drop(store);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn plain_list_reports_corrupt_name_mapping_without_resetting_it() {
+    use arterm::client_config;
+    let home = std::env::temp_dir().join(format!("arterm-bad-list-{}", Uuid::now_v7()));
+    assert!(run(&home, &["add", "work", "--tunnel", "example",
+        "--host-path", r"C:\Tools\arterm-host.exe"]).status.success());
+    let config = client_config::load(&home).unwrap();
+    let dir = client_config::state_dir(&home, &config.targets["work"]);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ref-work.json");
+    fs::write(&path, b"not-json").unwrap();
+    let result = run(&home, &["list"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid local session mapping"));
+    assert_eq!(fs::read(path).unwrap(), b"not-json");
     fs::remove_dir_all(home).unwrap();
 }
 
@@ -223,7 +285,11 @@ fn registration_persists_the_friendly_name_not_a_generated_tunnel_id() {
     let path = home.join("client").join("config.json");
     let config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(config["targets"]["dev01"]["tunnel_id"], "dev01");
-    assert!(String::from_utf8_lossy(&run(&home, &["list"]).stdout).contains("dev01\tdev01\t"));
+    let listed = run(&home, &["list", "--json"]);
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["machine"], "dev01");
+    assert_eq!(listed[0]["tunnel"], "dev01");
     let disabled = Command::new(env!("CARGO_BIN_EXE_arterm"))
         .env("VSTERM_REMOTE_HOME", &home)
         .env("VSTERM_NO_HISTORY", "1")

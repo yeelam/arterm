@@ -43,7 +43,7 @@ Usage:\n\
   arterm setup [--devtunnel-path PATH] [--no-download]\n\
   arterm login | logout\n\
   arterm add ALIAS --tunnel NAME-OR-ID --host-path ABSOLUTE\n\
-  arterm list\n\
+  arterm list [--json]\n\
   arterm remove ALIAS\n\
   arterm connect ALIAS [REF] [--shell EXE] [--cwd PATH] [--retries 0..20]\n\
   arterm list --client [--json] | list --server MACHINE [--json]\n\
@@ -57,6 +57,7 @@ Usage:\n\
   arterm --help | --version\n\n\
 Client Setup initializes local files. setup is optional repair/custom-path configuration, not sign-in.\n\
 Use arterm login if not signed in, then arterm add to register a host.\n\
+list shows registered machines and saved session names/IDs without querying the network.\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
 Control commands print readable results by default; use --json for structured automation output.\n\
 Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
@@ -177,15 +178,17 @@ fn add_target(root: &Path, args: &[String]) -> Result<()> {
 }
 
 fn list_targets(root: &Path, args: &[String]) -> Result<()> {
-    ensure!(args.is_empty(), "list takes no parameters");
+    ensure!(args.is_empty() || args == ["--json"], "list accepts only --json, --client or --server MACHINE");
     let config = client_config::load(root)?;
-    if config.targets.is_empty() {
-        println!("No registered boxes.");
-    } else {
-        for (alias, target) in config.targets {
-            println!("{alias}\t{}\t{}", target.tunnel_id, target.host_path);
-        }
+    let mut machines = Vec::new();
+    for (alias, target) in &config.targets {
+        let sessions = store::saved_sessions(&client_config::state_dir(root, target))?;
+        machines.push(serde_json::json!({
+            "machine": alias, "tunnel": target.tunnel_id, "host_path": target.host_path,
+            "sessions": sessions,
+        }));
     }
+    println!("{}", client_output::registered(&machines, !args.is_empty())?);
     Ok(())
 }
 
@@ -632,14 +635,9 @@ fn command(args: &[String]) -> Result<u32> {
             let mut inventory = client_protocol::list_sessions(&mut link)?;
             let dir = client_config::state_dir(&root, target);
             let mut labels = std::collections::BTreeMap::new();
-            if dir.exists() {
-                for entry in std::fs::read_dir(&dir)? {
-                    let path = entry?.path();
-                    if let Some(name) = path.file_name().and_then(|name| name.to_str())
-                        .and_then(|name| name.strip_prefix("ref-")).and_then(|name| name.strip_suffix(".json")) {
-                        let id: Uuid = serde_json::from_slice(&std::fs::read(&path)?).context("invalid local session mapping")?;
-                        labels.insert(id.to_string(), name.to_owned());
-                    }
+            for session in store::saved_sessions(&dir)? {
+                if let Some(name) = session.session_name {
+                    labels.insert(session.session_id.to_string(), name);
                 }
             }
             for session in inventory["sessions"].as_array_mut().context("invalid inventory")? {

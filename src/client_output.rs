@@ -1,4 +1,4 @@
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
 fn text(value: &Value) -> String {
@@ -150,6 +150,31 @@ fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
     output.join("\n")
 }
 
+pub fn registered(machines: &[Value], json: bool) -> Result<String> {
+    if json { return Ok(serde_json::to_string(machines)?); }
+    if machines.is_empty() { return Ok("No registered boxes.".into()); }
+    let machine_rows = machines.iter().map(|machine| vec![
+        text(&machine["machine"]), text(&machine["tunnel"]), text(&machine["host_path"]),
+    ]).collect();
+    let mut rows = Vec::new();
+    for machine in machines {
+        for session in machine["sessions"].as_array().context("invalid local session inventory")? {
+            rows.push(vec![
+                text(&machine["machine"]),
+                session["session_name"].as_str().map(|_| text(&session["session_name"]))
+                    .unwrap_or_else(|| "(unnamed)".into()),
+                text(&session["session_id"]),
+                if session["recovery_record_present"] == true { "saved" } else { "reservation only" }.into(),
+            ]);
+        }
+    }
+    let sessions = if rows.is_empty() { "No saved sessions.".into() } else {
+        table(&["MACHINE", "SESSION NAME", "SESSION ID", "LOCAL RECORD"], rows)
+    };
+    Ok(format!("Registered machines\n{}\n\nKnown sessions (local metadata; remote state unknown)\n{sessions}\n\nUse list --client for active local connections, or list --server MACHINE for live server state.",
+        table(&["MACHINE", "TUNNEL", "HOST EXECUTABLE"], machine_rows)))
+}
+
 pub fn clients(connections: &[Value], json: bool) -> Result<String> {
     if json {
         return Ok(serde_json::to_string(connections)?);
@@ -171,7 +196,7 @@ pub fn clients(connections: &[Value], json: bool) -> Result<String> {
         })
         .collect();
     let mut output = table(
-        &["MACHINE", "SESSION", "SESSION ID", "CONNECTION", "SHELL"],
+        &["MACHINE", "SESSION NAME", "SESSION ID", "CONNECTION", "SHELL"],
         rows,
     );
     for item in connections {
@@ -213,7 +238,7 @@ pub fn server(inventory: &Value, json: bool) -> Result<String> {
         "{heading}\n{}",
         table(
             &[
-                "SESSION",
+                "SESSION NAME",
                 "SESSION ID",
                 "PID",
                 "STATE",

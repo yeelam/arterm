@@ -108,6 +108,59 @@ impl SessionReference {
     }
 }
 
+/// Public local inventory only. Presence is not proof that a remote session is
+/// alive or that a protected recovery record can still be used.
+#[derive(Clone, Debug, Serialize)]
+pub struct SavedSession {
+    pub session_id: Uuid,
+    pub session_name: Option<String>,
+    pub recovery_record_present: bool,
+}
+
+pub fn saved_sessions(dir: &Path) -> Result<Vec<SavedSession>> {
+    use std::{collections::BTreeMap, io::Read, os::windows::fs::MetadataExt};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read local session inventory"),
+    };
+    let mut sessions = BTreeMap::<Uuid, SavedSession>::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(reference) = name.strip_prefix("ref-").and_then(|n| n.strip_suffix(".json")) {
+            let reference = SessionReference::parse(reference).context("invalid local session name")?;
+            let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(entry.path()).context("open local session name mapping")?;
+            let metadata = file.metadata()?;
+            ensure!(metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "local session mapping is not a regular file");
+            ensure!(metadata.len() <= 1024, "oversized local session mapping");
+            let mut bytes = Vec::new();
+            file.take(1025).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 1024, "oversized local session mapping");
+            let id: Uuid = serde_json::from_slice(&bytes).context("invalid local session mapping")?;
+            let row = sessions.entry(id).or_insert(SavedSession {
+                session_id: id, session_name: None, recovery_record_present: false,
+            });
+            ensure!(row.session_name.is_none(), "multiple local names refer to session {id}");
+            row.session_name = Some(reference.as_str().to_owned());
+        } else if let Some(id) = name.strip_suffix(".dpapi").and_then(|n| Uuid::parse_str(n).ok()) {
+            let metadata = entry.metadata()?;
+            ensure!(metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "local recovery record is not a regular file");
+            sessions.entry(id).or_insert(SavedSession {
+                session_id: id, session_name: None, recovery_record_present: false,
+            }).recovery_record_present = true;
+        }
+    }
+    let mut result: Vec<_> = sessions.into_values().collect();
+    result.sort_by(|a, b| a.session_name.cmp(&b.session_name).then(a.session_id.cmp(&b.session_id)));
+    Ok(result)
+}
+
 fn lock_record(path: &Path) -> Result<(File, bool)> {
     match OpenOptions::new().write(true).create_new(true).share_mode(0).open(path) {
         Ok(file) => {
