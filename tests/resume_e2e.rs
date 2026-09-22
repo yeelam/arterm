@@ -1010,16 +1010,50 @@ fn folder_lease_change_revokes_transfer_without_replacing_shell() {
 }
 
 fn owned_partials(root: &std::path::Path) -> Vec<PathBuf> {
+    assert!(root.is_dir(), "owned fixture root must remain present");
     let mut found = Vec::new();
-    for entry in fs::read_dir(root).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            found.extend(owned_partials(&entry.path()));
+    collect_owned_partials(root, &mut found);
+    found
+}
+
+fn collect_owned_partials(root: &std::path::Path, found: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("inspect owned partials: {error}"),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("enumerate owned partials: {error}"),
+        };
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("inspect partial entry: {error}"),
+        };
+        if kind.is_dir() {
+            collect_owned_partials(&entry.path(), found);
         } else if entry.file_name() == ".arterm-partial" {
             found.push(entry.path());
         }
     }
-    found
+}
+
+#[test]
+fn partial_scan_allows_a_descendant_removed_by_normal_cleanup() {
+    let root = std::env::temp_dir().join(format!("arterm-partial-scan-{}", Uuid::now_v7()));
+    let removed = root.join("removed");
+    fs::create_dir_all(&removed).unwrap();
+    fs::remove_dir(&removed).unwrap();
+    let mut found = Vec::new();
+    collect_owned_partials(&removed, &mut found);
+    assert!(found.is_empty());
+    let expected = root.join(".arterm-partial");
+    fs::write(&expected, b"owned test partial").unwrap();
+    assert_eq!(owned_partials(&root), vec![expected]);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
