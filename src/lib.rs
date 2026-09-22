@@ -12,6 +12,7 @@ pub mod host_task;
 pub mod host_task_io;
 pub mod host_supervisor;
 pub mod diagnostics;
+pub mod readiness_diagnostics;
 
 #[macro_export]
 macro_rules! statusln {
