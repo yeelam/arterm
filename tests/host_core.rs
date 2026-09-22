@@ -256,7 +256,8 @@ fn file_authorization_rejects_wrong_session_lease_epoch_and_revoked_writer() {
             ("min_version", 1.into()), ("max_version", 1.into()),
             ("client_instance_id", Value::Binary(client.to_vec())),
             ("capabilities", Value::Array(vec![s(arterm::transfer_admission::CAPABILITY),
-                s(arterm::transfer_payload::METADATA_CAPABILITY)])),
+                s(arterm::transfer_payload::METADATA_CAPABILITY),
+                s(arterm::recipient_metadata::CAPABILITY)])),
         ])));
         assert_eq!(text(&bridge.recv(), "type").unwrap(), "HelloOk");
     }
