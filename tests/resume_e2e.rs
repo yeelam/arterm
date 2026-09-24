@@ -1848,7 +1848,12 @@ fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
     let initial = initial.output();
     assert!(initial.status.success(), "{} {}", String::from_utf8_lossy(&initial.stdout), String::from_utf8_lossy(&initial.stderr));
 
-    let first = control(&["send","fixture","readywait","--command","Start-Sleep -Seconds 3; $RunCount++","--json"]);
+    let release_busy = fixture.home.join(format!("release-busy-{}", Uuid::now_v7()));
+    let busy_command = format!(
+        "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 50 }}; $RunCount++",
+        release_busy.to_string_lossy().replace('\'', "''")
+    );
+    let first = control(&["send","fixture","readywait","--command",&busy_command,"--json"]);
     assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stdout));
     let second = spawn(&["send","fixture","readywait","--command","$RunCount++","--wait","--timeout","10s","--json"]);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1856,6 +1861,7 @@ fn send_waits_for_readiness_and_never_runs_cancelled_or_expired_work() {
         assert!(Instant::now() < deadline);
     }
     assert!(control(&["read","fixture","readywait","--json"]).status.success(), "waiting blocked other controls");
+    fs::write(&release_busy, b"release after observing the waiting controller").unwrap();
     let second = second.output();
     assert!(second.status.success(), "{} {}", String::from_utf8_lossy(&second.stdout), String::from_utf8_lossy(&second.stderr));
 
