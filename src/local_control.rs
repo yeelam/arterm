@@ -543,8 +543,8 @@ impl<T: Terminal> Terminal for ManagedTerminal<T> {
     fn output_gap(&mut self) {
         self.shared.buffer.lock().unwrap().gap = true;
     }
-    fn control(&mut self) -> Option<ControlMessage> {
-        self.shared.control.lock().unwrap().queue.pop_front()
+    fn control(&mut self, allow_submit: bool) -> Option<ControlMessage> {
+        take_control(&mut self.shared.control.lock().unwrap().queue, allow_submit)
     }
     fn command_capability(&mut self, supported: bool) {
         let mut control = self.shared.control.lock().unwrap();
@@ -657,6 +657,12 @@ fn json_wire(value: &rmpv::Value) -> Value {
         ),
         _ => Value::Null,
     }
+}
+
+fn take_control(queue: &mut VecDeque<ControlMessage>, allow_submit: bool) -> Option<ControlMessage> {
+    let index = queue.iter().position(|message|
+        allow_submit || !matches!(message.action, Operation::Send { .. }))?;
+    queue.remove(index)
 }
 
 fn readiness_error(control: &ControlState) -> String {
@@ -1397,6 +1403,24 @@ fn write_frame(file: &File, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_terminal_ack_defers_sends_without_blocking_interrupts_or_status() {
+        let id = Uuid::now_v7();
+        let mut queue = VecDeque::from([
+            ControlMessage { operation_id: id,
+                action: Operation::Send { command: "not dispatched yet".into(), timeout_ms: Some(1000) },
+                submission: None },
+            ControlMessage { operation_id: Uuid::now_v7(), action: Operation::Interrupt, submission: None },
+            ControlMessage { operation_id: Uuid::now_v7(), action: Operation::CommandStatus { command_id: id }, submission: None },
+        ]);
+        assert!(matches!(take_control(&mut queue, false).unwrap().action, Operation::Interrupt));
+        assert!(matches!(take_control(&mut queue, false).unwrap().action, Operation::CommandStatus { .. }));
+        assert!(take_control(&mut queue, false).is_none());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(take_control(&mut queue, true).unwrap().operation_id, id);
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn admitted_readiness_timeouts_are_logged_once_for_all_terminal_paths() {
         for reply_instead_of_expire in [false, true] {

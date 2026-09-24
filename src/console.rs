@@ -136,7 +136,7 @@ pub trait Terminal {
     fn connection_state(&mut self, _state: &str) {}
     fn detach_requested(&self) -> bool { false }
     fn output_gap(&mut self) {}
-    fn control(&mut self) -> Option<crate::local_control::ControlMessage> { None }
+    fn control(&mut self, _allow_submit: bool) -> Option<crate::local_control::ControlMessage> { None }
     fn command_capability(&mut self, _supported: bool) {}
     fn command_context(&mut self, _enabled: bool, _host_version: Option<&str>) {}
     fn command_output_progress(&mut self, _seq: u64) {}

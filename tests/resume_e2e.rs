@@ -1340,6 +1340,62 @@ fn single_file_owner_death_reports_unknown_without_waiting_for_transfer_deadline
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn send_waits_for_nonediting_input_ack_instead_of_rejecting() {
+    use std::sync::atomic::Ordering;
+    struct Release(Arc<CreationGate>);
+    impl Drop for Release {
+        fn drop(&mut self) { self.0.release.store(true, Ordering::Release); }
+    }
+    let fixture = Fixture::new();
+    let gate = Arc::new(CreationGate { frame: "InputAck", ..Default::default() });
+    let _release = Release(gate.clone());
+    let (address, _) = relay_with_creation_gate(fixture.home.clone(), 1, None, Some(gate.clone()));
+    let mut owner = fixture.client("connect", Some("ack-wait"), &address);
+    let control = |args: &[&str]| Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home).args(args).output().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let listed = control(&["list", "--client", "--json"]);
+        assert!(listed.status.success());
+        let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        if owners.as_array().unwrap().iter().any(|v| v["shell_status"] == "ready") { break; }
+        assert!(Instant::now() < deadline, "fresh shell did not become ready: {owners}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    owner.input.write_all(b"\x1b[O\x1b[I").unwrap();
+    owner.input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gate.observed.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "nonediting input acknowledgement not held");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut sender = Pending(Some(Command::new(controller_executable())
+        .env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["send", "fixture", "ack-wait", "--command", "$AckWaitProof=42", "--wait", "--timeout", "10s", "--json"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(sender.0.as_mut().unwrap().try_wait().unwrap().is_none(), "send rejected before its input acknowledgement arrived");
+        let listed = control(&["list", "--client", "--json"]);
+        assert!(listed.status.success());
+        let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        if owners[0]["control_waiters"].as_u64().unwrap() > 0 { break; }
+        assert!(Instant::now() < deadline, "send was not waiting");
+    }
+    // Keep the acknowledgement held across an engine poll, not just admission.
+    thread::sleep(Duration::from_millis(150));
+    assert!(sender.0.as_mut().unwrap().try_wait().unwrap().is_none(), "queued send was rejected as human input");
+    gate.release.store(true, Ordering::Release);
+    let output = sender.output();
+    assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["record"]["succeeded"], true);
+    owner.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
 fn direct_input_read_host_accepts_owner_without_warmup() {
     let fixture = Fixture::new();
     let (address, _) = relay(fixture.home.clone(), 1);

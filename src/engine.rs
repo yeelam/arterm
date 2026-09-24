@@ -1091,20 +1091,17 @@ impl Engine {
                 }
                 continue;
             }
-                if let Some(control) = terminal.control() {
+                // An in-flight focus/key packet is not proof of a human edit.
+                // Keep automated sends queued until it is acknowledged, while
+                // status and interrupt requests remain available.
+                if let Some(control) = terminal.control(self.state.pending.is_none()) {
                     use crate::local_control::Operation;
                     let mut fields = self.writer()?;
                     fields.push(("connection_epoch", self.state.epoch.into()));
                     fields.push(("operation_id", s(&control.operation_id.to_string())));
                     let (kind, id) = match control.action {
                         Operation::Send { command, .. } => {
-                            if self.state.pending.is_some() {
-                                terminal.command_event("CommandRejected", &map(vec![
-                                    ("command_id", s(&control.operation_id.to_string())),
-                                    ("code", s("local human input pending")),
-                                ]));
-                                continue;
-                            }
+                            ensure!(self.state.pending.is_none(), "terminal dispatched a command before input acknowledgement");
                             fields.push(("command", s(&command)));
                             ("CommandSubmit", control.operation_id)
                         }
