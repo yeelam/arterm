@@ -200,10 +200,12 @@ function global:__arTermExchange([string]$request) {
 }
 $global:__arTermOriginalPrompt = (Get-Item Function:\prompt).ScriptBlock
 $global:__arTermCommand = $null
+$global:__arTermAcceptedCommand = $null
+$global:__arTermReading = $false
 $global:__arTermHistoryOverride=$false
 function global:prompt {
     $global:__arTermSuccess = $?
-    if ($global:__arTermDisabled) { return (& $global:__arTermOriginalPrompt) }
+    if ($global:__arTermDisabled -or $global:__arTermReading) { return (& $global:__arTermOriginalPrompt) }
     if ($global:__arTermHistoryOverride) {
         Set-PSReadLineOption -AddToHistoryHandler $global:__arTermOriginalHistory
         $global:__arTermHistoryOverride=$false
@@ -241,9 +243,6 @@ Set-PSReadLineKeyHandler -Chord F24 -ScriptBlock {
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line,[ref]$cursor)
         if ($line.Length -ne 0) { $null=__arTermExchange ('partial;'+$id); return }
         if ((__arTermExchange ('commit;'+$id)) -ne 'committed') { return }
-        $global:__arTermError=$global:Error[0]
-        $global:__arTermPreviousNative=$global:LASTEXITCODE
-        $global:LASTEXITCODE=$null
         $global:__arTermOriginalHistory=(Get-PSReadLineOption).AddToHistoryHandler
         $global:__arTermHistoryOverride=$true
         Set-PSReadLineOption -AddToHistoryHandler {
@@ -254,8 +253,7 @@ Set-PSReadLineKeyHandler -Chord F24 -ScriptBlock {
         } -ErrorAction Stop
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert($source)
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
-        $global:__arTermCommand=$id
-        $null=__arTermExchange ('started;'+$id)
+        $global:__arTermAcceptedCommand=$id
     } catch {
         if ($global:__arTermHistoryOverride) {
             Set-PSReadLineOption -AddToHistoryHandler $global:__arTermOriginalHistory
@@ -264,6 +262,26 @@ Set-PSReadLineKeyHandler -Chord F24 -ScriptBlock {
         [Console]::WriteLine('arTerm: ShellMailboxUnavailable; command outcome may be unknown')
     }
 } -ErrorAction Stop
+$global:__arTermOriginalReadLine=(Get-Item Function:\PSConsoleHostReadLine).ScriptBlock
+function global:PSConsoleHostReadLine {
+    $global:__arTermReading=$true
+    try {
+        $source = & $global:__arTermOriginalReadLine
+        if ($null -ne $global:__arTermAcceptedCommand) {
+            $global:__arTermError=$global:Error[0]
+            $global:__arTermPreviousNative=$global:LASTEXITCODE
+            $global:LASTEXITCODE=$null
+            $global:__arTermCommand=$global:__arTermAcceptedCommand
+            $global:__arTermAcceptedCommand=$null
+            try { $null=__arTermExchange ('started;'+$global:__arTermCommand) }
+            catch { [Console]::WriteLine('arTerm: ShellMailboxUnavailable; command outcome may be unknown') }
+        }
+        $source
+    } finally {
+        $global:__arTermAcceptedCommand=$null
+        $global:__arTermReading=$false
+    }
+}
 $global:__arTermDisabled=$false
 } catch {
     [Console]::WriteLine('arTerm: ShellIntegrationUnsupported')

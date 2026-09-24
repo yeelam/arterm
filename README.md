@@ -39,6 +39,9 @@ buffer inspection, insertion, and accept-line APIs. An authenticated, bounded
 in-memory pipe delivers command data only to the owned shell process; the handler
 checks the real edit buffer and inserts the original source for ordinary
 top-level execution. Base64 is transport data, not an execution wrapper.
+A read-only `PSConsoleHostReadLine` adapter arms execution tracking only after
+the original reader returns the accepted source. Prompt redraws during editing
+or acceptance cannot report command completion or managed readiness.
 Managed source is excluded from PSReadLine history with a one-line handler that
 restores the exact current user handler before the next manual line. Manual
 history, save settings, and user filters are not globally disabled or replaced.

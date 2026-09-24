@@ -54,9 +54,10 @@ impl Terminal {
             decode_script(encoded));
         let encoded = base64(&script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
         let pair = native_pty_system().openpty(PtySize {
-            rows: 40, cols: 160, pixel_width: 0, pixel_height: 0,
+            rows: 30, cols: 100, pixel_width: 0, pixel_height: 0,
         }).unwrap();
         let mut command = CommandBuilder::new(shell);
+        command.env("ARTERM_SHELL_HISTORY_PATH", home.join("history.txt"));
         command.args(["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand", &encoded]);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
@@ -65,7 +66,7 @@ impl Terminal {
         let mut reader = pair.master.try_clone_reader().unwrap();
         let (tx, output) = mpsc::channel();
         thread::spawn(move || {
-            let mut parser = vt100::Parser::new(40, 160, 0);
+            let mut parser = vt100::Parser::new(30, 100, 0);
             let mut tail = Vec::new();
             let mut bytes = [0; 4096];
             while let Ok(n) = reader.read(&mut bytes) {
@@ -116,6 +117,75 @@ impl Drop for Terminal {
         let _ = self.child.kill();
         let _ = self.child.wait();
         std::fs::remove_dir_all(&self.home).expect("remove only owned fixture history");
+    }
+}
+
+#[test]
+fn managed_completion_waits_for_execution_and_output_after_readline_prompt() {
+    for shell in ["powershell.exe", "pwsh.exe"] {
+        let mailbox = Mailbox::new().unwrap();
+        let commands = Arc::new(Mutex::new(Commands::new()));
+        let script = commands.lock().unwrap().bootstrap_mailbox(&mailbox.name, mailbox.host_started);
+        // A custom read function may redraw the prompt after acceptance, but
+        // before returning the source to the shell for normal execution.
+        let script = decode_script(&script).replace("$global:__arTermOriginalPrompt =", r#"
+$global:FixtureReadLine=(Get-Item Function:\PSConsoleHostReadLine).ScriptBlock
+function global:PSConsoleHostReadLine {
+    $source = & $global:FixtureReadLine
+    [Console]::WriteLine('FIXTURE_READ_ACCEPTED')
+    $null = prompt
+    [Console]::WriteLine('FIXTURE_READ_CALLBACK_DONE')
+    while (-not [IO.File]::Exists($env:ARTERM_SHELL_HISTORY_PATH+'.release')) {
+        Start-Sleep -Milliseconds 10
+    }
+    $source
+}
+$global:__arTermOriginalPrompt ="#);
+        let encoded = base64(&script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+        let mut terminal = Terminal::new(shell, &encoded);
+        let target = commands.clone();
+        mailbox.start(terminal.child.process_id().unwrap(), move |request|
+            target.lock().unwrap().mailbox_exchange(request)).unwrap();
+        terminal.until(";ready");
+        commands.lock().unwrap().output(&terminal.seen);
+        terminal.seen.clear();
+        let gate = terminal.home.join("executing");
+        let release = terminal.home.join("release");
+        let path = |p: &std::path::Path| p.to_str().unwrap().replace('\'', "''");
+        let source = format!(
+            "[IO.File]::WriteAllText('{}','entered'); while (-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output ('FIXTURE_'+'EXECUTED')",
+            path(&gate), path(&release));
+        let id = uuid::Uuid::now_v7();
+        let (_, wake) = commands.lock().unwrap().submit(id, &source).unwrap();
+        terminal.input(&wake.unwrap());
+        terminal.until("FIXTURE_READ_CALLBACK_DONE");
+        commands.lock().unwrap().output(&terminal.seen);
+        assert!(!gate.exists(), "{shell}: source executed before read function returned");
+        assert_ne!(commands.lock().unwrap().record(id).unwrap().state, "completed",
+            "{shell}: completed before read function returned");
+        assert!(!String::from_utf8_lossy(&terminal.seen).contains(";done;"),
+            "{shell}: read callback emitted done before execution");
+        std::fs::write(terminal.home.join("history.txt.release"), "release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(Instant::now() < deadline, "fixture execution gate deadline");
+            thread::sleep(Duration::from_millis(10));
+        }
+        while let Ok(bytes) = terminal.output.try_recv() { terminal.seen.extend(bytes); }
+        commands.lock().unwrap().output(&terminal.seen);
+        let state = commands.lock().unwrap().record(id).unwrap().state;
+        assert_ne!(state, "completed", "{shell}: completed during read callback before gate release");
+        assert!(!String::from_utf8_lossy(&terminal.seen).contains(";done;"),
+            "{shell}: done marker during read callback before gate release");
+        std::fs::write(&release, "release").unwrap();
+        terminal.until(";done;");
+        terminal.until(";ready");
+        commands.lock().unwrap().output(&terminal.seen);
+        assert_eq!(commands.lock().unwrap().record(id).unwrap().state, "completed");
+        let bytes = String::from_utf8_lossy(&terminal.seen);
+        assert!(bytes.find("FIXTURE_EXECUTED").is_some_and(|output|
+            output < bytes.find(";done;").unwrap()), "{shell}: done preceded executed output");
+        println!("{shell}: read callback, read release, execution gate, output, done, ready");
     }
 }
 

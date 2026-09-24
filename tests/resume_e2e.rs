@@ -1371,16 +1371,17 @@ fn send_waits_for_nonediting_input_ack_instead_of_rejecting() {
     }
     let mut sender = Pending(Some(Command::new(controller_executable())
         .env("VSTERM_REMOTE_HOME", &fixture.home)
-        .args(["send", "fixture", "ack-wait", "--command", "$AckWaitProof=42", "--wait", "--timeout", "10s", "--json"])
+        .args(["send", "fixture", "ack-wait", "--command", "$AckWaitProof=42", "--wait", "--timeout", "30s", "--json"])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(sender.0.as_mut().unwrap().try_wait().unwrap().is_none(), "send rejected before its input acknowledgement arrived");
         let listed = control(&["list", "--client", "--json"]);
         assert!(listed.status.success());
         let owners: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
         if owners[0]["control_waiters"].as_u64().unwrap() > 0 { break; }
-        assert!(Instant::now() < deadline, "send was not waiting");
+        assert!(Instant::now() < deadline, "controller launch/authentication did not reach the waiting owner: {owners}");
+        thread::sleep(Duration::from_millis(10));
     }
     // Keep the acknowledgement held across an engine poll, not just admission.
     thread::sleep(Duration::from_millis(150));

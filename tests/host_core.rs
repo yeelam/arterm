@@ -277,7 +277,7 @@ fn create_message(request: Uuid, id: Uuid, claim: &[u8], broker: &[u8]) -> Value
             ("create_claim", Value::Binary(claim.to_vec())),
             ("origin_broker_instance_id", Value::Binary(broker.to_vec())),
             ("connection_epoch", 1.into()),
-            ("shell", s("powershell.exe")),
+            ("shell", s(&std::env::var("ARTERM_TEST_SHELL").unwrap_or_else(|_| "powershell.exe".into()))),
             ("args", Value::Array(vec![s("-NoLogo"), s("-NoProfile")])),
             ("cwd", Value::Nil),
             ("env", map(vec![])),
