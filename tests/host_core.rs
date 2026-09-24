@@ -240,6 +240,16 @@ fn collect_marker(bridge: &mut Bridge, id: Uuid, after: &mut u64, needle: &str) 
     }
 }
 fn marker_pid(text: &str, prefix: &str) -> String {
+    if let Some(pid) = find_marker_pid(text, prefix) { return pid; }
+    // ConPTY may redraw or wrap a marker across VT records. Match the rendered
+    // screen too, rather than requiring one raw contiguous byte spelling.
+    let mut terminal = vt100::Parser::new(30, 100, 0);
+    terminal.process(text.as_bytes());
+    let rendered = terminal.screen().contents().replace(['\r', '\n'], "");
+    find_marker_pid(&rendered, prefix)
+        .unwrap_or_else(|| panic!("missing PID marker {prefix:?}; raw fixture output: {text:?}; rendered: {rendered:?}"))
+}
+fn find_marker_pid(text: &str, prefix: &str) -> Option<String> {
     text.match_indices(prefix)
         .find_map(|(start, _)| {
             let rest = &text[start + prefix.len()..];
@@ -250,7 +260,13 @@ fn marker_pid(text: &str, prefix: &str) -> String {
                 None
             }
         })
-        .unwrap()
+}
+
+#[test]
+fn pid_markers_survive_terminal_wrapping_and_style_records() {
+    assert_eq!(marker_pid("FIRST=\x1b[32m12345\x1b[0m:resumable", "FIRST="), "12345");
+    assert_eq!(marker_pid("SECOND=12\r\n345:resumable", "SECOND="), "12345");
+    assert_eq!(find_marker_pid("FIRST=$PID:resumable", "FIRST="), None);
 }
 fn create_message(request: Uuid, id: Uuid, claim: &[u8], broker: &[u8]) -> Value {
     message(
