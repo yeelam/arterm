@@ -159,11 +159,12 @@ and only when their command matches the owned installed executable.
 3. **On the local client**, run `arTerm-Client-Setup.exe`. Open a fresh PowerShell:
 
    ```powershell
-   arterm login # Only if not already signed in
+   arterm --login # Optional explicit sign-in; arterm login is also supported
    ```
 
    Client Setup completes local initialization; `arterm setup` is not required.
-   Sign in with the same GitHub account if needed. **Copy and run the host's printed
+   Use the same GitHub account as the host. Connections automatically attempt
+   GitHub sign-in when credentials are missing or expired. **Copy and run the host's printed
    registration command once**; client setup does not register the host for you.
    Then create your session:
 
@@ -354,8 +355,22 @@ default registration route.
 
 `arterm doctor my-devbox` checks discovery and reachability. The host's
 `code tunnel` and the client's `devtunnel connect` are two ends of the same
-transport. If credentials have expired, run `arterm login` with the host's
-GitHub account, then retry. Do not reinstall the host or delete session records.
+transport. Starting with 0.7.0, the client attempts a bounded
+`devtunnel user login --github` under the current Windows user when credentials
+are confirmed missing or expired, then checks authentication again before
+continuing. Valid sign-in is left unchanged. Concurrent client operations
+coordinate authentication recovery; there is no periodic login task or
+keep-alive traffic.
+
+The automatic login process has no console window, but GitHub/browser sign-in
+or approval can still appear. Existing browser sign-in may make it complete
+without typing credentials; browser-free or unattended authentication is not
+guaranteed. Network errors, malformed status responses, and timeouts are not
+treated as permission to launch login. Recovery is bounded rather than an
+endless login/reconnect loop. If recovery fails, run `arterm --login` (or
+`arterm login`) explicitly with the host's GitHub account, then retry.
+Installation and host authentication behavior are unchanged.
+Do not reinstall the host or delete session records.
 
 </details>
 

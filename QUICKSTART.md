@@ -154,12 +154,14 @@ From the extracted download:
 Open a fresh PowerShell window, then:
 
 ```powershell
-arterm.exe login # Only if not already signed in
+arterm.exe --login # Optional explicit sign-in; arterm.exe login also works
 ```
 
 The installer completes local initialization without inspecting or changing sign-in;
 no `arterm setup` is required. Use the **same GitHub account as the remote host**.
-Already signed-in users can go directly to registration. Run the registration command
+Already signed-in users can go directly to registration. Client connections
+attempt GitHub sign-in automatically if credentials are missing or expired;
+the installer itself never signs in. Run the registration command
 the host printed in PowerShell. For example (use the actual remote host path):
 
 ```powershell
@@ -189,8 +191,40 @@ Client configuration writers share a short-lived lock (up to two seconds of
 waiting); dependency download prompts do not hold it. Initialization reloads
 registrations before saving. If another command changes the configured dependency
 during selection, initialization fails without overwriting it; retry the command.
-Use `arterm login` explicitly if sign-in is needed. Installer switches use
+Use `arterm --login` (or `arterm login`) for explicit sign-in or recovery.
+Installer switches use
 slashes (`/quiet`, `/no-download`); runtime setup switches use double hyphens.
+
+### Automatic client sign-in recovery (0.7.0)
+
+When a client network operation detects missing or expired authentication,
+it attempts `devtunnel user login --github` in a hidden process under your
+current Windows user, then verifies sign-in before continuing. It uses the
+configured devtunnel executable and does not change a valid sign-in.
+Concurrent operations coordinate recovery rather than opening duplicate logins.
+There is no scheduled login, permanent client background service, or periodic
+traffic added by this feature. Offline `list` and `connect MACHINE` (which only
+prints a command) do not sign in.
+
+Hidden process launch does not guarantee hidden browser authentication.
+GitHub may open a browser or require sign-in/approval; an existing browser
+session can avoid manual credential entry. Recovery is bounded and does not
+turn network errors, malformed responses, or status-check timeouts into login
+attempts. Authentication recovery has a shared 60-second budget for coordination,
+login, and verification. A later reconnect can recover another expiry after a
+verified connection has been established; a failed connection episode does not
+keep launching login. If recovery cannot establish valid authentication, arTerm stops with
+an explicit instruction to run:
+
+```powershell
+arterm --login
+# Equivalent:
+arterm login
+```
+
+Use the same GitHub account as the host, then retry the original command.
+Host setup/startup authentication and installer sign-in behavior are unchanged.
+No session recovery files or host registrations need to be deleted.
 
 `connect MACHINE` only prints a reusable command and exits, without a
 remote connection. `connect MACHINE SESSION` creates on first use and recovers the

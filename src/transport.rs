@@ -8,11 +8,30 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpStream},
     os::windows::fs::OpenOptionsExt,
+    os::windows::{
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Security::{
+        Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
+        },
+        GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    },
+    System::Threading::{
+        CreateEventW, CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, SetEvent,
+        WaitForSingleObject, CREATE_NO_WINDOW,
+    },
 };
 
 pub const BRIDGE_ARGS: &[&str] = &["bridge", "--protocol", "vsterm-session-v1"];
@@ -129,13 +148,59 @@ fn note_forward(candidates: &mut BTreeMap<u16, Instant>, port: u16, now: Instant
 pub struct LoginRequired;
 impl std::fmt::Display for LoginRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("devtunnel login is missing or expired; run the new client's `login` command using the host's GitHub account")
+        f.write_str("devtunnel authentication requires attention; run `arterm --login` using the same GitHub account as the host")
     }
 }
 impl std::error::Error for LoginRequired {}
 
+#[derive(Debug)]
+struct AuthenticationRejected;
+impl std::fmt::Display for AuthenticationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("devtunnel rejected access; check tunnel permissions and the host's account")
+    }
+}
+impl std::error::Error for AuthenticationRejected {}
+
 impl Forward {
     pub fn start(devtunnel: &Path, tunnel_id: &str) -> Result<(Self, String)> {
+        let failure = authentication_object(true);
+        match Self::start_once(devtunnel, tunnel_id) {
+            Err(error) if error.is::<LoginRequired>() => {
+                AUTHENTICATION.recover(devtunnel, &failure)?;
+                Self::retry_after_authentication(devtunnel, tunnel_id, &failure)
+            }
+            Err(error) if error.is::<AuthenticationRejected>() => {
+                if !authenticated(devtunnel)? {
+                    AUTHENTICATION.recover(devtunnel, &failure)?;
+                    Self::retry_after_authentication(devtunnel, tunnel_id, &failure)
+                } else {
+                    Err(LoginRequired.into_error(error))
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn retry_after_authentication(
+        devtunnel: &Path, tunnel_id: &str, failure: &Result<OwnedHandle>,
+    ) -> Result<(Self, String)> {
+        Self::start_once(devtunnel, tunnel_id).map_err(|error| {
+            let error = if error.is::<AuthenticationRejected>() {
+                LoginRequired.into_error(error)
+            } else {
+                error
+            };
+            if error.is::<LoginRequired>() {
+                if let Ok(failure) = failure {
+                    unsafe { SetEvent(failure.as_raw_handle()); }
+                }
+            }
+            error
+        })
+    }
+
+    fn start_once(devtunnel: &Path, tunnel_id: &str) -> Result<(Self, String)> {
         let deadline = Instant::now() + Duration::from_secs(40);
         if !authenticated_until(devtunnel, deadline)? {
             return Err(LoginRequired.into());
@@ -173,6 +238,9 @@ impl Forward {
                 let line = line?;
                 if authentication_failure_text(&line) {
                     return Err(LoginRequired.into());
+                }
+                if authentication_rejected_text(&line) {
+                    return Err(AuthenticationRejected.into());
                 }
                 if let Some((local, remote)) = forwarded_port(&line) {
                     if published.is_empty() || published.contains(&remote) {
@@ -284,6 +352,7 @@ fn kill_owned_process_tree(child: &mut Child) {
         return;
     }
     let _ = Command::new("taskkill.exe")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -469,50 +538,327 @@ fn authentication_failure_text(text: &str) -> bool {
         "login required",
         "not logged in",
         "not authenticated",
-        "authentication failed",
-        "unauthorized",
+        "access token expired",
+        "token has expired",
     ]
     .iter()
     .any(|s| lower.contains(s))
 }
 
+fn authentication_rejected_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "unauthorized",
+        "forbidden",
+        "authentication failed",
+        "http 401",
+        "http 403",
+        "status code: 401",
+        "status code: 403",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+}
+
+fn authentication_metadata_text(value: &serde_json::Value, matches: fn(&str) -> bool) -> bool {
+    ["status", "error", "message"].iter().any(|key| {
+        match value.get(key) {
+            Some(serde_json::Value::String(text)) => matches(text),
+            Some(error) if *key == "error" => ["code", "message", "description"].iter()
+                .filter_map(|key| error.get(key).and_then(|value| value.as_str()))
+                .any(matches),
+            _ => false,
+        }
+    })
+}
+
 fn reject_expired_auth(output: &Captured) -> Result<()> {
-    if authentication_failure_text(&String::from_utf8_lossy(&output.stdout))
-        || authentication_failure_text(&String::from_utf8_lossy(&output.stderr))
-    {
+    ensure!(!output.truncated, "devtunnel metadata output exceeded 4 MiB");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = if stdout.trim_start().starts_with(['{', '[']) {
+        Some(
+            serde_json::from_str::<serde_json::Value>(&stdout)
+                .context("invalid devtunnel metadata JSON")?,
+        )
+    } else {
+        None
+    };
+    let auth_text = match &json {
+        Some(value) => authentication_metadata_text(value, authentication_failure_text),
+        None => authentication_failure_text(&stdout),
+    };
+    if auth_text || authentication_failure_text(&String::from_utf8_lossy(&output.stderr)) {
         return Err(LoginRequired.into());
+    }
+    let rejected = match &json {
+        Some(value) => authentication_metadata_text(value, authentication_rejected_text),
+        None => authentication_rejected_text(&stdout),
+    };
+    if rejected || authentication_rejected_text(&String::from_utf8_lossy(&output.stderr)) {
+        return Err(AuthenticationRejected.into());
     }
     Ok(())
 }
 
-fn auth_response_ready(output: &Captured) -> bool {
-    if !output.status.success() || output.truncated || reject_expired_auth(output).is_err() {
-        return false;
-    }
+fn auth_response_ready(output: &Captured) -> Result<bool> {
+    ensure!(
+        !output.truncated,
+        "devtunnel authentication response exceeded 4 MiB"
+    );
     // `user show --json` can exit zero with {"status":"Login token expired"}.
     // Require a positive status rather than trusting its process exit code.
-    let text = String::from_utf8_lossy(&output.stdout);
-    let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
-    let status = parsed
-        .as_ref()
-        .and_then(|v| v.get("status"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&text)
-        .trim()
-        .to_ascii_lowercase();
-    status == "logged in" || status.starts_with("logged in as ")
+    let text = std::str::from_utf8(&output.stdout)
+        .context("invalid devtunnel authentication response encoding")?;
+    let parsed = if text.trim_start().starts_with(['{', '[']) {
+        Some(
+            serde_json::from_str::<serde_json::Value>(text)
+                .context("invalid devtunnel authentication JSON")?,
+        )
+    } else {
+        None
+    };
+    if parsed.as_ref().is_some_and(|value| {
+        authentication_metadata_text(value, authentication_failure_text)
+    }) || authentication_failure_text(&String::from_utf8_lossy(&output.stderr))
+    {
+        return Ok(false);
+    }
+    let status = match &parsed {
+        Some(value) => value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .context("unrecognized devtunnel authentication status")?,
+        None => text,
+    }
+    .trim()
+    .to_ascii_lowercase();
+    if authentication_failure_text(&status)
+        || authentication_failure_text(&String::from_utf8_lossy(&output.stderr))
+    {
+        return Ok(false);
+    }
+    ensure!(
+        output.status.success(),
+        "devtunnel authentication status command failed"
+    );
+    ensure!(
+        status == "logged in" || status.starts_with("logged in as "),
+        "unrecognized devtunnel authentication status"
+    );
+    Ok(true)
 }
 
 fn authenticated_until(devtunnel: &Path, deadline: Instant) -> Result<bool> {
-    Ok(auth_response_ready(&metadata(
+    auth_response_ready(&metadata(
         devtunnel,
         &["user", "show", "--json"],
         deadline,
-    )?))
+    )?)
 }
 
 pub fn authenticated(devtunnel: &Path) -> Result<bool> {
     authenticated_until(devtunnel, Instant::now() + Duration::from_secs(10))
+}
+
+#[derive(Default)]
+struct Authentication {
+    attempted: AtomicBool,
+}
+static AUTHENTICATION: Authentication = Authentication {
+    attempted: AtomicBool::new(false),
+};
+
+// Register each network operation before its status check. Overlapping operations
+// retain the same user-scoped failure event; later independent commands get a fresh event.
+fn authentication_object(event: bool) -> Result<OwnedHandle> {
+    let sid = authentication_user_sid()?;
+    let wide = |text: String| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let name = wide(format!(
+        "Global\\arTerm-devtunnel-auth-{sid}-{}",
+        if event { "failure" } else { "lock" }
+    ));
+    let sddl = wide(format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"));
+    let mut descriptor = std::ptr::null_mut();
+    ensure!(
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } != 0,
+        "cannot secure devtunnel authentication serialization"
+    );
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        if event {
+            CreateEventW(&attributes, 1, 0, name.as_ptr())
+        } else {
+            CreateMutexW(&attributes, 0, name.as_ptr())
+        }
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    ensure!(
+        !handle.is_null(),
+        "cannot open devtunnel authentication serialization"
+    );
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
+// host_pipe is host-binary-only, not a library module. This lookup uses aligned
+// TOKEN_USER storage and owns the token through every error path.
+fn authentication_user_sid() -> Result<String> {
+    let mut token = std::ptr::null_mut();
+    ensure!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+        "cannot open current authentication user"
+    );
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(), TokenUser, std::ptr::null_mut(), 0, &mut needed,
+        );
+    }
+    ensure!(needed > 0, "cannot size current authentication user");
+    let mut data = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    ensure!(
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(), TokenUser, data.as_mut_ptr().cast(), needed, &mut needed,
+            )
+        } != 0,
+        "cannot read current authentication user"
+    );
+    let mut text = std::ptr::null_mut();
+    ensure!(
+        unsafe {
+            ConvertSidToStringSidW((*(data.as_ptr().cast::<TOKEN_USER>())).User.Sid, &mut text)
+        } != 0,
+        "cannot format current authentication user"
+    );
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        let sid = String::from_utf16(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        sid.context("invalid authentication user SID")
+    }
+}
+
+struct AuthenticationLock(OwnedHandle);
+impl AuthenticationLock {
+    fn acquire(deadline: Instant) -> Result<Self> {
+        let handle = authentication_object(false)?;
+        let timeout = remaining(deadline)?.as_millis().min(u32::MAX as u128 - 1) as u32;
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), timeout) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+            WAIT_TIMEOUT => bail!("devtunnel authentication serialization timed out"),
+            _ => bail!("devtunnel authentication serialization failed"),
+        }
+    }
+}
+impl Drop for AuthenticationLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0.as_raw_handle());
+        }
+    }
+}
+
+impl Authentication {
+    fn established(&self) {
+        self.attempted.store(false, Ordering::SeqCst);
+    }
+
+    fn recover(&self, devtunnel: &Path, failure: &Result<OwnedHandle>) -> Result<()> {
+        self.recover_until(
+            devtunnel,
+            Instant::now() + Duration::from_secs(60),
+            failure.as_ref().map_err(|error| anyhow::anyhow!("{error}")),
+        )
+    }
+
+    fn recover_until(
+        &self,
+        devtunnel: &Path,
+        deadline: Instant,
+        failure: Result<&OwnedHandle>,
+    ) -> Result<()> {
+        let result = (|| -> Result<()> {
+            let failure = failure?;
+            let _lock = AuthenticationLock::acquire(deadline)?;
+            if authenticated_until(devtunnel, deadline)? {
+                return Ok(());
+            }
+            ensure!(
+                unsafe { WaitForSingleObject(failure.as_raw_handle(), 0) } == WAIT_TIMEOUT
+                    && !self.attempted.swap(true, Ordering::SeqCst),
+                "automatic devtunnel sign-in already attempted"
+            );
+            let attempt = (|| -> Result<()> {
+                let mut login = Command::new(devtunnel);
+                login
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args(["user", "login", "--github"]);
+                let output = capture_bounded(login, remaining(deadline)?, 64 * 1024)?;
+                ensure!(
+                    output.status.success(),
+                    "automatic devtunnel sign-in exited unsuccessfully"
+                );
+                ensure!(
+                    authenticated_until(devtunnel, deadline)?,
+                    "automatic devtunnel sign-in did not establish usable credentials"
+                );
+                Ok(())
+            })();
+            if attempt.is_err() {
+                unsafe {
+                    SetEvent(failure.as_raw_handle());
+                }
+            }
+            attempt
+        })();
+        // Never include vendor login output, OAuth links, or tokens in diagnostics.
+        result.map_err(|error| LoginRequired.into_error(error))
+    }
+}
+
+impl LoginRequired {
+    fn into_error(self, diagnostic: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(self).context(diagnostic.to_string())
+    }
+}
+
+pub fn ensure_authenticated(devtunnel: &Path) -> Result<()> {
+    let failure = authentication_object(true);
+    if authenticated(devtunnel)? {
+        return Ok(());
+    }
+    AUTHENTICATION.recover(devtunnel, &failure)
+}
+
+pub fn login(devtunnel: &Path) -> Result<()> {
+    let _lock = AuthenticationLock::acquire(Instant::now() + Duration::from_secs(60))?;
+    let status = Command::new(devtunnel)
+        .args(["user", "login", "--github"])
+        .status()
+        .context("start interactive devtunnel sign-in")?;
+    ensure!(status.success(), "devtunnel login exited with {status}");
+    ensure!(
+        authenticated(devtunnel)?,
+        "devtunnel login did not establish usable credentials"
+    );
+    Ok(())
 }
 
 fn published_ports(devtunnel: &Path, tunnel_id: &str, deadline: Instant) -> Result<BTreeSet<u16>> {
@@ -714,6 +1060,10 @@ impl TunnelLink {
                 && link.stdout_id != link.stderr_id,
             "duplicate VS stream IDs"
         );
+        if link._forward.is_some() {
+            // Sign-in and port probes alone must not re-arm an unestablished episode.
+            AUTHENTICATION.established();
+        }
         Ok(link)
     }
     fn raw(&mut self, value: &Value) -> Result<()> {
@@ -816,22 +1166,70 @@ mod tests {
             truncated: false,
         };
         let expired = output(r#"{"status":"Login token expired"}"#, "");
-        assert!(!auth_response_ready(&expired));
+        assert!(!auth_response_ready(&expired).unwrap());
         assert!(reject_expired_auth(&expired)
             .unwrap_err()
             .is::<LoginRequired>());
-        assert!(!auth_response_ready(&output("", "Login token expired.")));
-        assert!(!auth_response_ready(&output("{}", "")));
+        assert!(!auth_response_ready(&output("", "Login token expired.")).unwrap());
+        assert!(!auth_response_ready(&output(
+            r#"{"error":{"message":"Not logged in"}}"#, ""
+        )).unwrap());
+        assert!(auth_response_ready(&output("{}", "")).is_err());
         assert!(!auth_response_ready(&output(
             r#"{"status":"not logged in"}"#,
             ""
-        )));
+        )).unwrap());
         assert!(auth_response_ready(&output(
             r#"{"status":"Logged in as example (GitHub)"}"#,
             ""
-        )));
-        assert!(auth_response_ready(&output("Logged in as example", "")));
+        )).unwrap());
+        assert!(auth_response_ready(&output("Logged in as example", "")).unwrap());
         assert!(reject_expired_auth(&output(r#"{"tunnels":[]}"#, "")).is_ok());
+        assert!(reject_expired_auth(&output(
+            r#"{"tunnels":[{"name":"login required"}]}"#, ""
+        )).is_ok());
+        assert!(reject_expired_auth(&output("", "Unauthorized: HTTP 403"))
+            .unwrap_err().is::<AuthenticationRejected>());
+        assert!(reject_expired_auth(&output(
+            r#"{"error":{"message":"Login token expired"}}"#, ""
+        )).unwrap_err().is::<LoginRequired>());
+        for text in [
+            r#"{"status":"Login token expired""#,
+            r#"{"status":"network unavailable"}"#,
+            "authentication failed",
+            "unauthorized",
+        ] {
+            assert!(auth_response_ready(&output(text, "")).is_err(), "{text}");
+        }
+        let mut truncated = expired;
+        truncated.truncated = true;
+        assert!(auth_response_ready(&truncated).is_err());
+        assert!(!reject_expired_auth(&truncated).unwrap_err().is::<LoginRequired>());
+    }
+
+    #[test]
+    fn authentication_serialization_timeout_is_bounded_and_typed() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _lock = AuthenticationLock::acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let authentication = Authentication::default();
+        let failure = authentication_object(true).unwrap();
+        let started = Instant::now();
+        let error = authentication.recover_until(
+            Path::new(r"C:\unused-vendor.exe"), started + Duration::from_millis(150),
+            Ok(&failure),
+        ).unwrap_err();
+        assert!(error.is::<LoginRequired>());
+        assert!(format!("{error:#}").contains("serialization timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!authentication.attempted.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]
