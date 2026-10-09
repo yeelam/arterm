@@ -2,6 +2,7 @@ use arterm::client_config;
 use std::{
     fs,
     net::TcpListener,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Mutex,
@@ -24,6 +25,8 @@ impl Fixture {
             .join("target")
             .join(format!("client-auth-{}", Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
+        // Preserve the extended prefix for production's raw Win32 atomic replacements.
+        let root = fs::canonicalize(&root).unwrap();
         let vendor = root.join("vendor.exe");
         let build = Command::new("rustc")
             .args(["--edition=2021", "tests\\fixtures\\auth_vendor.rs", "-o"])
@@ -39,6 +42,10 @@ impl Fixture {
     }
 
     fn home(&self, mode: &str, initially_ready: bool) -> PathBuf {
+        self.home_under(&self.root, mode, initially_ready)
+    }
+
+    fn home_under(&self, parent: &Path, mode: &str, initially_ready: bool) -> PathBuf {
         for file in ["calls", "ready", "discovered", "denied"] {
             let _ = fs::remove_file(self.root.join(file));
         }
@@ -46,7 +53,7 @@ impl Fixture {
         if initially_ready {
             fs::write(self.root.join("ready"), b"ready").unwrap();
         }
-        let home = self.root.join(format!("home-{}", Uuid::now_v7()));
+        let home = parent.join(format!("home-{}", Uuid::now_v7()));
         client_config::update(&home, |config| {
             config.devtunnel_path = Some(self.vendor.clone());
             client_config::add(config, "fixture", "fixture", r"C:\Tools\arterm-host.exe")?;
@@ -96,6 +103,68 @@ fn fallback(output: &Output) {
     );
     assert!(!diagnostic.contains("SECRET_OAUTH"), "{diagnostic}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET_OAUTH"));
+}
+
+#[test]
+fn long_private_checkout_fixture_preserves_atomic_saved_sessions_and_cleanup() {
+    use arterm::store::{SessionReference, Store};
+    let _guard = AUTHENTICATION_TESTS.lock().unwrap();
+    let fixture = Fixture::new();
+    // Keep linker output short while exercising extended state paths beyond MAX_PATH.
+    let checkout = fixture
+        .root
+        .join("private-checkout")
+        .join("source")
+        .join("long-checkout-component-".repeat(5));
+    let home = fixture.home_under(&checkout, "unauthorized", true);
+    let config = client_config::load(&home).unwrap();
+    let target = &config.targets["fixture"];
+    let dir = client_config::state_dir(&home, target);
+    let (store, state) = Store::resolve(
+        &dir,
+        &target.target_id,
+        &SessionReference::parse("saved").unwrap(),
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+    let record = dir.join(format!("{}.dpapi", state.id));
+    let temporary = record.with_extension(format!("{}.tmp", Uuid::now_v7()));
+    let wide: Vec<u16> = temporary.as_os_str().encode_wide().collect();
+    assert_eq!(
+        &wide[..4],
+        &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]
+    );
+    assert!(
+        wide.len() - 4 > 260,
+        "replacement path must exceed MAX_PATH"
+    );
+    store.save(&state).unwrap();
+    assert_eq!(
+        store.load(&target.target_id, state.id).unwrap().id,
+        state.id
+    );
+    let before = fs::read(&record).unwrap();
+    drop(store);
+    #[cfg(feature = "test-unsigned-ipc")]
+    {
+        fallback(&run(
+            &home,
+            &["connect", "fixture", "saved", "--stdio", "--retries", "1"],
+        ));
+        assert_eq!(fixture.calls("login-hidden"), 0);
+        assert_eq!(fixture.calls("connect"), 1);
+    }
+    assert_eq!(fs::read(&record).unwrap(), before);
+    let owned_root = fixture.root.clone();
+    let shared_parent = owned_root.parent().unwrap().to_owned();
+    drop(fixture);
+    assert!(!owned_root.try_exists().unwrap());
+    assert!(
+        shared_parent.is_dir(),
+        "cleanup must preserve the shared parent"
+    );
 }
 
 fn control_connection(
