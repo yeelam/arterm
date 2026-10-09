@@ -15,6 +15,54 @@ use windows_sys::Win32::{
     Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
 };
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementReason {
+    Completed,
+    Missing,
+    BrokerChanged,
+}
+
+fn validate_lifecycle_knowledge(
+    ended: bool, exit_confirmed: Option<bool>, reason: Option<RetirementReason>,
+) -> Result<()> {
+    ensure!(exit_confirmed != Some(true) || ended,
+        "confirmed exit knowledge requires ended state");
+    if let Some(reason) = reason {
+        ensure!(ended, "retirement reason requires ended state");
+        match reason {
+            RetirementReason::Completed => ensure!(exit_confirmed == Some(true),
+                "completed retirement requires confirmed exit knowledge"),
+            RetirementReason::Missing | RetirementReason::BrokerChanged =>
+                ensure!(exit_confirmed != Some(true),
+                    "noncompletion retirement contradicts confirmed exit knowledge"),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct RetiredSession {
+    pub id: Uuid,
+    pub reason: RetirementReason,
+}
+
+impl std::fmt::Display for RetiredSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session {} is already retired ({:?}); its GUID cannot be reused", self.id, self.reason)
+    }
+}
+impl std::error::Error for RetiredSession {}
+
+#[derive(Debug)]
+pub struct RecoveryBlocked;
+impl std::fmt::Display for RecoveryBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session recovery is blocked; exit/nonexistence is not confirmed")
+    }
+}
+impl std::error::Error for RecoveryBlocked {}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PendingInput {
     pub seq: u64,
@@ -42,6 +90,11 @@ pub struct State {
     pub pending: Option<PendingInput>,
     #[serde(default)]
     pub ended: bool,
+    /// Separate exit knowledge from the fail-closed recovery guard above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_confirmed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<RetirementReason>,
     #[serde(default)]
     pub reference: Option<String>,
     #[serde(default = "legacy_command_execution")]
@@ -71,8 +124,53 @@ impl State {
             input_ack: 0,
             pending: None,
             ended: false,
+            exit_confirmed: None,
+            retirement_reason: None,
             reference: None,
             command_execution: None,
+        }
+    }
+
+    pub fn mark_ended(&mut self, confirmed: bool) -> Result<()> {
+        validate_lifecycle_knowledge(self.ended, self.exit_confirmed, self.retirement_reason)?;
+        if confirmed { return self.mark_retired(RetirementReason::Completed); }
+        self.ended = true;
+        self.exit_confirmed = Some(self.exit_confirmed == Some(true));
+        Ok(())
+    }
+
+    pub fn mark_retired(&mut self, reason: RetirementReason) -> Result<()> {
+        validate_lifecycle_knowledge(self.ended, self.exit_confirmed, self.retirement_reason)?;
+        let reason = if self.exit_confirmed == Some(true) { RetirementReason::Completed } else { reason };
+        self.ended = true;
+        self.exit_confirmed = Some(reason == RetirementReason::Completed);
+        self.retirement_reason = Some(reason);
+        self.claim.clear();
+        self.token = None;
+        self.pending = None;
+        self.args.clear();
+        self.cwd = None;
+        Ok(())
+    }
+
+    pub fn merge_ended(&mut self, other: &State) -> Result<()> {
+        validate_lifecycle_knowledge(self.ended, self.exit_confirmed, self.retirement_reason)?;
+        validate_lifecycle_knowledge(other.ended, other.exit_confirmed, other.retirement_reason)?;
+        if other.ended {
+            if let Some(reason) = other.retirement_reason {
+                self.mark_retired(reason)?;
+            } else {
+                self.mark_ended(other.exit_confirmed == Some(true))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn broker_binding_is_safe(&self) -> bool {
+        match &self.origin {
+            Some(origin) => origin.len() == 16,
+            None => self.token.is_none() && self.pending.is_none() && self.epoch == 0
+                && self.input_ack == 0 && self.create_deadline_ms.is_none(),
         }
     }
 }
@@ -82,6 +180,7 @@ pub struct Store {
     _lock: File,
     _reference_lock: Option<File>,
     known: bool,
+    writer: std::sync::Mutex<()>,
 }
 
 /// Public, non-secret reference. Names and canonical GUIDs are case-insensitive.
@@ -161,6 +260,159 @@ pub fn saved_sessions(dir: &Path) -> Result<Vec<SavedSession>> {
     Ok(result)
 }
 
+#[derive(Deserialize)]
+struct Lifecycle {
+    schema: u32,
+    id: Uuid,
+    box_name: String,
+    #[serde(default)]
+    ended: bool,
+    #[serde(default)]
+    exit_confirmed: Option<bool>,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    retirement_reason: Option<RetirementReason>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    reason: Option<RetirementReason>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredGuard {
+    schema: u32,
+    kind: String,
+    id: Uuid,
+    box_name: String,
+    #[serde(deserialize_with = "required_guard_reference")]
+    reference: Option<String>,
+    reason: RetirementReason,
+}
+
+fn required_guard_reference<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+impl Lifecycle {
+    fn validate(&self, box_name: &str, id: Uuid) -> Result<()> {
+        ensure!(self.schema == 1 && self.id == id && self.box_name == box_name,
+            "session identity/box mismatch");
+        if let Some(reference) = &self.reference {
+            ensure!(SessionReference::parse(reference)?.as_str() == reference,
+                "invalid protected reference");
+        }
+        ensure!(self.kind.as_deref().map_or(true, |kind| kind == "retired"),
+            "unknown recovery record kind");
+        ensure!(self.kind.is_none() || self.reason.is_some(), "invalid retired guard");
+        if self.kind.is_none() {
+            validate_lifecycle_knowledge(self.ended, self.exit_confirmed, self.retirement_reason)?;
+        }
+        Ok(())
+    }
+
+    fn retirement(&self) -> Option<RetirementReason> {
+        if self.kind.as_deref() == Some("retired") { return self.reason; }
+        if !self.ended { return None; }
+        self.retirement_reason.or((self.exit_confirmed == Some(true)).then_some(RetirementReason::Completed))
+    }
+}
+
+fn read_protected_record(path: &Path) -> Result<Vec<u8>> {
+    use std::{io::Read, os::windows::fs::MetadataExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    const MAX_RECORD: u64 = 1024 * 1024;
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path).context("open protected recovery record")?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "protected recovery record is not a regular file");
+    ensure!(metadata.len() <= MAX_RECORD, "oversized protected recovery record");
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= MAX_RECORD, "oversized protected recovery record");
+    let plain = protect(&bytes, false)?;
+    ensure!(plain.len() as u64 <= MAX_RECORD, "oversized protected recovery state");
+    Ok(plain)
+}
+
+fn read_lifecycle(path: &Path, box_name: &str, id: Uuid) -> Result<Lifecycle> {
+    Ok(validated_record(&read_protected_record(path)?, box_name, id)?.0)
+}
+
+fn validated_record(plain: &[u8], box_name: &str, id: Uuid) -> Result<(Lifecycle, Option<State>)> {
+    let lifecycle: Lifecycle = serde_json::from_slice(plain)
+        .map_err(|_| anyhow::anyhow!("invalid protected lifecycle"))?;
+    lifecycle.validate(box_name, id)?;
+    if lifecycle.kind.as_deref() == Some("retired") {
+        let guard: RetiredGuard = serde_json::from_slice(plain)
+            .map_err(|_| anyhow::anyhow!("invalid retired guard"))?;
+        ensure!(guard.schema == 1 && guard.kind == "retired" && guard.id == id
+            && guard.box_name == box_name, "retired guard identity/box mismatch");
+        return Ok((lifecycle, None));
+    }
+    let state: State = serde_json::from_slice(plain)
+        .map_err(|_| anyhow::anyhow!("invalid protected state"))?;
+    validate_state(&state, box_name, id)?;
+    Ok((lifecycle, Some(state)))
+}
+
+fn validate_state(state: &State, box_name: &str, id: Uuid) -> Result<()> {
+    ensure!(state.schema == 1 && state.id == id && state.box_name == box_name,
+        "session identity/box mismatch");
+    if let Some(reference) = &state.reference {
+        ensure!(SessionReference::parse(reference)?.as_str() == reference, "invalid protected reference");
+    }
+    validate_lifecycle_knowledge(state.ended, state.exit_confirmed, state.retirement_reason)?;
+    ensure!(state.claim.len() == 32, "invalid create claim");
+    ensure!(state.token.as_ref().map_or(true, |token| token.len() == 32), "invalid resume token");
+    ensure!(state.origin.as_ref().map_or(true, |origin| origin.len() == 16), "invalid broker identity");
+    ensure!(state.create_epoch > 0 && state.create_epoch < u64::MAX && state.epoch < u64::MAX
+        && state.input_ack < u64::MAX, "invalid recovery counters");
+    if let Some(pending) = &state.pending {
+        ensure!(state.input_ack.checked_add(1) == Some(pending.seq)
+            && !pending.bytes.is_empty() && pending.bytes.len() <= 4096, "invalid outstanding input");
+    }
+    Ok(())
+}
+
+pub fn active_sessions(dir: &Path, box_name: &str) -> Result<Vec<SavedSession>> {
+    let mut active = Vec::new();
+    for session in saved_sessions(dir)? {
+        if !session.recovery_record_present {
+            active.push(session);
+            continue;
+        }
+        let result = (|| -> Result<bool> {
+            let lifecycle = read_lifecycle(&dir.join(format!("{}.dpapi", session.session_id)), box_name, session.session_id)?;
+            if lifecycle.kind.as_deref() == Some("retired") { return Ok(false); }
+            if let Some(reason) = lifecycle.retirement() {
+                let store = Store::open(dir, session.session_id)?;
+                store.retire(box_name, session.session_id, reason)?;
+                return Ok(false);
+            }
+            if lifecycle.ended && lifecycle.exit_confirmed.is_none() {
+                crate::statusln!("[list] {}: legacy end decision has no exit confirmation; reference retained until explicit reconciliation.", session.session_id);
+            }
+            Ok(true)
+        })();
+        match result {
+            Ok(false) => {}
+            Ok(true) => active.push(session),
+            Err(_) => {
+                crate::statusln!("[list] {}: recovery lifecycle unavailable; retaining reference with remote state unknown.", session.session_id);
+                active.push(session);
+            }
+        }
+    }
+    Ok(active)
+}
+
 fn lock_record(path: &Path) -> Result<(File, bool)> {
     match OpenOptions::new().write(true).create_new(true).share_mode(0).open(path) {
         Ok(file) => {
@@ -184,6 +436,7 @@ impl Store {
             _lock: lock,
             _reference_lock: None,
             known,
+            writer: std::sync::Mutex::new(()),
         })
     }
 
@@ -194,6 +447,24 @@ impl Store {
         create: bool,
         shell: Option<&str>,
         cwd: Option<&str>,
+    ) -> Result<(Self, State)> {
+        Self::resolve_inner(dir, box_name, reference, create, shell, cwd, false)
+    }
+
+    pub fn resolve_for_management(
+        dir: &Path, box_name: &str, reference: &SessionReference,
+    ) -> Result<(Self, State)> {
+        Self::resolve_inner(dir, box_name, reference, false, None, None, true)
+    }
+
+    fn resolve_inner(
+        dir: &Path,
+        box_name: &str,
+        reference: &SessionReference,
+        create: bool,
+        shell: Option<&str>,
+        cwd: Option<&str>,
+        management: bool,
     ) -> Result<(Self, State)> {
         fs::create_dir_all(dir)?;
         let mut reference_lock = None;
@@ -227,7 +498,36 @@ impl Store {
         let mut store = Self::open(dir, id)?;
         store._reference_lock = reference_lock;
         let state = if store.known || store.path.try_exists()? || (!new_mapping && Uuid::parse_str(reference.as_str()).is_err()) {
-            store.load(box_name, id)?
+            match store.load(box_name, id) {
+                Ok(state) => state,
+                Err(error) => {
+                    if let Some(retired) = error.downcast_ref::<RetiredSession>() {
+                        if Uuid::parse_str(reference.as_str()).is_err() {
+                            let lifecycle = read_lifecycle(&store.path, box_name, id)?;
+                            ensure!(lifecycle.reference.as_deref() == Some(reference.as_str()),
+                                "reference/state identity mismatch");
+                            if create {
+                                let mut fresh = State::new(box_name.to_owned(),
+                                    shell.unwrap_or("powershell.exe").to_owned(), Vec::new(), cwd.map(str::to_owned));
+                                fresh.reference = Some(reference.as_str().to_owned());
+                                fresh.claim = random_claim()?;
+                                let mut replacement = Store::open(dir, fresh.id)?;
+                                ensure!(!replacement.known && !replacement.path.try_exists()?,
+                                    "fresh session identity already reserved");
+                                replacement._reference_lock = store._reference_lock.take();
+                                replacement.save(&fresh)?;
+                                // A crash before this publication leaves an unusable orphan;
+                                // the old mapping and its retired GUID remain intact.
+                                atomic_write(&dir.join(format!("ref-{}.json", reference.as_str())),
+                                    &serde_json::to_vec(&fresh.id)?)?;
+                                return Ok((replacement, fresh));
+                            }
+                        }
+                        return Err(RetiredSession { id: retired.id, reason: retired.reason }.into());
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             ensure!(create, "no saved session; resume never creates");
             let mut state = State::new(
@@ -247,40 +547,60 @@ impl Store {
         if Uuid::parse_str(reference.as_str()).is_err() {
             ensure!(state.reference.as_deref() == Some(reference.as_str()), "reference/state identity mismatch");
         }
-        ensure!(!state.ended, "session has ended; choose a NEW reference");
+        if let Some(name) = &state.reference {
+            let mapped: Uuid = serde_json::from_slice(&fs::read(dir.join(format!("ref-{name}.json")))?)
+                .context("invalid reference publication")?;
+            ensure!(mapped == state.id, "reference publication incomplete or superseded; refusing session use");
+        }
+        if state.ended && !management { return Err(RecoveryBlocked.into()); }
         ensure!(shell.map_or(true, |s| s == state.shell), "incompatible --shell for saved session");
         ensure!(cwd.map_or(true, |c| state.cwd.as_deref() == Some(c)), "incompatible --cwd for saved session");
         Ok((store, state))
     }
     pub fn load(&self, box_name: &str, id: Uuid) -> Result<State> {
-        let bytes =
-            fs::read(&self.path).context("no saved session; refusing to create a replacement")?;
-        let plain = protect(&bytes, false)?;
-        let state: State = serde_json::from_slice(&plain).context("invalid protected state")?;
-        ensure!(
-            state.schema == 1 && state.id == id && state.box_name == box_name,
-            "session identity/box mismatch"
-        );
-        ensure!(state.claim.len() == 32, "invalid create claim");
-        ensure!(
-            state.token.as_ref().map_or(true, |t| t.len() == 32),
-            "invalid resume token"
-        );
-        ensure!(
-            state.origin.as_ref().map_or(true, |b| b.len() == 16),
-            "invalid broker identity"
-        );
-        if let Some(p) = &state.pending {
-            ensure!(
-                p.seq == state.input_ack + 1 && !p.bytes.is_empty() && p.bytes.len() <= 4096,
-                "invalid outstanding input"
-            );
+        let plain = read_protected_record(&self.path)
+            .context("no saved session; refusing to create a replacement")?;
+        let (lifecycle, state) = validated_record(&plain, box_name, id)?;
+        if let Some(reason) = lifecycle.retirement() {
+            if lifecycle.kind.is_none() { self.retire(box_name, id, reason)?; }
+            return Err(RetiredSession { id, reason }.into());
         }
-        Ok(state)
+        state.context("invalid protected state")
     }
     pub fn save(&self, state: &State) -> Result<()> {
+        validate_lifecycle_knowledge(state.ended, state.exit_confirmed, state.retirement_reason)?;
+        let _writer = self.writer.lock().unwrap();
+        ensure!(self.path.file_stem().and_then(|name| name.to_str())
+            .and_then(|name| Uuid::parse_str(name).ok()) == Some(state.id), "session record ID mismatch");
+        let reason = state.retirement_reason.or(
+            (state.ended && state.exit_confirmed == Some(true)).then_some(RetirementReason::Completed));
+        if self.path.try_exists()? {
+            let lifecycle = read_lifecycle(&self.path, &state.box_name, state.id)?;
+            if let Some(retired) = lifecycle.retirement() {
+                if lifecycle.kind.is_none() { self.write_guard(&lifecycle, retired)?; }
+                if reason.is_some() { return Ok(()); }
+                return Err(RetiredSession { id: state.id, reason: retired }.into());
+            }
+            if let Some(reason) = reason { return self.write_guard(&lifecycle, reason); }
+        } else if reason.is_some() {
+            anyhow::bail!("no validated recovery record; refusing retirement");
+        }
+        validate_state(state, &state.box_name, state.id)?;
         let bytes = protect(&serde_json::to_vec(state)?, true)?;
         atomic_write(&self.path, &bytes)
+    }
+
+    pub fn retire(&self, box_name: &str, id: Uuid, reason: RetirementReason) -> Result<()> {
+        let _writer = self.writer.lock().unwrap();
+        let lifecycle = read_lifecycle(&self.path, box_name, id)?;
+        if lifecycle.kind.as_deref() == Some("retired") { return Ok(()); }
+        self.write_guard(&lifecycle, reason)
+    }
+
+    fn write_guard(&self, lifecycle: &Lifecycle, reason: RetirementReason) -> Result<()> {
+        let guard = RetiredGuard { schema: 1, kind: "retired".into(), id: lifecycle.id,
+            box_name: lifecycle.box_name.clone(), reference: lifecycle.reference.clone(), reason };
+        atomic_write(&self.path, &protect(&serde_json::to_vec(&guard)?, true)?)
     }
 }
 

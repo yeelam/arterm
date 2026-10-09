@@ -30,6 +30,8 @@ pub fn exit_code(response: &Value) -> u32 {
             | "detach_requested"
             | "interrupt_requested"
             | "terminated"
+            | "retired"
+            | "already_retired"
             | "termination_accepted",
         ) => 0,
         _ => 1,
@@ -67,6 +69,8 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
         Some("interrupt_requested") => "Interrupt requested; command completion is not confirmed.",
         Some("terminated") => "Session terminated; exit confirmed.",
         Some("termination_accepted") => "Termination accepted; exit not confirmed.",
+        Some("retired") => "Session reference retired; no replacement was created. This does not imply an old broker's process was killed.",
+        Some("already_retired") => "Session reference already retired; no remote termination was performed.",
         Some("ok") => "Command status received.",
         _ => "Operation failed.",
     };
@@ -81,6 +85,7 @@ pub fn result(response: &Value, machine: &str, session: &str, json: bool) -> Res
     for (label, value) in [
         ("Command ID", &response["command_id"]),
         ("Session ID", &response["session_id"]),
+        ("Retirement reason", &response["retirement_reason"]),
         ("State", &response["record"]["state"]),
         ("Succeeded", &response["record"]["succeeded"]),
         ("Exit code", &response["record"]["exit_code"]),
@@ -169,10 +174,10 @@ pub fn registered(machines: &[Value], json: bool) -> Result<String> {
             ]);
         }
     }
-    let sessions = if rows.is_empty() { "No saved sessions.".into() } else {
+    let sessions = if rows.is_empty() { "No locally known sessions to list.".into() } else {
         table(&["MACHINE", "SESSION NAME", "SESSION ID", "LOCAL RECORD"], rows)
     };
-    Ok(format!("Registered machines\n{}\n\nKnown sessions (local metadata; remote state unknown)\n{sessions}\n\nUse list --client for active local connections, or list --server MACHINE for live server state.",
+    Ok(format!("Registered machines\n{}\n\nKnown sessions (local lifecycle knowledge; remote state unknown)\n{sessions}\n\nCompleted or proven nonresumable sessions are retired. Uncertain references are retained.\nUse list --client for active local connections, or list --server MACHINE for live server state.",
         table(&["MACHINE", "TUNNEL", "HOST EXECUTABLE"], machine_rows)))
 }
 
@@ -320,6 +325,8 @@ mod tests {
             ("interrupt_requested", 0, "not confirmed"),
             ("terminated", 0, "exit confirmed"),
             ("termination_accepted", 0, "exit not confirmed"),
+            ("retired", 0, "does not imply"),
+            ("already_retired", 0, "no remote termination"),
             ("ok", 0, "status received"),
         ] {
             let value = json!({"status":status,"command_id":"command-1"});

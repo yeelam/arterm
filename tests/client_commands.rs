@@ -44,6 +44,7 @@ fn registration_commands_are_native_isolated_and_preserve_recovery_data() {
     assert!(!duplicate.status.success());
     let listed = run(&home, &["list"]);
     let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.status.success());
     assert!(stdout.contains("MACHINE") && stdout.contains("TUNNEL"));
     assert!(stdout.contains("work") && stdout.contains("tunnel-1"));
     assert!(home.join("client").join("config.json").is_file());
@@ -85,7 +86,7 @@ fn concurrent_registration_processes_preserve_all_successful_writes() {
 }
 
 #[test]
-fn plain_list_shows_named_and_unnamed_saved_sessions_without_opening_them() {
+fn offline_list_keeps_named_unnamed_and_reserved_records_with_unknown_remote_state() {
     use arterm::{client_config, store::{SessionReference, Store}};
     let home = std::env::temp_dir().join(format!("arterm-named-list-{}", Uuid::now_v7()));
     assert!(run(&home, &["add", "work", "--tunnel", "example",
@@ -105,8 +106,10 @@ fn plain_list_shows_named_and_unnamed_saved_sessions_without_opening_them() {
     fs::write(dir.join(format!("{unnamed}.dpapi")), b"PRIVATE_RECORD_NOT_TO_BE_READ").unwrap();
     let reserved = Uuid::now_v7();
     fs::write(dir.join("ref-pending.json"), serde_json::to_vec(&reserved).unwrap()).unwrap();
+    let mapping = dir.join("ref-mywork01.json");
+    let mapping_before = fs::read(&mapping).unwrap();
     let output = run(&home, &["list"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("SESSION NAME") && text.contains("mywork01") && text.contains(&state.id.to_string()));
     assert!(text.contains("(unnamed)") && text.contains(&unnamed.to_string()));
@@ -123,12 +126,15 @@ fn plain_list_shows_named_and_unnamed_saved_sessions_without_opening_them() {
     assert!(sessions.iter().any(|s| s["session_name"] == "pending"
         && s["recovery_record_present"] == false));
     assert_eq!(fs::read(&record).unwrap(), before);
+    assert_eq!(fs::read(&mapping).unwrap(), mapping_before);
+    assert_eq!(fs::read(dir.join(format!("{unnamed}.dpapi"))).unwrap(), b"PRIVATE_RECORD_NOT_TO_BE_READ");
+    assert_eq!(fs::read(dir.join("ref-pending.json")).unwrap(), serde_json::to_vec(&reserved).unwrap());
     drop(store);
     fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
-fn plain_list_reports_corrupt_name_mapping_without_resetting_it() {
+fn offline_list_reports_corrupt_name_mapping_without_resetting_it() {
     use arterm::client_config;
     let home = std::env::temp_dir().join(format!("arterm-bad-list-{}", Uuid::now_v7()));
     assert!(run(&home, &["add", "work", "--tunnel", "example",
@@ -139,9 +145,16 @@ fn plain_list_reports_corrupt_name_mapping_without_resetting_it() {
     let path = dir.join("ref-work.json");
     fs::write(&path, b"not-json").unwrap();
     let result = run(&home, &["list"]);
-    assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).contains("invalid local session mapping"));
-    assert_eq!(fs::read(path).unwrap(), b"not-json");
+    assert_eq!(fs::read(&path).unwrap(), b"not-json");
+    fs::write(&path, b"\"SECRET_RESUME_TOKEN\"").unwrap();
+    let result = run(&home, &["list", "--json"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid local session mapping"));
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("SECRET_RESUME_TOKEN"));
+    assert_eq!(fs::read(&path).unwrap(), b"\"SECRET_RESUME_TOKEN\"");
     fs::remove_dir_all(home).unwrap();
 }
 
@@ -150,6 +163,8 @@ fn help_version_and_validation_do_not_require_setup() {
     let home = std::env::temp_dir().join(format!("devbox-client-help-{}", Uuid::now_v7()));
     assert!(run(&home, &["--help"]).status.success());
     let help = String::from_utf8(run(&home, &["--help"]).stdout).unwrap();
+    assert!(!help.contains("--saved"));
+    assert!(help.contains("without network or sign-in") && help.contains("proven nonresumable"));
     assert!(help.contains("--file") && help.contains("arterm receive"));
     assert!(!help.contains("--unblock") && help.contains("automatically unblocked") && help.contains("not a malware scan"));
     assert!(run(&home, &["--version"]).status.success());
@@ -168,6 +183,9 @@ fn help_version_and_validation_do_not_require_setup() {
     .success());
     assert!(!home.join("client").join("config.json").exists());
     for args in [
+        vec!["list", "--saved"],
+        vec!["list", "--saved", "--json"],
+        vec!["list", "--json", "--saved"],
         vec!["resume", "work", "session"],
         vec!["send", "work", "session"],
         vec!["send", "work", "session", "--command", "x", "--file", "x"],
@@ -221,6 +239,12 @@ fn automation_output_defaults_to_human_and_json_is_explicit() {
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&json.stdout).unwrap(), serde_json::json!([]));
     assert!(json.stderr.is_empty());
     for args in [
+        vec!["list", "--saved", "--json", "--json"],
+        vec!["list", "--saved", "--saved"],
+        vec!["list", "--saved", "--address", "127.0.0.1:1"],
+        vec!["list", "--saved", "--client"],
+        vec!["list", "--json", "--saved", "work"],
+        vec!["list", "--json", "--json"],
         vec!["list", "--client", "--json", "--json"],
         vec!["list", "--server", "work", "--json", "--json"],
         vec!["terminate", "work", "shell", "--json", "--json"],

@@ -12,7 +12,7 @@ use client_config::{ClientConfig, Target};
 use arterm::{
     console::{Console, Terminal},
     deployment,
-    engine::{End, Engine},
+    engine::{End, Engine, SessionRejected},
     local_control::{self, Operation, Owner},
     store::{self, SessionReference, Store},
     transport::{ensure_authenticated, login, Forward, LoginRequired, TunnelLink},
@@ -57,7 +57,10 @@ Usage:\n\
   arterm --help | --version\n\n\
 Client Setup initializes local files. setup is optional repair/custom-path configuration, not sign-in.\n\
 Network commands renew positively missing/expired sign-in once; use arterm --login for interactive GitHub sign-in with the host's account.\n\
-list shows registered machines and saved session names/IDs without querying the network.\n\
+list shows local session references without network or sign-in; completed/proven nonresumable sessions are retired.\n\
+Offline, disconnected, and unconfirmed references are retained; remote existence is not inferred from network failure.\n\
+Connecting a retired session name creates fresh identity/state; an old GUID never resolves to its replacement.\n\
+Use list --server MACHINE for current authorized remote inventory, including detached running sessions.\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
 Control commands print readable results by default; use --json for structured automation output.\n\
 Commands require a compatible, command-enabled PowerShell session. Existing sessions are not retrofitted.\n\
@@ -178,11 +181,14 @@ fn add_target(root: &Path, args: &[String]) -> Result<()> {
 }
 
 fn list_targets(root: &Path, args: &[String]) -> Result<()> {
-    ensure!(args.is_empty() || args == ["--json"], "list accepts only --json, --client or --server MACHINE");
+    ensure!(args.is_empty() || args == ["--json"],
+        "list accepts only --json, --client or --server MACHINE");
     let config = client_config::load(root)?;
     let mut machines = Vec::new();
     for (alias, target) in &config.targets {
-        let sessions = store::saved_sessions(&client_config::state_dir(root, target))?;
+        let dir = client_config::state_dir(root, target);
+        let sessions = store::active_sessions(&dir, &target.target_id)
+            .map_err(|_| anyhow::anyhow!("invalid local session mapping or recovery metadata; inventory unavailable"))?;
         machines.push(serde_json::json!({
             "machine": alias, "tunnel": target.tunnel_id, "host_path": target.host_path,
             "sessions": sessions,
@@ -210,6 +216,93 @@ fn connect_link(
     }
     let (forward, address) = Forward::start(devtunnel_path(config)?, &target.tunnel_id)?;
     TunnelLink::connect(&address, &target.host_path, Some(forward))
+}
+
+fn probe_retirement(config: &ClientConfig, target: &Target, address: Option<&str>,
+    state: &store::State) -> Result<Option<store::RetirementReason>> {
+    ensure!(state.origin.is_some(), "no saved broker identity; remote existence remains unknown");
+    let mut link = connect_link(config, target, address)?;
+    client_protocol::retirement_from_inventory(&mut link, state)
+}
+
+fn terminate_remote(config: &ClientConfig, target: &Target, address: Option<&str>,
+    state: &store::State) -> Result<client_protocol::Termination> {
+    if state.token.is_none() {
+        if state.ended {
+            if let Ok(Some(reason)) = probe_retirement(config, target, address, state) {
+                return Ok(client_protocol::Termination::Retired(reason));
+            }
+        }
+        bail!("no saved resume credential; remote existence remains unknown and reference was retained");
+    }
+    ensure!(state.origin.is_some(), "no saved broker identity; reference retained");
+    let outcome = {
+        let mut link = connect_link(config, target, address)?;
+        client_protocol::terminate(&mut link, state)?
+    };
+    if outcome != client_protocol::Termination::Rejected { return Ok(outcome); }
+    match probe_retirement(config, target, address, state) {
+        Ok(Some(reason)) => Ok(client_protocol::Termination::Retired(reason)),
+        _ => bail!("saved session credential rejected; remote existence remains unconfirmed and reference was retained"),
+    }
+}
+
+fn termination_response(state: &mut store::State, outcome: client_protocol::Termination) -> Result<serde_json::Value> {
+    Ok(match outcome {
+        client_protocol::Termination::Confirmed => {
+            state.mark_ended(true)?;
+            serde_json::json!({"status":"terminated", "session_id":state.id})
+        }
+        client_protocol::Termination::AcceptedUnconfirmed => {
+            state.mark_ended(false)?;
+            serde_json::json!({"status":"termination_accepted", "session_id":state.id})
+        }
+        client_protocol::Termination::Retired(reason) => {
+            state.mark_retired(reason)?;
+            serde_json::json!({"status":"retired", "session_id":state.id,"retirement_reason":reason})
+        }
+        client_protocol::Termination::Rejected => unreachable!("unreconciled rejection"),
+    })
+}
+
+fn already_retired(id: Uuid, reason: store::RetirementReason) -> serde_json::Value {
+    serde_json::json!({"status":"already_retired","session_id":id,"retirement_reason":reason})
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_unconfirmed_rejects_contradictory_exit_flags_without_mutation_or_completion() {
+    let mut state = store::State::new("fixture".into(), "powershell.exe".into(), vec![], None);
+    state.claim = store::random_claim().unwrap();
+    state.token = Some(vec![9; 32]);
+    state.origin = Some(vec![7; 16]);
+    state.exit_confirmed = Some(true);
+    let before = serde_json::to_vec(&state).unwrap();
+    assert!(termination_response(&mut state, client_protocol::Termination::AcceptedUnconfirmed).is_err());
+    assert!(serde_json::to_vec(&state).unwrap() == before);
+    assert!(!state.ended && state.retirement_reason.is_none());
+    state.exit_confirmed = None;
+    let response = termination_response(&mut state, client_protocol::Termination::AcceptedUnconfirmed).unwrap();
+    assert_eq!(response["status"], "termination_accepted");
+    assert!(state.ended && state.exit_confirmed == Some(false) && state.retirement_reason.is_none());
+}
+
+fn matches_reference(id: Uuid, name: Option<&str>, reference: &SessionReference) -> bool {
+    match Uuid::parse_str(reference.as_str()) {
+        Ok(requested) => requested == id,
+        Err(_) => name == Some(reference.as_str()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn guid_reference_never_falls_back_to_a_reused_local_name() {
+    let old = Uuid::now_v7();
+    let current = Uuid::now_v7();
+    let guid = SessionReference::parse(&old.to_string()).unwrap();
+    assert!(matches_reference(old, Some("reusable"), &guid));
+    assert!(!matches_reference(current, Some(guid.as_str()), &guid));
+    assert!(matches_reference(current, Some("reusable"), &SessionReference::parse("reusable").unwrap()));
 }
 
 fn quote_command_arg(value: &str) -> String {
@@ -272,7 +365,20 @@ fn run_session(
     let target = client_config::target(&config, alias)?.clone();
     let retries = flags.retries.unwrap_or(DEFAULT_RETRIES);
     let state_dir = client_config::state_dir(root, &target);
-    let (store, state) = Store::resolve(&state_dir, &target.target_id, reference, create, flags.shell.as_deref(), flags.cwd.as_deref())?;
+    let (store, state) = match Store::resolve(&state_dir, &target.target_id, reference, create, flags.shell.as_deref(), flags.cwd.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(error) if error.is::<store::RecoveryBlocked>() => {
+            let (store, state) = Store::resolve_for_management(&state_dir, &target.target_id, reference)?;
+            if let Ok(Some(reason)) = probe_retirement(&config, &target, flags.address.as_deref(), &state) {
+                store.retire(&target.target_id, state.id, reason)?;
+                return Err(store::RetiredSession { id: state.id, reason }.into());
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    ensure!(state.broker_binding_is_safe(),
+        "saved state has no safe broker binding; reference retained without adopting a broker");
     let store = std::sync::Arc::new(store);
     let service_store = store.clone();
     let id = state.id;
@@ -295,7 +401,12 @@ fn run_session(
     let files = std::sync::Mutex::new(file_protocol::Files::default());
     owner.set_service(std::sync::Arc::new(move |operation_id, action, check| {
         let state = service_snapshot.lock().unwrap().clone();
-        ensure!(!state.ended && state.token.is_some(), "session is not authorized or has ended");
+        if matches!(action, Operation::Terminate) {
+            if let Some(reason) = state.retirement_reason { return Ok(already_retired(state.id, reason)); }
+        } else {
+            ensure!(!state.ended, "session has ended or its recovery is blocked");
+        }
+        ensure!(state.token.is_some(), "session is not authorized");
         check()?;
         if matches!(action, Operation::FileSend { .. } | Operation::FileReceive { .. }) {
             let ticket = admission.ticket().context("file transfer unsupported or attachment unavailable")?;
@@ -304,14 +415,13 @@ fn run_session(
             return file_protocol::transfer(&mut link, &state, &mut files, &ticket, operation_id, action, check);
         }
         ensure!(matches!(action, Operation::Terminate), "invalid management operation");
-        let mut link = connect_link(&service_config, &service_target, service_address.as_deref())?;
         check()?;
-        let confirmed = client_protocol::terminate(&mut link, &state)?;
+        let outcome = terminate_remote(&service_config, &service_target, service_address.as_deref(), &state)?;
         admission.revoke();
         let mut snapshot = service_snapshot.lock().unwrap();
-        snapshot.ended = true;
+        let response = termination_response(&mut snapshot, outcome)?;
         service_store.save(&snapshot)?;
-        Ok(serde_json::json!({"status":if confirmed { "terminated" } else { "termination_accepted" }, "session_id":state.id}))
+        Ok(response)
     }));
     let mut terminal = owner.terminal(console);
     let result = (|| -> Result<u32> {
@@ -342,14 +452,26 @@ fn run_session(
                     continue;
                 }
             };
-            match engine.run(&mut link, &mut terminal, &mut |state| {
+            let end = engine.run(&mut link, &mut terminal, &mut |state| {
                 let mut snapshot = snapshot.lock().unwrap();
                 let mut updated = state.clone();
-                updated.ended |= snapshot.ended;
+                updated.merge_ended(&snapshot)?;
                 store.save(&updated)?;
                 *snapshot = updated;
                 Ok(())
-            })? {
+            });
+            let end = match end {
+                Ok(end) => end,
+                Err(error) if error.is::<SessionRejected>() => {
+                    if let Ok(Some(reason)) = probe_retirement(&config, &target, flags.address.as_deref(), &engine.state) {
+                        store.retire(&target.target_id, id, reason)?;
+                        return Err(store::RetiredSession { id, reason }.into());
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            match end {
                 End::Detached => {
                     eprintln!("[session] Detached; remote session retained.");
                     return Ok(0);
@@ -389,21 +511,28 @@ fn terminate_session(root: &Path, args: &[String]) -> Result<u32> {
     let config = client_config::load(root)?;
     let target = client_config::target(&config, alias)?.clone();
     let owners = local_control::discover(root)?.into_iter().filter(|owner| owner.target_id == target.target_id
-        && (owner.reference.as_deref() == Some(reference.as_str()) || owner.session_id.to_string() == reference.as_str()))
+        && matches_reference(owner.session_id, owner.reference.as_deref(), &reference))
         .collect::<Vec<_>>();
     ensure!(owners.len() <= 1, "multiple local owners match the session");
     if let Some(owner) = owners.first() {
         let response = local_control::request(owner, Operation::Terminate)?;
         println!("{}", client_output::result(&response, alias, reference.as_str(), json)?);
-        return Ok(if matches!(response["status"].as_str(), Some("terminated" | "termination_accepted")) { 0 } else { 1 });
+        return Ok(if matches!(response["status"].as_str(), Some("terminated" | "termination_accepted" | "retired" | "already_retired")) { 0 } else { 1 });
     }
-    let (store, mut state) = Store::resolve(&client_config::state_dir(root, &target), &target.target_id, &reference, false, None, None)?;
-    let id = state.id;
-    let mut link = connect_link(&config, &target, flags.address.as_deref())?;
-    let confirmed = client_protocol::terminate(&mut link, &state)?;
-    state.ended = true;
+    let (store, mut state) = match Store::resolve_for_management(&client_config::state_dir(root, &target), &target.target_id, &reference) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Some(retired) = error.downcast_ref::<store::RetiredSession>() {
+                let response = already_retired(retired.id, retired.reason);
+                println!("{}", client_output::result(&response, alias, reference.as_str(), json)?);
+                return Ok(0);
+            }
+            return Err(error);
+        }
+    };
+    let outcome = terminate_remote(&config, &target, flags.address.as_deref(), &state)?;
+    let response = termination_response(&mut state, outcome)?;
     store.save(&state)?;
-    let response = serde_json::json!({"status":if confirmed {"terminated"} else {"termination_accepted"}, "session_id":id});
     println!("{}", client_output::result(&response, alias, reference.as_str(), json)?);
     Ok(0)
 }
@@ -541,8 +670,7 @@ fn local_command(root: &Path, args: &[String]) -> Result<u32> {
     let target = client_config::target(&config, machine)?;
     let matches = local_control::discover(root)?.into_iter().filter(|identity| {
         identity.target_id == target.target_id
-            && (identity.reference.as_deref() == Some(reference.as_str())
-                || identity.session_id.to_string() == reference.as_str())
+            && matches_reference(identity.session_id, identity.reference.as_deref(), &reference)
     }).collect::<Vec<_>>();
     ensure!(matches.len() == 1,
         "no unique active managed local client for {machine} {}; connect explicitly (an older unmanaged client cannot be controlled)",

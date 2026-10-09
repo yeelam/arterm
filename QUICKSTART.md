@@ -106,7 +106,9 @@ arterm-host setup --terminate-sessions
 
 **These flags end ALL live sessions of the scoped host, including detached shells;
 their running state cannot be recovered.** Saved references and credentials are
-retained, but ended sessions need new references. Shutdown uses the existing
+retained. In 0.7.1, a name can be reused after the client has confirmed or
+authoritatively retired its ended session, creating fresh data and a new GUID.
+Unknown records are not automatically replaced. Shutdown uses the existing
 control command scoped to the current Windows user, logon session and data root,
 not process-name or all-user kills. Owned tasks sharing this installation are
 paused before shutdown/write, including other data roots. Their brokers in this
@@ -203,8 +205,8 @@ current Windows user, then verifies sign-in before continuing. It uses the
 configured devtunnel executable and does not change a valid sign-in.
 Concurrent operations coordinate recovery rather than opening duplicate logins.
 There is no scheduled login, permanent client background service, or periodic
-traffic added by this feature. Offline `list` and `connect MACHINE` (which only
-prints a command) do not sign in.
+traffic added by this feature. Offline `list` and `connect MACHINE`, which only
+prints a command, do not sign in.
 
 Hidden process launch does not guarantee hidden browser authentication.
 GitHub may open a browser or require sign-in/approval; an existing browser
@@ -253,9 +255,16 @@ arterm.exe terminate my-devbox MyWork
 
 A reattached session has the same remote PID, variables, and working directory.
 Repeating original `--shell`/`--cwd` values is allowed; incompatible values fail
-rather than replacing the session. Ended, missing, corrupt, or unavailable
-records never create a replacement. Choose a NEW reference for a new shell.
-Do not delete recovery files.
+rather than replacing a live or uncertain session.
+
+Starting with 0.7.1, once the client knows a session ended or has authoritative
+evidence that its saved reference cannot resume on the current broker, it
+retires that entry. A subsequent `connect` using the same **name** creates a
+new GUID, fresh authorization state, and a clean broker binding. The name
+mapping is updated atomically; old GUIDs cannot attach to or terminate the
+replacement. A GUID never creates a replacement for a retired session.
+Unknown, corrupt, unreachable, or unconfirmed records are not silently replaced.
+Do not manually delete recovery files to force reuse.
 
 ## Automation
 
@@ -284,12 +293,26 @@ timeout reports `IntegrationNotEstablished` with `submitted: false`; unknown
 startup input is not classified as a busy managed command. Explicitly unsupported
 sessions fail immediately instead of consuming the readiness budget.
 
-Machine always precedes session. Plain `list` lists registered machines and
-locally saved **session names and session IDs**; `list --json` provides the same
-inventory structurally. This reads public local name mappings and recovery-file
-presence, not credentials, and does not connect or sign in. A saved record is
-not proof that the remote session still exists or is resumable. GUID-only
-sessions are labelled `(unnamed)`; incomplete mappings are `reservation only`.
+Machine always precedes session. Plain `list` displays locally known session
+names and IDs, filtering only sessions the client knows have ended.
+`list --json` provides the same inventory structurally. Unknown or uncertain
+records remain visible, including after a host reboot or broker-identity change.
+An absent or unreachable host is not treated as proof of termination; a listed
+record does not prove that its remote shell is alive or resumable.
+Default listing is offline and does not sign in.
+
+Older records may contain only an `ended` flag, without distinguishing confirmed
+exit from an unconfirmed termination or a blocked recovery. These ambiguous
+legacy entries remain visible with a warning. An explicit `terminate MACHINE
+NAME-or-GUID` can reconcile them using confirmed exit or broker-bound authorized
+inventory. If the host cannot establish the outcome, the record remains intact.
+`list --server` by itself does not retire local entries.
+
+Known-ended and authoritatively stale entries are retired from the inventory
+with a minimal protected identity guard, rather than retained as usable session
+data. A retired name can be reused with a new GUID and clean state; an old GUID
+cannot address the replacement. Mere network loss or a broker that has not
+been contacted does not authorize retirement.
 `list --client` lists active managed local connections; `list --server MACHINE`
 queries the authorized host inventory, including detached sessions. Each
 `connect` owns a separate local named pipe: no broadcast or shared client daemon.
@@ -297,9 +320,13 @@ queries the authorized host inventory, including detached sessions. Each
 or fail. A detached session must be reattached before using those controls.
 `list --server` and `terminate` do not need an active local owner, but still
 require authorization; termination needs the saved session credential.
+`terminate MACHINE SESSION` accepts either the session name or its canonical
+GUID in that same positional argument; there is no separate name/GUID flag.
+Repeated termination of a retired reference reports its ended/nonexistent
+status without targeting a replacement session.
 
 Controls and client/server inventories use readable summaries and tables by
-default. Add `--json` to `send`, `read`, `list --client`, `list --server`,
+default. Add `--json` to `send`, `read`, `list`, `list --client`, `list --server`,
 `interrupt`, `detach`, or `terminate` for the existing structured response
 schema. Scripts parsing output must explicitly request `--json`. Exit codes
 are the same in both modes. Response failures are printed once, in the selected

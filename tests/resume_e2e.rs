@@ -2034,6 +2034,7 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
         client.command("Write-Output ('READY=' + $PID + ':exit')");
         client.wait_for(|out, _| pid_marker(out, "READY=", ":exit").is_some());
         let _connection = connections.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retired_id = client.guid();
         client.command(&format!("exit {code}"));
         client.wait_exit(code);
         assert!(client.err.contains(&format!("Remote exit code: {code}")), "{}", client.err);
@@ -2041,9 +2042,9 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
         assert!(!client.err.contains("Attachment lost"), "{}", client.err);
         assert_eq!(client.err.matches("Resume command:").count(), 1,
             "only initial startup may print the resume command: {}", client.err);
-        let mut later = fixture.client("connect", Some("ExitTest"), &addr);
+        let mut later = fixture.client("connect", Some(&retired_id), &addr);
         later.wait_exit(1);
-        assert!(later.err.contains("session has ended"), "{}", later.err);
+        assert!(later.err.contains("already retired"), "{}", later.err);
         assert!(!later.err.contains("Reconnecting"));
     }
 }
@@ -2229,12 +2230,13 @@ fn intentional_remote_exit_ends_the_client_without_recovery_instructions() {
 
 #[test]
 #[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
-fn named_termination_is_durable_and_never_recreates() {
+fn named_termination_retires_original_guid_without_recycling_it() {
     let fixture = Fixture::new();
     let (addr, connections) = relay(fixture.home.clone(), 2);
     let mut client = fixture.client("connect", Some("TerminateMe"), &addr);
     client.command("Write-Output ('READY=' + $PID + ':terminate')");
     client.wait_for(|out, _| pid_marker(out, "READY=", ":terminate").is_some());
+    let retired_id = client.guid();
     let _connection = connections.recv_timeout(Duration::from_secs(5)).unwrap();
     client.detach();
     let output = Command::new(client_executable())
@@ -2243,9 +2245,9 @@ fn named_termination_is_durable_and_never_recreates() {
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Session terminated; exit confirmed."));
-    let mut later = fixture.client("connect", Some("TerminateMe"), &addr);
+    let mut later = fixture.client("connect", Some(&retired_id), &addr);
     later.wait_exit(1);
-    assert!(later.err.contains("session has ended"), "{}", later.err);
+    assert!(later.err.contains("already retired"), "{}", later.err);
 }
 
 #[test]
@@ -2302,8 +2304,8 @@ fn server_inventory_and_exact_termination_preserve_neighbor_session() {
     assert!(ended.status.success(), "{}", String::from_utf8_lossy(&ended.stderr));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&ended.stdout).unwrap()["status"], "terminated");
     assert_eq!(inventory()["sessions"].as_array().unwrap().len(), 1);
-    assert!(!invoke(&["connect", "fixture", "victim", "--address", &addr, "--retries", "0"]).status.success());
-    assert!(!invoke(&["connect", "fixture", "dormant", "--address", &addr, "--retries", "0"]).status.success());
+    assert!(!invoke(&["connect", "fixture", &victim_id, "--address", &addr, "--retries", "0"]).status.success());
+    assert!(!invoke(&["connect", "fixture", &detached_id, "--address", &addr, "--retries", "0"]).status.success());
     neighbor.detach();
     let unowned = fixture.home.join("inventory-only");
     fs::create_dir_all(unowned.join("client")).unwrap();
@@ -2343,7 +2345,136 @@ fn exit_while_detached_is_an_error_on_later_connect() {
     let mut later = fixture.client("connect", Some("DetachedExit"), &addr);
     later.wait_exit(1);
     assert!(later.err.contains("session has ended"), "{}", later.err);
-    let mut again = fixture.client("connect", Some("DetachedExit"), &addr);
+    let mut again = fixture.client("connect", Some(&id), &addr);
     again.wait_exit(1);
     assert!(!again.err.contains("Resume command:"), "known ended state must fail before connecting");
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn retired_name_reuse_is_fresh_and_old_guid_termination_cannot_touch_replacement() {
+    use arterm::{client_config, store};
+    let fixture = Fixture::new();
+    let (addr, _connections) = relay(fixture.home.clone(), 2);
+    let mut old = fixture.client("connect", Some("Reusable"), &addr);
+    old.command("if ((Get-PSReadLineOption).HistorySavePath -ne $env:ARTERM_SHELL_HISTORY_PATH) { throw 'fixture history isolation failed' }; $global:OldOnly='old-state'; Write-Output ('OLD='+$PID+':retire')");
+    old.wait_for(|out, _| pid_marker(out, "OLD=", ":retire").is_some());
+    let old_id = old.guid();
+    let config = client_config::load(&fixture.home).unwrap();
+    let target = &config.targets["fixture"];
+    let dir = client_config::state_dir(&fixture.home, target);
+    let read = |id: &str| {
+        let bytes = fs::read(dir.join(format!("{id}.dpapi"))).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&store::protect(&bytes, false).unwrap()).unwrap()
+    };
+    let previous = read(&old_id);
+    old.command("exit 0");
+    old.wait_exit(0);
+    let guard = read(&old_id);
+    assert_eq!(guard["kind"], "retired");
+    assert_eq!(guard.as_object().unwrap().len(), 6);
+    let mut fresh = fixture.client("connect", Some("Reusable"), &addr);
+    fresh.command("if ($null -ne $global:OldOnly) { throw 'state reused' }; $global:Keep='replacement'; Write-Output ('FRESH='+$PID+':fresh')");
+    fresh.wait_for(|out, _| pid_marker(out, "FRESH=", ":fresh").is_some());
+    let fresh_id = fresh.guid();
+    assert_ne!(fresh_id, old_id);
+    let current = read(&fresh_id);
+    for field in ["id", "client_id", "request_id", "claim", "token"] {
+        assert!(current[field] != previous[field], "fresh session reused {field}");
+    }
+    let retired = Command::new(client_executable()).env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["terminate", "fixture", &old_id, "--address", &addr, "--json"]).output().unwrap();
+    assert!(retired.status.success());
+    let retired: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+    assert_eq!(retired["status"], "already_retired");
+    assert_eq!(retired["session_id"], old_id);
+    fresh.command("Write-Output ('AFTER='+$PID+':fresh'); Write-Output $global:Keep");
+    fresh.wait_for(|out, _| pid_marker(out, "AFTER=", ":fresh").is_some() && out.contains("replacement"));
+    assert_eq!(pid_marker(&fresh.out, "AFTER=", ":fresh"), pid_marker(&fresh.out, "FRESH=", ":fresh"));
+    let listed = Command::new(client_executable()).env("VSTERM_REMOTE_HOME", &fixture.home)
+        .args(["list", "--json"]).output().unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["sessions"][0]["session_id"], fresh_id);
+    fresh.detach();
+}
+
+#[test]
+#[ignore = "explicit functional fixture feature or trusted SIGNED_CLIENT/SIGNED_HOST required"]
+fn authorized_same_broker_inventory_retires_missing_ids_but_not_rejected_live_credentials() {
+    use arterm::{client_config, store::{self, SessionReference, Store}};
+    let fixture = Fixture::new();
+    let (addr, _connections) = relay(fixture.home.clone(), 10);
+    let invoke = |home: &std::path::Path, args: &[&str]| Command::new(client_executable())
+        .env("VSTERM_REMOTE_HOME", home).args(args).output().unwrap();
+    let mut keeper = fixture.client("connect", Some("Keeper"), &addr);
+    keeper.command("if ((Get-PSReadLineOption).HistorySavePath -ne $env:ARTERM_SHELL_HISTORY_PATH) { throw 'fixture history isolation failed' }; $global:Keep='neighbor'; Write-Output ('KEEPER='+$PID+':live')");
+    keeper.wait_for(|out, _| pid_marker(out, "KEEPER=", ":live").is_some());
+    let keeper_id = keeper.guid();
+    let config = client_config::load(&fixture.home).unwrap();
+    let target = &config.targets["fixture"];
+    let dir = client_config::state_dir(&fixture.home, target);
+    let inventory = invoke(&fixture.home, &["list", "--server", "fixture", "--address", &addr, "--json"]);
+    assert!(inventory.status.success());
+    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    let broker = inventory["broker_instance_id"].as_str().unwrap();
+    let origin: Vec<u8> = (0..broker.len()).step_by(2)
+        .map(|index| u8::from_str_radix(&broker[index..index+2], 16).unwrap()).collect();
+    let make = |root: &std::path::Path, name: &str, ended: bool| {
+        let (record, mut state) = Store::resolve(root, &target.target_id,
+            &SessionReference::parse(name).unwrap(), true, Some(&test_shell()), None).unwrap();
+        state.origin = Some(origin.clone());
+        state.token = Some(vec![42;32]);
+        state.command_execution = Some(false);
+        state.ended = ended;
+        record.save(&state).unwrap();
+        state.id
+    };
+    let missing = make(&dir, "MissingLegacy", true);
+    let output = invoke(&fixture.home, &["terminate", "fixture", "missinglegacy", "--address", &addr, "--json"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["status"], "retired");
+    assert_eq!(outcome["retirement_reason"], "missing");
+    assert_eq!(outcome["session_id"], missing.to_string());
+    let missing_without_token = make(&dir, "MissingNoToken", true);
+    let record = Store::open(&dir, missing_without_token).unwrap();
+    let mut state = record.load(&target.target_id, missing_without_token).unwrap();
+    state.token = None;
+    record.save(&state).unwrap();
+    drop(record);
+    let no_token = invoke(&fixture.home, &["terminate", "fixture", "missingnotoken", "--address", &addr, "--json"]);
+    assert!(no_token.status.success(), "{}", String::from_utf8_lossy(&no_token.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&no_token.stdout).unwrap()["retirement_reason"], "missing");
+    let connect_missing = make(&dir, "MissingConnect", false);
+    let mut rejected = fixture.client("connect", Some("MissingConnect"), &addr);
+    rejected.wait_exit(1);
+    let bytes = fs::read(dir.join(format!("{connect_missing}.dpapi"))).unwrap();
+    let guard: serde_json::Value = serde_json::from_slice(&store::protect(&bytes, false).unwrap()).unwrap();
+    assert_eq!(guard["kind"], "retired");
+    assert_eq!(guard["reason"], "missing");
+    let mut fresh = fixture.client("connect", Some("MissingLegacy"), &addr);
+    fresh.command("Write-Output ('FRESH='+$PID+':live')");
+    fresh.wait_for(|out, _| pid_marker(out, "FRESH=", ":live").is_some());
+    assert_ne!(fresh.guid(), missing.to_string());
+    let old = invoke(&fixture.home, &["terminate", "fixture", &missing.to_string(), "--address", &addr, "--json"]);
+    assert!(old.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&old.stdout).unwrap()["status"], "already_retired");
+    let unowned = fixture.home.join("rejected-controller");
+    fs::create_dir_all(unowned.join("client")).unwrap();
+    fs::copy(fixture.home.join("client").join("config.json"), unowned.join("client").join("config.json")).unwrap();
+    let unowned_dir = client_config::state_dir(&unowned, target);
+    let probe = make(&unowned_dir, &keeper_id, false);
+    assert_eq!(probe.to_string(), keeper_id);
+    let before = fs::read(unowned_dir.join(format!("{probe}.dpapi"))).unwrap();
+    let rejected = invoke(&unowned, &["terminate", "fixture", &keeper_id, "--address", &addr, "--json"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("reference was retained"));
+    assert_eq!(fs::read(unowned_dir.join(format!("{probe}.dpapi"))).unwrap(), before);
+    keeper.command("Write-Output ('AFTER='+$PID+':live'); Write-Output $global:Keep");
+    keeper.wait_for(|out, _| pid_marker(out, "AFTER=", ":live").is_some() && out.contains("neighbor"));
+    assert_eq!(pid_marker(&keeper.out, "AFTER=", ":live"), pid_marker(&keeper.out, "KEEPER=", ":live"));
+    fresh.detach();
+    keeper.detach();
 }
