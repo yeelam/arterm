@@ -1,33 +1,44 @@
 # arTerm
 
-[![arTerm - remote terminal access, automatic reconnect, client-reboot recovery, and an agent-ready CLI](.github/arterm-github-cover.jpg)](https://github.com/yeelam/arterm/releases/latest)
+### Lose the connection. Not your work.
 
-arTerm keeps a Windows remote shell running independently of
-your local terminal. Return to the same shell with the same named command,
-or control an attached session from another local CLI or agent.
+Keep builds, coding agents, and long-running commands on a remote Windows
+machine, not tied to your local terminal. Close the client, lose your VPN, or
+restart your notebook. Come back to the **same remote shell, variables, and
+work in progress** while the host stays running.
 
-Reach configured Windows Dev Boxes, VMs and Windows Sandbox hosts across networks
-through an authenticated tunnel—no same-LAN connection or direct inbound host
-access required. Client and host still need permitted outbound connectivity under
-organizational network policy.
+**[Download for Windows: x64 and ARM64](https://github.com/yeelam/arterm/releases/latest)**
+| [Get connected](#get-connected)
+| [Full quick start](QUICKSTART.md)
 
-## Why use it?
+[![Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue.](.github/arterm-before-after.png)](https://github.com/yeelam/arterm/releases/latest)
 
-- **Long-running remote CLI agents and builds:** leave work running on a remote
-  Windows machine, then reattach to its existing process and shell environment.
-- **Network or VPN drops:** reconnect to the same session when connectivity
-  returns, rather than start another shell.
-- **Local tab loss or client reboot:** reopen your terminal and rerun the saved
-  command from the same Windows user account with its local recovery data intact.
-- **Automation alongside a human:** send a command, wait for its correlated
-  completion, or read output without creating a second remote shell.
-- **Files and folders:** send or receive either through the existing connected
-  session, with SHA-256 verification and unique TEMP destinations. Directories
-  are automatically packed, transferred, and extracted; ordinary ZIP files stay files.
-  Received files are automatically unblocked on the receiving endpoint,
-  including newly extracted folder files. Sources are unchanged.
-  **Development release gate:** independent archive review remains blocked;
-  this integration is not release-qualified.
+*Workflow illustration, not a session screenshot. The remote Windows host must
+stay running and logged in; arTerm survives client-side loss, not host shutdown.*
+
+## What you get
+
+- **Stop babysitting your connection.** Your remote build or agent keeps running
+  when the local client closes or disconnects.
+- **Return to your work, not a blank shell.** Reuse the same command to reattach
+  to the existing process and environment.
+- **Let people and agents share a working session.** Send a command, read output,
+  or interrupt work from another local CLI without creating a second shell.
+- **Reach your Windows machines across networks.** Connect to configured Dev
+  Boxes, VMs, and Windows Sandbox hosts through GitHub-authenticated tunnels,
+  without needing the same LAN or direct inbound host access.
+- **Move results without terminal paste.** Send files or whole folders through
+  the attached session with integrity checks and unique receiving destinations.
+
+Client and host need permitted outbound connectivity. See the
+[quick start](QUICKSTART.md) for setup and
+[development-signed installation guide](DEVELOPMENT-INSTALL.md) for trust requirements.
+
+<details>
+<summary>Technical details: session lifetime, shell integration, and development gates</summary>
+
+**File-transfer development gate:** independent archive review remains blocked;
+this integration is not release-qualified by that review.
 
 **Limit:** the remote host must stay running and logged in. Remote Windows
 reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.
@@ -82,6 +93,8 @@ through the existing interrupt request on Windows PowerShell and PowerShell 7.
 Earlier minimal F24-only interruption probes are archived outside shipping tests;
 arbitrary TUI behavior and all custom profile/read-line handlers are not certified.
 
+</details>
+
 ## What you need
 
 | Requirement | Local client | Remote host |
@@ -98,6 +111,10 @@ Installers detect dependencies and offer downloads only with consent; vendor
 binaries are not bundled. Host setup requires acceptance of the VS Code server
 license terms. Host startup is at **Windows user logon**, not a SYSTEM service:
 a cold boot requires Windows sign-in, and arTerm does not configure autologon.
+
+<details>
+<summary>Host startup and ownership details</summary>
+
 The per-user Task Scheduler task uses InteractiveToken/LeastPrivilege and runs
 under the current process's Windows token SID, including Entra/AAD `S-1-12-1`
 identities. Both the principal and logon trigger use that SID; no local-account
@@ -134,6 +151,8 @@ installation. The registered action remains exact; another directory or publishe
 is not treated as an alias.
 Legacy `VsTermHost` Run entries are removed only after successful task registration
 and only when their command matches the owned installed executable.
+
+</details>
 
 ## Get connected
 
@@ -174,8 +193,11 @@ and only when their command matches the owned installed executable.
 
 **Repeat that exact command to reattach.** `MyWork` is a non-secret session
 reference, not a password. Press **Ctrl+]** to detach and leave the shell running;
-type **`exit` inside the remote shell** to end it. Choose a new reference for a
-new shell; ended or unavailable sessions are not silently replaced.
+type **`exit` inside the remote shell** to end it. Starting with 0.7.1, a session
+name can be reused after its old session is known ended or has been
+authoritatively retired. Reuse creates a fresh GUID and clean session data;
+the old GUID never addresses the replacement. Unknown or unavailable sessions
+are not silently replaced.
 
 On detach, remote exit, or connection failure, the interactive client restores
 the local console flags, code pages, and inherited keyboard, focus, paste, and
@@ -236,6 +258,17 @@ client daemon. Local controls require that exact active owner; missing or
 ambiguous owners are errors. Authorized server inventory and termination also
 work while detached.
 
+Plain `arterm list` shows locally known session names and IDs, except sessions
+the client knows have ended. A session with uncertain status remains visible:
+an unreachable host, server reboot, or changed broker is not itself proof of
+termination. These entries are not claims that a remote process is still alive.
+Default listing does not connect or sign in. Use `list --server MACHINE` for
+current authorized host inventory and `--json` for structured output.
+Known-ended or authoritatively stale entries are retired from the session
+inventory. Only the identity guard needed for safe old-GUID handling remains.
+Reusing a retired name atomically publishes fresh session data, not the old
+credential or broker binding.
+
 `send` waits for a safe prompt for up to **30 seconds** by default, then returns
 a command ID and acceptance, not proof of success. `--timeout 5s` overrides this
 readiness budget even without `--wait`. With `--wait`, an explicit positive,
@@ -250,7 +283,7 @@ the owner's input, heartbeat, or other controls. See [automation and limits](QUI
 for status, interruption, termination, and idempotency.
 
 Controls and client/server inventories print readable summaries by default.
-Use `--json` on `send`, `read`, `list --client`, `list --server`, `interrupt`,
+Use `--json` on `send`, `read`, `list`, `list --client`, `list --server`, `interrupt`,
 `detach`, or `terminate` when parsing output in scripts. JSON retains the
 structured response schema and the same exit codes.
 

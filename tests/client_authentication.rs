@@ -358,6 +358,20 @@ fn automatic_authentication_cli_is_positive_bounded_hidden_and_serialized() {
         );
     }
     let home = fixture.home("expired", false);
+    client_config::update(&home, |config| {
+        config.targets.clear();
+        Ok(())
+    }).unwrap();
+    let empty = run(&home, &["list"]);
+    assert!(empty.status.success());
+    assert_eq!(String::from_utf8_lossy(&empty.stdout).trim(), "No registered boxes.");
+    let empty_json = run(&home, &["list", "--json"]);
+    assert!(empty_json.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&empty_json.stdout).unwrap(), serde_json::json!([]));
+    assert_eq!(fixture.calls("status"), 0);
+    assert_eq!(fixture.calls("login-hidden"), 0);
+    assert_eq!(fixture.calls("connect"), 0);
+    let home = fixture.home("expired", false);
     assert!(run(&home, &["list"]).status.success());
     assert!(run(&home, &["connect", "fixture"]).status.success());
     assert_eq!(fixture.calls("status"), 0);

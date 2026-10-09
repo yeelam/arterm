@@ -98,7 +98,10 @@ credentials. Other installations/users are not force-stopped.
 
 arTerm's `arterm connect my-devbox` only prints a reusable command.
 Type that command or `arterm connect my-devbox MyWork`; repeat it to recover
-the same session. Existing 0.2 GUID recovery records remain supported.
+the same still-resumable session. In 0.7.1, a known-ended or authoritatively
+retired name can be reused with a fresh GUID and clean session data; old GUIDs
+never address the replacement. Unknown records are not silently replaced.
+Existing 0.2 GUID recovery records remain supported.
 Reusable connect requires the host's
 `ended-session-rejection` capability. Finish live 0.2 sessions using explicit
 GUID connection with an existing saved credential before upgrading their host.

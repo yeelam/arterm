@@ -33,6 +33,15 @@ pub enum End {
     Detached,
     Exited(u32),
 }
+#[derive(Debug)]
+pub struct SessionRejected;
+impl std::fmt::Display for SessionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("host rejected the saved session credential; remote existence is not confirmed")
+    }
+}
+impl std::error::Error for SessionRejected {}
+
 pub struct Engine {
     pub state: State,
     pub output_seq: u64,
@@ -329,6 +338,7 @@ mod tests {
             let end = engine.run(&mut server, &mut FakeTerminal::default(), &mut |_| Ok(())).unwrap();
             assert_eq!(end, End::Exited(code));
             assert!(engine.state.ended);
+            assert_eq!(engine.state.exit_confirmed, Some(true));
         }
     }
     #[test]
@@ -392,8 +402,32 @@ mod tests {
         assert_eq!(server.creates, 1);
         let persisted = persisted.unwrap();
         assert!(persisted.ended);
+        assert_eq!(persisted.exit_confirmed, Some(false));
+        assert_eq!(persisted.retirement_reason, Some(crate::store::RetirementReason::BrokerChanged));
         assert_eq!(persisted.id, saved.id);
-        assert_eq!(persisted.token, saved.token);
+        assert!(persisted.token.is_none() && persisted.claim.is_empty() && persisted.pending.is_none());
+        assert_eq!(persisted.origin, saved.origin);
+    }
+
+    #[test]
+    fn unbound_saved_credentials_or_input_never_adopt_a_broker_or_send_protocol_frames() {
+        for scenario in 0..3 {
+            let mut saved = state();
+            if scenario == 0 { saved.token = Some(vec![2;32]); }
+            if scenario == 1 { saved.pending = Some(crate::store::PendingInput { seq: 1, bytes: b"private-input".to_vec() }); }
+            if scenario == 2 { saved.origin = Some(vec![1]); }
+            let origin = saved.origin.clone();
+            let mut engine = Engine::resume_guid(saved);
+            let mut server = FakeLink::new(engine.state.id);
+            let mut persisted = false;
+            assert!(engine.run(&mut server, &mut FakeTerminal::default(), &mut |_| {
+                persisted = true;
+                Ok(())
+            }).is_err());
+            assert!(server.sent.is_empty() && !persisted && !engine.state.ended);
+            assert_eq!(engine.state.origin, origin);
+            assert!(engine.state.retirement_reason.is_none());
+        }
     }
 
     #[test]
@@ -412,6 +446,7 @@ mod tests {
             .is_err());
         assert_eq!(server.creates, 1);
         assert!(engine.state.ended);
+        assert_eq!(engine.state.exit_confirmed, Some(false));
         let before = server.sent.len();
         assert!(engine.run(&mut server, &mut terminal, &mut |_| Ok(())).is_err());
         assert_eq!(server.sent.len(), before);
@@ -423,6 +458,7 @@ mod tests {
             .is_err());
         assert_eq!(server.sent.len(), before + 1); // only Hello, not another create
         assert!(engine.state.ended);
+        assert_eq!(engine.state.exit_confirmed, Some(false));
         let mut engine = Engine::new(pending);
         engine.state.create_deadline_ms = Some(0);
         server.broker = vec![1; 16];
@@ -430,6 +466,7 @@ mod tests {
         assert!(engine.run(&mut server, &mut terminal, &mut |_| Ok(())).is_err());
         assert_eq!(server.sent.len(), before + 1);
         assert!(engine.state.ended);
+        assert_eq!(engine.state.exit_confirmed, Some(false));
     }
     #[test]
     fn lost_input_ack_reconciles_after_client_restart() {
@@ -726,6 +763,8 @@ impl Engine {
     ) -> Result<End> {
         let _transfer_scope = self.transfer_admission.connection_scope();
         ensure!(!self.state.ended, "session has ended; choose a NEW reference");
+        ensure!(self.state.broker_binding_is_safe(),
+            "saved state has no safe broker binding; refusing credential/input reuse");
         terminal.reading(false);
         self.attachment = None;
         self.lease = None;
@@ -844,7 +883,7 @@ impl Engine {
                         let broker = bin16(body, "broker_instance_id")?;
                         if let Some(origin) = &self.state.origin {
                             if *origin != broker {
-                                self.state.ended = true;
+                                self.state.mark_retired(crate::store::RetirementReason::BrokerChanged)?;
                                 save(&self.state)?;
                                 bail!("Terminal host restarted; refusing to recreate session or replay uncertain input");
                             }
@@ -862,7 +901,7 @@ impl Engine {
                             phase = "attaching";
                         } else {
                             if self.state.create_deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
-                                self.state.ended = true;
+                                self.state.mark_ended(false)?;
                                 save(&self.state)?;
                                 bail!("create recovery window expired; refusing to create a replacement");
                             }
@@ -1023,7 +1062,7 @@ impl Engine {
                     "SessionExited" if phase == "attached" => {
                         self.same_session(body)?;
                         terminal.reading(false);
-                        self.state.ended = true;
+                        self.state.mark_ended(true)?;
                         save(&self.state)?;
                         let code = get(body, "exit_code")?;
                         if code.is_nil() {
@@ -1060,22 +1099,22 @@ impl Engine {
                     }
                     "SessionEnded" => {
                         self.same_session(body)?;
-                        self.state.ended = true;
+                        self.state.mark_ended(true)?;
                         save(&self.state)?;
                         bail!("session has ended; choose a NEW reference");
                     }
                     "CreateRecoveryUnavailable" => {
-                        self.state.ended = true;
+                        self.state.mark_ended(false)?;
                         save(&self.state)?;
                         bail!("host returned {kind}; session was not replaced");
                     }
                     "CreateRequestConflict"
                     | "SessionIdConflict"
-                    | "Unauthorized"
                     | "LeaseRevoked"
                     | "ConnectionSuperseded" => {
                         bail!("host returned {kind}; session was not replaced");
                     }
+                    "Unauthorized" => return Err(SessionRejected.into()),
                     _ => bail!("unexpected host protocol message {kind} in {phase}"),
                 }
                 if let Some(value) = reply {
