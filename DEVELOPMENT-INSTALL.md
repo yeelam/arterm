@@ -76,8 +76,13 @@ Then run the installer for the role you need:
 
 Client installation completes local initialization; no `arterm.exe setup` is
 required. Open a fresh PowerShell window after installation. On the client,
-use `arterm.exe login` only if not already signed in; installation never changes
-sign-in. On the host, run `arterm-host.exe setup --name my-devbox`. Sign into the same GitHub
+use `arterm.exe --login` (or `arterm.exe login`) for explicit sign-in; installation
+never changes sign-in. Starting with 0.7.0, client network operations attempt
+bounded GitHub login automatically only when authentication is missing or
+expired. The login process is hidden, but a browser or approval prompt may still
+appear. Failed recovery tells you to use `arterm --login`; it does not loop
+indefinitely or change host authentication. On the host, run
+`arterm-host.exe setup --name my-devbox`. Sign into the same GitHub
 account on both machines and run the host's printed registration command on
 the client. Follow [QUICKSTART.md](https://github.com/yeelam/arterm/blob/main/QUICKSTART.md) for the
 complete connection and automation steps.

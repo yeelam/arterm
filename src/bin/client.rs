@@ -15,7 +15,7 @@ use arterm::{
     engine::{End, Engine},
     local_control::{self, Operation, Owner},
     store::{self, SessionReference, Store},
-    transport::{authenticated, Forward, LoginRequired, TunnelLink},
+    transport::{ensure_authenticated, login, Forward, LoginRequired, TunnelLink},
 };
 use std::{
     path::{Path, PathBuf},
@@ -41,7 +41,7 @@ fn usage() {
         "arTerm client {}\n\
 Usage:\n\
   arterm setup [--devtunnel-path PATH] [--no-download]\n\
-  arterm login | logout\n\
+  arterm --login | login | logout\n\
   arterm add ALIAS --tunnel NAME-OR-ID --host-path ABSOLUTE\n\
   arterm list [--json]\n\
   arterm remove ALIAS\n\
@@ -56,7 +56,7 @@ Usage:\n\
   arterm doctor [ALIAS]\n\
   arterm --help | --version\n\n\
 Client Setup initializes local files. setup is optional repair/custom-path configuration, not sign-in.\n\
-Use arterm login if not signed in, then arterm add to register a host.\n\
+Network commands renew positively missing/expired sign-in once; use arterm --login for interactive GitHub sign-in with the host's account.\n\
 list shows registered machines and saved session names/IDs without querying the network.\n\
 Without REF, connect only prints a reusable command. Names are not passwords.\n\
 Control commands print readable results by default; use --json for structured automation output.\n\
@@ -438,6 +438,13 @@ fn doctor(root: &Path, args: &[String]) -> Result<()> {
         "--address requires doctor ALIAS"
     );
     let config = client_config::load(root)?;
+    let target = alias
+        .as_deref()
+        .map(|alias| {
+            client_config::validate_alias(alias)?;
+            client_config::target(&config, alias).map(|target| (alias, target))
+        })
+        .transpose()?;
     if flags.address.is_none() {
         let path = devtunnel_path(&config)?;
         ensure!(
@@ -445,15 +452,11 @@ fn doctor(root: &Path, args: &[String]) -> Result<()> {
             "configured devtunnel executable is missing: {}",
             path.display()
         );
-        ensure!(
-            authenticated(path)?,
-            "devtunnel is not signed in; run arterm login"
-        );
+        ensure_authenticated(path)?;
         println!("Dependency and authentication are ready.");
     }
-    if let Some(alias) = alias {
-        let target = client_config::target(&config, &alias)?.clone();
-        let mut link = connect_link(&config, &target, flags.address.as_deref())?;
+    if let Some((alias, target)) = target {
+        let mut link = connect_link(&config, target, flags.address.as_deref())?;
         client_protocol::doctor(&mut link)?;
         println!("Tunnel and host handshake succeeded for {alias}.");
     }
@@ -592,13 +595,10 @@ fn command(args: &[String]) -> Result<u32> {
             setup(&root, &args[1..])?;
             Ok(0)
         }
-        Some("login") if args.len() == 1 => {
+        Some("login" | "--login") => {
+            ensure!(args.len() == 1, "arterm --login / login accepts no extra arguments");
             let config = client_config::load(&root)?;
-            run_vendor(devtunnel_path(&config)?, &["user", "login", "--github"])?;
-            ensure!(
-                authenticated(devtunnel_path(&config)?)?,
-                "devtunnel login did not establish usable credentials"
-            );
+            login(devtunnel_path(&config)?)?;
             Ok(0)
         }
         Some("logout") if args.len() == 1 => {
