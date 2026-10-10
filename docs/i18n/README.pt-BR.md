@@ -1,6 +1,6 @@
 # arTerm: terminal remoto persistente do Windows após desconexão
 
-[English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English](../../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md)
 
 Perca a conexão, não o trabalho. Deixe compilações, comandos demorados e agentes de programação no Windows remoto. Depois de fechar o cliente, perder a VPN ou reiniciar o notebook, volte ao mesmo shell sem começar do zero.
 
@@ -11,6 +11,8 @@ Escolha x64 ou ARM64 em [Downloads para Windows](https://github.com/yeelam/arter
 **Antes de adicionar confiança ou instalar:** siga a [comparação do ZIP](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) com Get-FileHash e o checksum do arquivo publicado na release. A impressão digital do CER não verifica o ZIP nem os executáveis. Pare se o checksum público estiver ausente ou não corresponder; uma correspondência não garante segurança nem aprova confiança.
 
 **Mantenha os dados da sessão privados:** saída retida, histórico normal do shell e arquivos de recuperação podem conter comandos, caminhos, código ou segredos. Proteja-os nos dois computadores e remova informações sensíveis antes de compartilhar logs, capturas ou pacotes de suporte. A proteção de credenciais por DPAPI não significa que todos os arquivos sejam criptografados ou sem conteúdo. As exclusões de conteúdo dos diagnósticos de prontidão são mais restritas.
+
+Antes de executar, use Get-AuthenticodeSignature conforme a [inspeção somente leitura](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them) dos instaladores e clientes extraídos. Checksum ZIP, identidade CER e confiança Windows são verificações distintas. Exija o signatário de desenvolvimento fixado e status Valid; signatário desconhecido ou status não Valid exige parar, não contornar avisos. A confiança depende de aprovação explícita e política separadamente, seguida de nova inspeção. O controle é restrito ao mesmo usuário local, sessão, integridade/elevação e cliente assinado idêntico; não é compartilhamento arbitrário entre agentes de máquinas diferentes.
 
 No host, execute arTerm-Host-Setup.exe e abra um novo PowerShell:
 
@@ -54,4 +56,4 @@ Se falhar, execute arterm doctor my-devbox e confira contas e rede; use arterm -
 
 Usuários de Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi e Qwen CLI podem ler e executar comandos comuns do Windows quando suas ferramentas permitirem. Isso não declara integração nativa nem certificação dos seis clientes. Outro terminal de controle local exige o mesmo usuário, sessão e contexto de integridade/elevação, além de cliente assinado confiável e idêntico byte a byte. Mantenha a conexão em execução.
 
-[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Troubleshooting](../../README.md#installation-and-troubleshooting-details) · [Upgrade / stop](../../QUICKSTART.md#upgrade-without-registering-again) · [Trust removal](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)
+[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Solução de problemas](../../README.md#installation-and-troubleshooting-details) · [Atualizar e parar](../../QUICKSTART.md#upgrade-without-registering-again) · [Remover a confiança no certificado](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

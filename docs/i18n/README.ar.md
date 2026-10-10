@@ -1,0 +1,83 @@
+<div dir="rtl">
+
+# arTerm: طرفية Windows بعيدة مستمرة بعد انقطاع الاتصال
+
+</div>
+
+[English](../../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md)
+
+<div dir="rtl">
+
+افقد الاتصال، لا عملك. أبقِ عمليات البناء والأوامر طويلة التشغيل ووكلاء البرمجة على جهاز Windows البعيد. بعد إغلاق العميل أو انقطاع VPN أو إعادة تشغيل الحاسوب المحمول، عد إلى الصدفة نفسها ومتغيراتها ومجلد العمل نفسه.
+
+يحتاج العميل والمضيف كلاهما إلى Windows. يجب أن يبقى المضيف قيد التشغيل والمستخدم مسجّل الدخول. يستخدم العميل Microsoft devtunnel CLI، ويستخدم المضيف واجهة VS Code tunnel CLI أصلية متوافقة مثل code-tunnel.exe؛ المحرر الكامل اختياري. سجّل الدخول إلى النفقين بحساب GitHub نفسه؛ مصادقة gh منفصلة. يجب السماح بالاتصالات الصادرة، والموافقة على تنزيل الاعتماديات وقبول ترخيص VS Code server.
+
+اختر x64 أو ARM64 من [تنزيلات Windows](https://github.com/yeelam/arterm/releases/latest). الإصدار المنشور v0.7.1 موقّع بشهادة تطوير، وليس بشهادة إنتاج موثوقة لدى الجمهور. قبل التثبيت أو إضافة الثقة، استخدم Get-FileHash في [مقارنة ZIP](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) مع مجموع التحقق المنشور للإصدار نفسه. تجزئة ZIP وهوية CER وثقة Windows بتوقيع الملف التنفيذي فحوص منفصلة. قبل التشغيل، افحص المثبّتات والعملاء المستخرجين باستخدام Get-AuthenticodeSignature وفق [الفحص للقراءة فقط](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them): يجب مطابقة هوية موقّع التطوير المحددة وأن تكون الحالة Valid. إذا غاب مجموع التحقق أو اختلف، أو كان الموقّع مجهولاً، أو لم تكن الحالة Valid، فتوقف. الثقة بالشهادة تتطلب موافقة صريحة مستقلة من المستخدم وسماح سياسة المؤسسة، ثم إعادة الفحص. لا تتجاوز تحذيرات النظام أو Authenticode أو SmartScreen أو ضوابط التطبيقات.
+
+بعد نجاح الفحوص وسماح السياسة، شغّل arTerm-Host-Setup.exe على المضيف البعيد وافتح PowerShell جديداً:
+
+</div>
+
+```powershell
+arterm-host setup --name my-devbox
+```
+
+<div dir="rtl">
+
+أكمل تسجيل دخول النفق واحتفظ بأمر التسجيل الذي يطبعه المضيف. ثبّت arTerm-Client-Setup.exe محلياً، وافتح PowerShell جديداً باستخدام حساب GitHub نفسه، ثم نفّذ أمر التسجيل كما طُبع وبمسار المضيف الفعلي. العميل مهيّأ بالفعل؛ لا حاجة إلى arterm setup. اتصل محلياً باسم جلسة جديد:
+
+</div>
+
+```powershell
+arterm connect my-devbox MyProof --shell powershell
+```
+
+<div dir="rtl">
+
+نفّذ في PowerShell البعيد المتصل، وسجّل PID والمجلد:
+
+</div>
+
+```powershell
+$artermProof = 'kept-on-host'
+$artermPid = $PID
+$artermCwd = (Get-Location).Path
+$PID; $artermProof; (Get-Location).Path
+```
+
+<div dir="rtl">
+
+اضغط Ctrl+] لفصل العميل فقط. إذا اعترضت الطرفية الاختصار، أغلق علامة تبويب العميل المحلي وحدها. أبقِ المضيف يعمل والمستخدم مسجّل الدخول. كرّر الأمر نفسه محلياً:
+
+</div>
+
+```powershell
+arterm connect my-devbox MyProof --shell powershell
+```
+
+<div dir="rtl">
+
+في PowerShell البعيد بعد إعادة الاتصال:
+
+</div>
+
+```powershell
+$PID; $artermProof; (Get-Location).Path
+($PID -eq $artermPid) -and ($artermProof -eq 'kept-on-host') -and ((Get-Location).Path -eq $artermCwd)
+```
+
+<div dir="rtl">
+
+المتوقع: PID نفسه، وkept-on-host، والمجلد نفسه، وTrue. استخدم أمر الاتصال نفسه لاحقاً لمتابعة العمل. لإنهاء الاختبار، اكتب exit داخل الصدفة البعيدة: تنتهي العملية ولا يمكن استعادة حالتها أثناء التشغيل.
+
+لا يعيد البرنامج إحياء العمليات بعد إعادة تشغيل المضيف أو تسجيل الخروج أو تعطله أو إيقافه أو الخروج من الصدفة. يبدأ المضيف عند تسجيل دخول المستخدم؛ لا يضبط دخولاً تلقائياً أو خدمة بلا مستخدم مسجّل الدخول. إعادة عرض المخرجات لها حد للاحتفاظ. فرع التطوير بأكمله غير مؤهل للإصدار: المراجعة المستقلة لأرشيفات نقل الملفات وشروط الإدخال المباشر لم تكتمل. واجهات TUI العشوائية غير معتمدة؛ رفع الحظر عن الملفات تلقائياً لا يضمن سلامتها.
+
+قد تحتوي المخرجات المحفوظة وسجل الصدفة المعتاد وملفات الاسترداد على أوامر ومسارات وشيفرة أو أسرار. احمِها على الجهازين واحجب المعلومات الحساسة قبل مشاركة السجلات أو الصور أو حزم الدعم. حماية بيانات الاعتماد عبر DPAPI لا تعني تشفير كل الملفات أو خلوها من المحتوى. استثناءات المحتوى في تشخيصات الجاهزية أضيق نطاقاً.
+
+يمكن لمستخدمي Copilot CLI وClaude Code وCodex وGemini CLI وKimi وQwen CLI استعمال أوامر Windows العادية إذا سمحت أدواتهم؛ هذا ليس اعتماداً لتكامل أصلي للمنتجات الستة. تتطلب طرفية تحكم محلية أخرى المستخدم نفسه وجلسة الدخول نفسها وسياق مستوى تكامل رمز الوصول في Windows (Token Integrity Level) ورفع الصلاحيات نفسه وعميلًا موقّعاً موثوقاً مطابقاً بايتاً ببايت. أبقِ عملية الاتصال قيد التشغيل. ليس ذلك مشاركة عشوائية لوكلاء على أجهزة مختلفة.
+
+عند الفشل، افحص الحسابات والشبكة عبر arterm doctor my-devbox، واستعد دخول العميل باستخدام arterm --login عند الحاجة. لا تحذف سجلات الاسترداد ولا تعِد تثبيت مضيف يعمل. ترفض التحديثات افتراضياً قطع الجلسات النشطة. على المضيف يحافظ arterm-host stop --disable على التوقف؛ ويبدأ arterm-host start التشغيل مجدداً دون استعادة الصدفات المفقودة. إزالة التثبيت تحتفظ ببيانات المستخدم؛ راجع الدليل لإلغاء الثقة بالشهادة.
+
+</div>
+
+[English README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [استكشاف الأخطاء وإصلاحها](../../README.md#installation-and-troubleshooting-details) · [التحديث والإيقاف](../../QUICKSTART.md#upgrade-without-registering-again) · [إلغاء الثقة بالشهادة](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

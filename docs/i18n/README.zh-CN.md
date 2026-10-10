@@ -1,6 +1,6 @@
 # arTerm：断线后继续工作的 Windows 远程终端
 
-[English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English](../../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md)
 
 连接断了，工作不用重来。构建、长时间命令和 AI 编程代理留在远程 Windows 主机运行。客户端关闭、VPN 断开或笔记本重启后，回到同一个 shell。
 
@@ -11,6 +11,8 @@
 **信任或安装前：**按[下载 ZIP 校验步骤](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)用 Get-FileHash 与公开发布的归档校验和比较。CER 指纹不能验证 ZIP 或程序。公开校验和缺失或不匹配时停止；匹配不等于安全或信任批准。
 
 **保护会话隐私：**保留的终端输出、正常 shell 历史和恢复文件可能包含命令、路径、代码或秘密。两端都应妥善保护，分享日志、截图或支持材料前先脱敏。凭据由 DPAPI 保护，不表示所有文件都加密或不含内容；就绪诊断的有限内容排除不适用于全部会话数据。
+
+运行前按[只读签名检查](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them)用 Get-AuthenticodeSignature 检查解压后的安装器和客户端。ZIP 校验和、CER 身份与可执行文件的 Windows 信任是不同检查；须匹配固定的开发签名者且状态为 Valid。未知签名者或非 Valid 状态必须停止，不能绕过警告。是否信任仍需单独明确批准并符合政策；批准后重新检查。控制仅限同一本地用户、登录会话、完整性/提权上下文和相同签名客户端，不是任意跨机器代理共享。
 
 远程运行 arTerm-Host-Setup.exe，打开新的 PowerShell：
 
@@ -54,4 +56,4 @@ $PID; $artermProof; (Get-Location).Path
 
 这些公共命令可供 Copilot CLI、Claude Code、Codex、Gemini CLI、Kimi、Qwen CLI 用户在工具允许时使用，不是六客户端原生集成认证。第二个本地控制终端必须与连接进程具有相同用户、登录会话、完整性/提权上下文，使用字节完全相同的受信任签名客户端；连接进程须保持运行。
 
-[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Troubleshooting](../../README.md#installation-and-troubleshooting-details) · [Upgrade / stop](../../QUICKSTART.md#upgrade-without-registering-again) · [Trust removal](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)
+[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [故障排查](../../README.md#installation-and-troubleshooting-details) · [升级与停止](../../QUICKSTART.md#upgrade-without-registering-again) · [撤销证书信任](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

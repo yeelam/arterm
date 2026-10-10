@@ -1,8 +1,8 @@
 # arTerm: terminal remoto persistente de Windows tras perder la conexión
 
-[English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English](../../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md)
 
-Pierde la conexión, no tu trabajo. Deja compilaciones, comandos largos y agentes de programación en el Windows remoto. Tras cerrar el cliente, perder la VPN o reiniciar el portátil, vuelve al mismo shell sin empezar de cero.
+Pierde la conexión, no tu trabajo. Deja compilaciones, comandos de larga duración y agentes de programación en el Windows remoto. Tras cerrar el cliente, perder la VPN o reiniciar el portátil, vuelve al mismo shell sin empezar de cero.
 
 Ambos equipos necesitan Windows. El host debe seguir encendido con el usuario conectado. El cliente usa Microsoft devtunnel CLI; el host, una CLI nativa compatible de túneles de VS Code, como code-tunnel.exe. El editor completo es opcional. Ambos túneles necesitan la misma cuenta de GitHub; la autenticación de gh es distinta. Se requiere tráfico saliente permitido, consentimiento para descargar dependencias y aceptación de la licencia de VS Code server.
 
@@ -11,6 +11,8 @@ Elige x64 o ARM64 en [Descargas para Windows](https://github.com/yeelam/arterm/r
 **Antes de añadir confianza o instalar:** sigue la [comparación del ZIP](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) con Get-FileHash y la suma del archivo publicada en la versión. La huella CER no verifica el ZIP ni los ejecutables. Detente si falta la suma pública o no coincide; una coincidencia no garantiza seguridad ni aprueba confianza.
 
 **Mantén privados los datos de sesión:** la salida retenida, el historial normal del shell y los archivos de recuperación pueden contener comandos, rutas, código o secretos. Protégelos en ambos equipos y elimina información sensible antes de compartir registros, capturas o paquetes de soporte. DPAPI protege credenciales, no garantiza que todos los archivos estén cifrados o sin contenido. Las exclusiones de contenido de los diagnósticos de disponibilidad son más limitadas.
+
+Antes de ejecutar, usa Get-AuthenticodeSignature según la [inspección de solo lectura](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them) de instaladores y clientes extraídos. Suma ZIP, identidad CER y confianza Windows son comprobaciones distintas. Exige el firmante de desarrollo fijado y estado Valid; un firmante desconocido o estado no Valid exige parar, no eludir avisos. La confianza requiere aprobación explícita y permiso de política por separado, y después repetir la inspección. El control se limita al mismo usuario local, sesión, integridad/elevación y cliente firmado idéntico; no es compartir agentes arbitrarios entre máquinas.
 
 En el host ejecuta arTerm-Host-Setup.exe y abre un nuevo PowerShell:
 
@@ -54,4 +56,4 @@ Si falla, ejecuta arterm doctor my-devbox y revisa cuentas y red; usa arterm --l
 
 Usuarios de Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi y Qwen CLI pueden consultar y ejecutar comandos normales de Windows si sus herramientas lo permiten. No es una certificación de integración nativa de seis clientes. Otro terminal de control local exige el mismo usuario, sesión y contexto de integridad/elevación, con un cliente firmado de confianza e idéntico byte a byte. Mantén la conexión en ejecución.
 
-[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Troubleshooting](../../README.md#installation-and-troubleshooting-details) · [Upgrade / stop](../../QUICKSTART.md#upgrade-without-registering-again) · [Trust removal](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)
+[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Solución de problemas](../../README.md#installation-and-troubleshooting-details) · [Actualizar y detener](../../QUICKSTART.md#upgrade-without-registering-again) · [Retirar la confianza del certificado](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

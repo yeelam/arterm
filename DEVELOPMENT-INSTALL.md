@@ -79,6 +79,68 @@ process injection, or other code invoking the legitimate CLI. There is no
 production environment-variable or command-line bypass. arTerm does not import
 trust automatically.
 
+## Inspect extracted executable signatures without running them
+
+After the published ZIP checksum matches, extract it and open PowerShell in
+that extracted directory. This **read-only** inspection checks the actual client,
+host and both installers before any executable is run; it does not add trust:
+
+```powershell
+& {
+    $cer = (Resolve-Path -LiteralPath .\arTerm-Dev.cer -ErrorAction Stop).Path
+    $expectedCerHash = '46B3A8A9307652D90662DB056FDEDCB93C91EDCF823F6BE3007A7E54F2AD171C'
+    $expectedThumbprint = '3F94517F423B0A6DF92F19D4B0B0467AFE10C1F2'
+    if ((Get-FileHash -LiteralPath $cer -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expectedCerHash) {
+        throw 'Unexpected public certificate. Stop; do not run or add trust.'
+    }
+    $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cer)
+    if ($certificate.Thumbprint -ne $expectedThumbprint -or $certificate.Subject -ne 'CN=DevBoxRemote Development') {
+        throw 'Unexpected development publisher identity. Stop.'
+    }
+    $checks = foreach ($file in 'arTerm-Client-Setup.exe', 'arTerm-Host-Setup.exe', 'arterm.exe', 'arterm-host.exe') {
+        $signature = Get-AuthenticodeSignature -LiteralPath (Resolve-Path -LiteralPath $file -ErrorAction Stop).Path
+        $signer = $signature.SignerCertificate
+        [pscustomobject]@{
+            File = $file
+            Status = $signature.Status
+            StatusMessage = $signature.StatusMessage
+            Subject = $signer.Subject
+            Thumbprint = $signer.Thumbprint
+        }
+        if ($null -eq $signer -or $signer.Thumbprint -ne $expectedThumbprint -or
+            [Convert]::ToBase64String($signer.RawData) -ne [Convert]::ToBase64String($certificate.RawData)) {
+            throw "Unexpected or absent signer for $file. Stop; do not run or add trust."
+        }
+    }
+    $checks | Format-Table -AutoSize
+    if (@($checks | Where-Object { $_.Status -ne 'Valid' }).Count -ne 0) {
+        throw 'Windows signature trust is not Valid for every executable. Stop; do not run them.'
+    }
+    'All four executable signatures are Valid and match the pinned development certificate.'
+}
+```
+
+Expected publisher: `CN=DevBoxRemote Development`, with the thumbprint in
+[Certificate identity](#certificate-identity), and the exact public certificate
+bytes whose SHA-256 is pinned there. Subject text alone is not an identity check.
+The ZIP checksum checks downloaded archive bytes; the CER hash identifies the
+public certificate; Authenticode checks each executable's signature and Windows
+trust status. These are distinct checks, not substitutes for one another.
+
+On a user account that has **not** approved this self-signed development
+certificate, Windows may report `NotTrusted` or another non-`Valid` status.
+That is a stop, **not permission to run the installer or ignore an OS warning**.
+`NotSigned`, `HashMismatch`, unknown signers and other invalid/error results must
+also stop; do not fix them by trusting an unknown issuer or disabling controls.
+If the archive, public certificate and executable signer identities all match,
+you may separately review [Optional one-time trust](#optional-one-time-trust-for-your-test-user)
+with your administrator and explicit approval. No inspection result grants that
+approval. If trust is declined or policy blocks it, use an approved deployment
+route instead. After any permitted manual trust decision, rerun this complete
+read-only check and require **all four statuses to be `Valid` before execution**.
+A valid signature does not override SmartScreen reputation, application-control
+policy, dependency consent or vendor license requirements.
+
 ## Optional one-time trust for your test user
 
 Only if you understand and approve trusting this development publisher, and
@@ -103,7 +165,7 @@ Your administrator may restrict this operation. If it is blocked, stop and
 use your organization's approved deployment route; do not disable security
 controls or change machine-wide trust settings.
 
-Then run the installer for the role you need:
+Rerun the [read-only executable signature inspection](#inspect-extracted-executable-signatures-without-running-them). Only when every signature is `Valid` and the exact signer matches, and policy permits execution, run the installer for the role you need:
 
 ```powershell
 .\arTerm-Client-Setup.exe

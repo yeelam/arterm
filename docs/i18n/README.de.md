@@ -1,6 +1,6 @@
 # arTerm: persistentes Windows-Remote-Terminal nach Verbindungsabbruch
 
-[English](../../README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English](../../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md) | [हिन्दी](README.hi.md) | [العربية](README.ar.md)
 
 Verlieren Sie die Verbindung, nicht Ihre Arbeit. Builds, lange Befehle und Coding-Agenten laufen auf dem entfernten Windows-Rechner weiter. Nach dem Schließen des Clients, einem VPN-Abbruch oder Notebook-Neustart kehren Sie zur selben Shell zurück statt neu anzufangen.
 
@@ -11,6 +11,8 @@ Wählen Sie x64 oder ARM64 unter [Windows-Downloads](https://github.com/yeelam/a
 **Vor Vertrauensfreigabe oder Installation:** folgen Sie dem [ZIP-Prüfsummenvergleich](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) mit Get-FileHash und der öffentlich veröffentlichten Archivprüfsumme. Der CER-Fingerabdruck prüft weder ZIP noch Programmdateien. Fehlt die öffentliche Prüfsumme oder weicht sie ab, stoppen Sie. Eine Übereinstimmung garantiert weder Sicherheit noch Vertrauensfreigabe.
 
 **Sitzungsdaten privat halten:** Gespeicherte Terminalausgabe, normale Shell-Historie und Wiederherstellungsdateien können Befehle, Pfade, Code oder Geheimnisse enthalten. Schützen Sie sie auf beiden Rechnern und entfernen Sie sensible Inhalte vor dem Teilen von Logs, Screenshots oder Supportpaketen. DPAPI schützt Zugangsdaten, nicht automatisch alle Dateien vor Klartext oder Inhalt. Die engeren Inhaltsausschlüsse für Bereitschaftsdiagnosen gelten nicht für sämtliche Sitzungsdaten.
+
+Prüfen Sie vor der Ausführung die entpackten Installer und Clients mit Get-AuthenticodeSignature gemäß der [rein lesenden Signaturprüfung](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them). ZIP-Prüfsumme, CER-Identität und Windows-Vertrauen sind getrennte Prüfungen. Erforderlich sind der festgelegte Entwicklungssignierer und Status Valid; unbekannter Signierer oder nicht Valid bedeutet stoppen, nicht Warnungen umgehen. Vertrauen braucht separat ausdrückliche Zustimmung und Richtlinienerlaubnis; danach erneut prüfen. Steuerung ist auf denselben lokalen Benutzer, dieselbe Sitzung, Integrität/Erhöhung und den identischen signierten Client beschränkt, nicht beliebiges Agententeilen zwischen Rechnern.
 
 Führen Sie auf dem Host arTerm-Host-Setup.exe aus und öffnen Sie eine neue PowerShell:
 
@@ -54,4 +56,4 @@ Bei Fehlern prüfen Sie mit arterm doctor my-devbox Konten und Netzwerk. Bei Bed
 
 Nutzer von Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi und Qwen CLI können diese Anleitung lesen und gewöhnliche Windows-Befehle ausführen, sofern ihre Werkzeuge dies erlauben. Das behauptet keine native Integration oder Zertifizierung aller sechs Clients. Ein weiteres lokales Steuerterminal erfordert denselben Benutzer, dieselbe Windows-Anmeldesitzung, denselben Integritäts-/Erhöhungskontext und einen bytegleichen, vertrauenswürdig signierten Client. Der Verbindungsprozess muss weiterlaufen.
 
-[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Troubleshooting](../../README.md#installation-and-troubleshooting-details) · [Upgrade / stop](../../QUICKSTART.md#upgrade-without-registering-again) · [Trust removal](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)
+[README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Fehlerbehebung](../../README.md#installation-and-troubleshooting-details) · [Aktualisieren und stoppen](../../QUICKSTART.md#upgrade-without-registering-again) · [Zertifikatsvertrauen entfernen](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

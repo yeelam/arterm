@@ -13,7 +13,7 @@ work in progress** while the host stays running.
 | [Get connected](#get-connected)
 | [Full quick start](QUICKSTART.md)
 
-**Languages:** English | [简体中文](docs/i18n/README.zh-CN.md) | [日本語](docs/i18n/README.ja.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md)
+**Languages:** [English](README.md) | [简体中文](docs/i18n/README.zh-CN.md) | [繁體中文](docs/i18n/README.zh-TW.md) | [日本語](docs/i18n/README.ja.md) | [한국어](docs/i18n/README.ko.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md) | [Italiano](docs/i18n/README.it.md) | [Русский](docs/i18n/README.ru.md) | [Türkçe](docs/i18n/README.tr.md) | [Tiếng Việt](docs/i18n/README.vi.md) | [Bahasa Indonesia](docs/i18n/README.id.md) | [हिन्दी](docs/i18n/README.hi.md) | [العربية](docs/i18n/README.ar.md)
 
 [![Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue.](.github/arterm-before-after.png)](https://github.com/yeelam/arterm/releases/latest)
 
@@ -28,6 +28,9 @@ stay running and logged in; arTerm survives client-side loss, not host shutdown.
   to the existing process and environment.
 - **Let people and agents share a working session.** Send a command, read output,
   or interrupt work from another local CLI without creating a second shell.
+  Controllers must share the attachment's local Windows user, logon/session,
+  integrity/elevation context and byte-identical trusted signed client. This is
+  local control of one owned attachment, not arbitrary cross-machine agent sharing.
 - **Reach your Windows machines across networks.** Connect to configured Dev
   Boxes, VMs, and Windows Sandbox hosts through GitHub-authenticated tunnels,
   without needing the same LAN or direct inbound host access.
@@ -187,6 +190,11 @@ and only when their command matches the owned installed executable.
 against the public release manifest. Verifying only the CER fingerprint does
 not verify the archive or executable payloads. Stop if the published payload
 checksum is unavailable or mismatched; a match is not a safety or trust approval.
+Then perform the [read-only Authenticode inspection](DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them)
+of the extracted installers and clients. Require the pinned development signer
+and `Valid` Windows trust before running them; non-`Valid` results must stop, not
+trigger a warning bypass. Manual certificate trust remains a separate,
+explicit, policy-permitted decision.
 
 **Keep session data private.** Retained terminal output, normal shell history,
 and recovery files may expose commands, paths, code or secrets. Protect them on
@@ -195,7 +203,15 @@ support bundles. DPAPI protection of credentials does not mean every retained
 artifact is encrypted or content-free. The narrower readiness-diagnostic
 content exclusions do not apply to all session data.
 
-1. Download the installers from [Releases](https://github.com/yeelam/arterm/releases/latest).
+1. Choose the Windows **x64 or ARM64 ZIP archive** matching the machine on
+   which you will install from [Releases](https://github.com/yeelam/arterm/releases/latest).
+   The published v0.7.1 assets are
+   `arTerm-0.7.1-windows-x64-development-signed.zip` and
+   `arTerm-0.7.1-windows-arm64-development-signed.zip`.
+   First compare the downloaded ZIP with that release's published checksum,
+   then extract it and inspect the included installer/client signatures using
+   [the installation verification guide](DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)
+   before adding trust or running an installer.
    Use an official signed build: local control requires valid Windows
    Authenticode chain trust and matching client binaries. Public CI artifacts
    and local builds are unsigned, not production IPC-ready. For self-signed
