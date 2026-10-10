@@ -8,9 +8,9 @@
 
 </details>
 
-Gardez compilations et agents de programmation actifs après une perte du client/VPN ; retrouvez le même shell interactif, ses variables et son répertoire ; consultez la sortie conservée : rejeu borné, pas un journal complet. Windows des deux côtés ; hôte en marche et utilisateur connecté. Aucune récupération après redémarrage ou fermeture de session Windows de l’hôte.
+Gardez les compilations et les agents de programmation actifs après une interruption de la connexion du client ou du VPN ; retrouvez le même shell interactif, ses variables et son répertoire ; consultez la sortie conservée : rejeu borné, pas un journal complet. Windows des deux côtés ; hôte en marche et utilisateur connecté. Aucune récupération après redémarrage ou fermeture de session Windows de l’hôte.
 
-[Configurer](../../README.md#get-connected) · [Vérifier téléchargement et confiance](../../DEVELOPMENT-INSTALL.md) · [Vérifier le même shell](../../README.md#prove-that-you-returned-to-the-same-shell)
+[Configurer](#native-setup) · [Vérifier téléchargement et confiance](../../DEVELOPMENT-INSTALL.md) · [Vérifier le même shell](../../README.md#prove-that-you-returned-to-the-same-shell) · [Référence technique (anglais)](../../README.md#get-connected)
 
 <img src="../../.github/arterm-before-after.png" width="700" alt="Avant et après : après fermeture du client, perte du VPN ou redémarrage du portable, retrouvez le même shell distant, ses variables et le travail ; l’hôte reste en marche avec l’utilisateur connecté.">
 
@@ -22,18 +22,13 @@ Gardez compilations et agents de programmation actifs après une perte du client
 
 Pour les tâches non interactives courantes, votre canal de commandes à distance déjà approuvé peut suffire. Choisissez arTerm pour retrouver **le même shell Windows interactif et son environnement, exécutés sur l’hôte**, après fermeture du client, perte du VPN ou redémarrage du portable, en respectant ses conditions de connexion et ses contrôles locaux documentés. Les deux machines doivent être sous Windows et l’hôte doit rester en marche avec une session ouverte ; ce n’est pas une restauration après redémarrage de l’hôte.
 
+<a id="native-setup"></a>
 
-Perdez la connexion, pas votre travail. Laissez compilations, commandes de longue durée et agents de programmation sur le poste Windows distant. Fermez le client, perdez le VPN ou redémarrez le portable, puis retrouvez le même shell sans repartir de zéro.
-
-L’hôte distant garde le shell en cours d’exécution ; votre portable ne fait que s’y connecter.
+## Prérequis et confiance
 
 Convient si les deux postes utilisent Windows, les tunnels le même compte GitHub et les connexions sortantes sont autorisées. L’hôte doit rester en marche avec l’utilisateur connecté. Aucun processus n’est restauré après redémarrage, fermeture de session, crash ou arrêt de l’hôte, ni exit du shell. Les téléchargements actuels portent une signature de développement, pas une signature de production reconnue publiquement.
 
 [Vérifiez le téléchargement et examinez la décision de confiance avant installation](../../DEVELOPMENT-INSTALL.md). Ne contournez pas les avertissements système ou les politiques de votre organisation.
-
-[Télécharger x64 / ARM64](https://github.com/yeelam/arterm/releases/latest) · [Configurer](../../README.md#get-connected) → [Vérifier la reconnexion au même shell](../../README.md#prove-that-you-returned-to-the-same-shell)
-
-## Prérequis et confiance
 
 Client et hôte doivent utiliser Windows. L’hôte doit rester en marche avec l’utilisateur connecté. Le client utilise Microsoft devtunnel CLI ; l’hôte, une CLI native compatible avec les tunnels VS Code, telle que code-tunnel.exe. L’éditeur complet est facultatif. Les deux tunnels doivent utiliser le même compte GitHub ; l’authentification de gh est distincte. Les connexions sortantes doivent être autorisées. Le téléchargement des dépendances nécessite votre accord, et la configuration de l’hôte demande l’acceptation de la licence VS Code server.
 
@@ -41,15 +36,13 @@ Choisissez x64 ou ARM64 dans les [téléchargements Windows](https://github.com/
 
 **Avant d’ajouter la confiance ou d’installer :** suivez la [comparaison du ZIP](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) avec Get-FileHash et la somme d’archive publiée dans la version. L’empreinte CER ne vérifie ni le ZIP ni les exécutables. Arrêtez-vous si la somme publique manque ou diffère ; une correspondance ne garantit pas la sécurité et n’autorise pas la confiance.
 
-
-
 L’hôte exige aussi Windows Script Host/VBScript autorisé par la politique. Vérifiez avant confiance ou installation ; si bloqué, arrêtez sans contourner la politique.
 
 ## Configuration
 
 **Gardez les données de session privées :** sortie conservée, historique normal du shell et fichiers de récupération peuvent contenir commandes, chemins, code ou secrets. Protégez-les sur les deux machines et masquez les informations sensibles avant de partager journaux, captures ou dossiers de support. La protection DPAPI des identifiants ne signifie pas que tous les fichiers sont chiffrés ou sans contenu. Les exclusions de contenu des diagnostics de disponibilité sont plus limitées.
 
-Avant toute exécution, utilisez Get-AuthenticodeSignature selon l’[inspection en lecture seule](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them) des installateurs et clients extraits. Somme ZIP, identité CER et confiance Windows sont distinctes. Exigez le signataire de développement fixé et le statut Valid ; un signataire inconnu ou un statut non Valid impose l’arrêt, pas le contournement des avertissements. La confiance exige séparément un accord explicite et l’autorisation de la politique, puis une nouvelle inspection. Le contrôle reste limité au même utilisateur local, à la même session, au même contexte d’intégrité/élévation et au client signé identique ; pas de partage arbitraire d’agents entre machines.
+Avant toute exécution, utilisez Get-AuthenticodeSignature selon l’[inspection en lecture seule](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them) des installateurs et clients extraits. Somme ZIP, identité CER et confiance Windows sont distinctes. Exigez le signataire de développement identifié par l’empreinte SHA-256 du certificat indiquée dans le guide et le statut Valid ; un signataire inconnu ou un statut non Valid impose l’arrêt, pas le contournement des avertissements. La confiance exige séparément un accord explicite et l’autorisation de la politique, puis une nouvelle inspection. Le contrôle reste limité au même utilisateur local, à la même session, au même contexte d’intégrité/élévation et au client signé identique ; pas de partage arbitraire d’agents entre machines.
 
 Sur l’hôte, exécutez arTerm-Host-Setup.exe puis ouvrez un nouveau PowerShell :
 
@@ -93,8 +86,6 @@ Vous devez retrouver le même PID, kept-on-host, le même répertoire et True. R
 
 Les processus ne sont pas restaurés après redémarrage, fermeture de session, crash ou arrêt de l’hôte, ni après sortie du shell. L’hôte démarre à la connexion de l’utilisateur, sans configurer de connexion automatique ni de service sans utilisateur connecté. La relecture de sortie est limitée. Toute la branche de développement n’est pas qualifiée pour publication : la revue indépendante des archives de transfert et les critères de saisie directe restent incomplets. Les TUI arbitraires ne sont pas certifiées ; le déblocage automatique des fichiers ne garantit pas leur sécurité.
 
-
-
 La relecture est limitée ; conservez un journal de compilation distant pour toute la sortie. arterm-host stop peut redémarrer automatiquement ; arterm-host stop --disable maintient l’arrêt.
 
 ## Récupération et retour arrière
@@ -104,8 +95,6 @@ En cas d’échec, lancez arterm doctor my-devbox et vérifiez comptes et résea
 ## Contrôle local avancé
 
 Les send/read gérés exigent une nouvelle session PowerShell/pwsh prise en charge et l’identité locale approuvée correspondant à la connexion. Les shells existants ne sont pas adaptés. La publication ne clôt pas les critères de saisie directe/revue des archives transférées de la branche ; les versions inconnues restent non vérifiées.
-
-
 
 Les utilisateurs de Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi et Qwen CLI peuvent lire ces instructions et lancer des commandes Windows ordinaires si leurs outils le permettent. Ce n’est pas une certification d’intégration native de ces six clients. Un autre terminal de contrôle local exige le même utilisateur, la même session et le même contexte d’intégrité/élévation, avec un client signé approuvé et identique octet par octet. Gardez le processus de connexion actif.
 

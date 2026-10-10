@@ -22,6 +22,8 @@ survives client-side loss, not host reboot or shutdown.*
 - **Return to your work, not a blank shell.** Reattach to the same interactive shell process, with its variables and working directory intact.
 - **Catch up on what happened while away.** Reconnection replays retained terminal output; retention is bounded, so gaps are possible and this is not a complete log.
 
+[Same-owner command control: new supported PowerShell/pwsh, matching trusted local attachment](#agent-neutral-command-access)
+
 For ordinary noninteractive jobs, your existing approved remote-command channel may already be sufficient. Choose arTerm when you need to reattach to the **same host-owned interactive Windows shell and environment** after client closure, VPN loss or notebook restart, using its documented connectivity and local controls. Both ends must be Windows, and the host must remain running and logged in; this is not host-reboot recovery.
 
 **Fits:** Windows on both ends, the same GitHub account for both tunnels,
