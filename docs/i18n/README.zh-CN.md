@@ -8,6 +8,10 @@
 
 从[Windows 下载页](https://github.com/yeelam/arterm/releases/latest)选择 x64 或 ARM64。已核实该链接转到 v0.7.1。包是开发证书签名版本，不是公共受信任的生产签名。先按[安装指南](../../DEVELOPMENT-INSTALL.md)核验校验和与公开证书指纹；仅在明确同意且组织政策允许时添加当前用户信任。不要绕过 Authenticode、SmartScreen 或应用控制。
 
+**信任或安装前：**按[下载 ZIP 校验步骤](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)用 Get-FileHash 与公开发布的归档校验和比较。CER 指纹不能验证 ZIP 或程序。公开校验和缺失或不匹配时停止；匹配不等于安全或信任批准。
+
+**保护会话隐私：**保留的终端输出、正常 shell 历史和恢复文件可能包含命令、路径、代码或秘密。两端都应妥善保护，分享日志、截图或支持材料前先脱敏。凭据由 DPAPI 保护，不表示所有文件都加密或不含内容；就绪诊断的有限内容排除不适用于全部会话数据。
+
 远程运行 arTerm-Host-Setup.exe，打开新的 PowerShell：
 
 ```powershell

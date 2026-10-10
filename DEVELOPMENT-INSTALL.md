@@ -10,6 +10,43 @@ It must never contain a PFX or private key. Public CI artifacts and ordinary
 local builds are unsigned; they are not substitutes for signed production IPC
 peers.
 
+## Verify the downloaded release payload before trust or installation
+
+For **v0.7.1 only**, the public release's
+[SHA256SUMS](https://github.com/yeelam-gordon/arterm/releases/download/v0.7.1/SHA256SUMS)
+lists hashes of the two downloaded ZIP archives. It is distinct from any
+`SHA256SUMS` inside an extracted package. Download your architecture's ZIP from
+[Releases](https://github.com/yeelam/arterm/releases/latest), and compare its bytes
+before extracting, importing a certificate, or running an installer. If latest
+is no longer v0.7.1, use that release's own published manifest instead; never
+apply these hashes to another version.
+
+In PowerShell opened in the directory containing your downloaded ZIP:
+
+```powershell
+# Choose the filename you actually downloaded; change x64 to arm64 if needed.
+$archive = 'arTerm-0.7.1-windows-x64-development-signed.zip'
+$published = @{
+    'arTerm-0.7.1-windows-x64-development-signed.zip' = '60387ba0a018d844d44af549edd54bf9eb8385ab3e2d11fb5afa528fb4a330d5'
+    'arTerm-0.7.1-windows-arm64-development-signed.zip' = '4cf7e9e353234791398f3b4a6201469be437087122cbad241b6845a1108693c2'
+}
+if (-not $published.ContainsKey($archive)) { throw 'No published hash for this filename.' }
+$actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256 -ErrorAction Stop).Hash
+if ($actual -ne $published[$archive]) { throw 'Archive checksum mismatch. Stop; do not install or add trust.' }
+'Archive checksum matches the published v0.7.1 manifest.'
+```
+
+Expected: the match message. Missing files or any mismatch must stop the flow.
+Compare the expected values above with the linked public release manifest, not
+an untrusted file supplied alongside a download. If a release has no accessible
+published payload checksum, this verification cannot be completed: stop rather
+than substituting a CER hash or a private-build hash. Matching the published
+checksum establishes byte agreement, not safety or publisher trust. After a
+match, extract the archive and perform the separate certificate check below;
+**the CER hash alone does not verify the ZIP or executable payloads**.
+Authenticode checks, explicit policy-permitted trust, application controls and
+license/download consent all remain required.
+
 ## Certificate identity
 
 - Subject: `CN=DevBoxRemote Development`

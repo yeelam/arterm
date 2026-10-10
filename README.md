@@ -182,6 +182,19 @@ and only when their command matches the owned installed executable.
 
 ## Get connected
 
+**Before trust or installation:** follow the concrete
+[downloaded ZIP checksum comparison](DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)
+against the public release manifest. Verifying only the CER fingerprint does
+not verify the archive or executable payloads. Stop if the published payload
+checksum is unavailable or mismatched; a match is not a safety or trust approval.
+
+**Keep session data private.** Retained terminal output, normal shell history,
+and recovery files may expose commands, paths, code or secrets. Protect them on
+both machines; redact sensitive content before sharing logs, screenshots or
+support bundles. DPAPI protection of credentials does not mean every retained
+artifact is encrypted or content-free. The narrower readiness-diagnostic
+content exclusions do not apply to all session data.
+
 1. Download the installers from [Releases](https://github.com/yeelam/arterm/releases/latest).
    Use an official signed build: local control requires valid Windows
    Authenticode chain trust and matching client binaries. Public CI artifacts

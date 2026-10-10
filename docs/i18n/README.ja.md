@@ -8,6 +8,10 @@
 
 [Windows ダウンロード](https://github.com/yeelam/arterm/releases/latest)で x64 または ARM64 を選びます。確認済みリンクは v0.7.1 に転送されます。公開の本番用信頼証明書ではなく開発用署名です。[インストールガイド](../../DEVELOPMENT-INSTALL.md)でチェックサムと公開証明書の指紋を確認し、明示的同意と組織の許可がある場合のみ現在のユーザーに信頼を追加します。Authenticode、SmartScreen、アプリ制御を回避しないでください。
 
+**信頼追加・インストールの前に：**[ZIP の検証手順](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)で Get-FileHash を使い、公開リリースのアーカイブチェックサムと比較します。CER の指紋だけでは ZIP や実行ファイルを検証できません。公開チェックサムがない場合や不一致なら停止します。一致は安全性や信頼承認ではありません。
+
+**セッションデータは非公開に：**保持された端末出力、通常のシェル履歴、復旧ファイルにはコマンド、パス、コード、秘密情報が含まれる可能性があります。両側で保護し、ログ、画像、サポート資料を共有する前に機密情報を除去してください。資格情報の DPAPI 保護は全ファイルの暗号化や内容の不在を意味しません。準備状態の診断に限った内容除外は全セッションデータには適用されません。
+
 ホストで arTerm-Host-Setup.exe を実行し、新しい PowerShell を開きます：
 
 ```powershell

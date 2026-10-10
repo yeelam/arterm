@@ -8,6 +8,10 @@ Ambos equipos necesitan Windows. El host debe seguir encendido con el usuario co
 
 Elige x64 o ARM64 en [Descargas para Windows](https://github.com/yeelam/arterm/releases/latest). La ruta verificada redirige a v0.7.1. Los paquetes llevan firma de desarrollo, no un certificado de producción de confianza pública. Sigue la [guía de instalación](../../DEVELOPMENT-INSTALL.md) para comprobar sumas y huella del certificado público. Solo añade confianza para el usuario actual con aprobación explícita y permiso de tu organización. No eludas Authenticode, SmartScreen ni controles de aplicaciones.
 
+**Antes de añadir confianza o instalar:** sigue la [comparación del ZIP](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation) con Get-FileHash y la suma del archivo publicada en la versión. La huella CER no verifica el ZIP ni los ejecutables. Detente si falta la suma pública o no coincide; una coincidencia no garantiza seguridad ni aprueba confianza.
+
+**Mantén privados los datos de sesión:** la salida retenida, el historial normal del shell y los archivos de recuperación pueden contener comandos, rutas, código o secretos. Protégelos en ambos equipos y elimina información sensible antes de compartir registros, capturas o paquetes de soporte. DPAPI protege credenciales, no garantiza que todos los archivos estén cifrados o sin contenido. Las exclusiones de contenido de los diagnósticos de disponibilidad son más limitadas.
+
 En el host ejecuta arTerm-Host-Setup.exe y abre un nuevo PowerShell:
 
 ```powershell
