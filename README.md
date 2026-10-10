@@ -7,18 +7,27 @@
 Keep builds, coding agents, and long-running commands on a remote Windows
 machine, not tied to your local terminal. Close the client, lose your VPN, or
 restart your notebook. Come back to the **same remote shell, variables, and
-work in progress** while the host stays running.
+work in progress** while the host stays running and logged in.
+**The remote host owns the running shell; your notebook only attaches to it.**
+
+**Fits:** Windows on both ends, the same GitHub account for both tunnels,
+and permitted outbound connectivity. The current downloads are
+**development-signed, not publicly trusted production builds**;
+[verify downloads and review the trust decision](DEVELOPMENT-INSTALL.md)
+before installation. Never bypass OS warnings or your organization's policy.
+**Does not survive:** host reboot, logoff, crash/shutdown, or remote shell `exit`.
 
 **[Download for Windows: x64 and ARM64](https://github.com/yeelam/arterm/releases/latest)**
-| [Get connected](#get-connected)
+| [Set up](#get-connected) → [Prove same-shell reconnection](#prove-that-you-returned-to-the-same-shell)
 | [Full quick start](QUICKSTART.md)
 
 **Languages:** [English](README.md) | [简体中文](docs/i18n/README.zh-CN.md) | [繁體中文](docs/i18n/README.zh-TW.md) | [日本語](docs/i18n/README.ja.md) | [한국어](docs/i18n/README.ko.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md) | [Italiano](docs/i18n/README.it.md) | [Русский](docs/i18n/README.ru.md) | [Türkçe](docs/i18n/README.tr.md) | [Tiếng Việt](docs/i18n/README.vi.md) | [Bahasa Indonesia](docs/i18n/README.id.md) | [हिन्दी](docs/i18n/README.hi.md) | [العربية](docs/i18n/README.ar.md)
 
-[![Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue.](.github/arterm-before-after.png)](https://github.com/yeelam/arterm/releases/latest)
+<a href="https://github.com/yeelam/arterm/releases/latest"><img src=".github/arterm-before-after.png" width="700" alt="Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue."></a>
 
-*Workflow illustration, not a session screenshot. The remote Windows host must
-stay running and logged in; arTerm survives client-side loss, not host shutdown.*
+*Workflow illustration with English labels, not a live-session screenshot or
+test proof. The remote Windows host must stay running and logged in; arTerm
+survives client-side loss, not host reboot or shutdown.*
 
 ## What you get
 
@@ -28,14 +37,21 @@ stay running and logged in; arTerm survives client-side loss, not host shutdown.
   to the existing process and environment.
 - **Let people and agents share a working session.** Send a command, read output,
   or interrupt work from another local CLI without creating a second shell.
-  Controllers must share the attachment's local Windows user, logon/session,
-  integrity/elevation context and byte-identical trusted signed client. This is
-  local control of one owned attachment, not arbitrary cross-machine agent sharing.
+  Requires the same trusted local client/context—not arbitrary cross-machine
+  sharing. [Read the controller requirements](#agent-neutral-command-access)
+  before sending commands.
+
+<details>
+<summary>Network reach and file-transfer capabilities</summary>
+
 - **Reach your Windows machines across networks.** Connect to configured Dev
   Boxes, VMs, and Windows Sandbox hosts through GitHub-authenticated tunnels,
   without needing the same LAN or direct inbound host access.
 - **Move results without terminal paste.** Send files or whole folders through
   the attached session with integrity checks and unique receiving destinations.
+
+
+</details>
 
 Client and host need permitted outbound connectivity. See the
 [quick start](QUICKSTART.md) for setup and
@@ -208,17 +224,11 @@ content exclusions do not apply to all session data.
    The published v0.7.1 assets are
    `arTerm-0.7.1-windows-x64-development-signed.zip` and
    `arTerm-0.7.1-windows-arm64-development-signed.zip`.
-   First compare the downloaded ZIP with that release's published checksum,
-   then extract it and inspect the included installer/client signatures using
-   [the installation verification guide](DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)
-   before adding trust or running an installer.
-   Use an official signed build: local control requires valid Windows
-   Authenticode chain trust and matching client binaries. Public CI artifacts
-   and local builds are unsigned, not production IPC-ready. For self-signed
-   development builds, follow
-   [DEVELOPMENT-INSTALL.md](DEVELOPMENT-INSTALL.md) first. Their certificate is
-   not publicly trusted; any local trust must be explicitly approved and
-   permitted by your organization's policy.
+   Complete the [payload and signature verification](DEVELOPMENT-INSTALL.md)
+   described above before trust or installation. Local control requires valid
+   Windows Authenticode trust and matching signed client binaries; unsigned
+   public CI/local builds cannot replace them. Any development-certificate trust
+   needs separate explicit approval permitted by your organization's policy.
 
 2. **On the remote host**, run `arTerm-Host-Setup.exe`. Open a fresh PowerShell,
    then configure a unique host name:
@@ -254,28 +264,10 @@ authoritatively retired. Reuse creates a fresh GUID and clean session data;
 the old GUID never addresses the replacement. Unknown or unavailable sessions
 are not silently replaced.
 
-On detach, remote exit, or connection failure, the interactive client restores
-the local console flags, code pages, and inherited keyboard, focus, paste, and
-mouse input modes. The client's buffered attachment input is discarded on exit;
-unrelated native input records are preserved. Scripted `--stdio` clients
-do not change these console modes. Mode discovery waits at most 100ms. If the
-console does not report a mode, remote changes to that input mode are suppressed
-instead of guessing the parent shell's state; other output remains available.
-Outstanding local mode replies remain tracked across fragmented input and
-connection failure. Exit allows a further bounded 200ms for outstanding replies,
-preserves unrelated startup typeahead, and reports queries still unanswered.
-
-This does not reset the outer ConPTY input parser. An input stream ending in an
-unterminated CSI can consume the next typed character even without arTerm;
-restoring console modes and clearing queued input records cannot repair that
-separate parser state.
-
 Without a reference, `arterm connect my-devbox` **only prints** a complete
 reusable command and exits; it does not start a remote shell.
 
-## Control an attached session
-
-### Prove that you returned to the same shell
+## Prove that you returned to the same shell
 
 After the setup and registration above, use a new reference for this small
 PowerShell check on the **local client**:
@@ -319,6 +311,29 @@ running host just because the client disconnected. See
 [safe upgrades and stopping](QUICKSTART.md#upgrade-without-registering-again),
 and [trust removal](DEVELOPMENT-INSTALL.md).
 
+<details>
+<summary>Console restoration and parser limitations</summary>
+
+On detach, remote exit, or connection failure, the interactive client restores
+the local console flags, code pages, and inherited keyboard, focus, paste, and
+mouse input modes. The client's buffered attachment input is discarded on exit;
+unrelated native input records are preserved. Scripted `--stdio` clients
+do not change these console modes. Mode discovery waits at most 100ms. If the
+console does not report a mode, remote changes to that input mode are suppressed
+instead of guessing the parent shell's state; other output remains available.
+Outstanding local mode replies remain tracked across fragmented input and
+connection failure. Exit allows a further bounded 200ms for outstanding replies,
+preserves unrelated startup typeahead, and reports queries still unanswered.
+
+This does not reset the outer ConPTY input parser. An input stream ending in an
+unterminated CSI can consume the next typed character even without arTerm;
+restoring console modes and clearing queued input records cannot repair that
+separate parser state.
+
+</details>
+
+## Control an attached session
+
 ### Agent-neutral command access
 
 Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi, and Qwen CLI users can inspect
@@ -359,6 +374,9 @@ antivirus, or certificate trust. Review files before opening or running them;
 a signature or matching hash does not prove benign content. Byte/ZIP transport
 does not preserve source ADS, URLs or ACLs. See [transfer details](QUICKSTART.md#automation) for publication,
 receipts, limits, and unknown-outcome handling.
+
+<details>
+<summary>Controller lifecycle, readiness, inventory, and diagnostic details</summary>
 
 `connect` is a normal running native process. Your caller, Copilot, or OS owns
 backgrounding; arTerm has no `--background`, `start`, or `resume` command.
@@ -427,6 +445,8 @@ terminal output, key codes, hashes of commands, credentials, or tokens**.
 text remains in the prompt. See the diagnostic collection steps in QUICKSTART.
 Pure modifier-key presses carrying no character are now nonediting, like key
 releases and focus reports; actual edits remain guarded.
+
+</details>
 
 For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.

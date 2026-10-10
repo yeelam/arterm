@@ -4,9 +4,27 @@
 
 연결이 끊겨도 작업을 처음부터 다시 하지 마세요. 빌드, 오래 걸리는 명령, 코딩 에이전트를 원격 Windows에서 실행하고 클라이언트 종료, VPN 단절 또는 노트북 재시작 후 같은 셸과 변수, 작업 폴더로 돌아옵니다.
 
+실행 중인 셸은 원격 호스트가 소유합니다. 노트북은 그 셸에 연결할 뿐입니다.
+
+조건: 양쪽 Windows, 터널에 같은 GitHub 계정, 허용된 아웃바운드 연결. 호스트는 실행 중이고 사용자가 로그인한 상태여야 합니다. 호스트 재부팅, 로그아웃, 충돌, 종료 또는 셸 exit 후에는 복원하지 않습니다. 현재 다운로드는 개발 서명이며 공개적으로 신뢰되는 운영 빌드가 아닙니다.
+
+[설치 전에 다운로드와 신뢰 결정을 확인](../../DEVELOPMENT-INSTALL.md). OS 경고나 조직 정책을 우회하지 마세요.
+
+[x64 / ARM64 다운로드](https://github.com/yeelam/arterm/releases/latest) · [설정](../../README.md#get-connected) → [같은 셸 재연결 확인](../../README.md#prove-that-you-returned-to-the-same-shell)
+
+<a href="https://github.com/yeelam/arterm/releases/latest"><img src="../../.github/arterm-before-after.png" width="700" alt="전후 비교: 클라이언트 종료, VPN 단절 또는 노트북 재시작 후 같은 원격 셸과 변수, 작업으로 돌아갑니다. 호스트는 실행 중이며 사용자가 로그인한 상태여야 합니다."></a>
+
+*이 그림은 작업 흐름 설명용이며 실제 세션 캡처나 테스트 증거가 아닙니다. 그림의 표시는 영어입니다. 핵심은 클라이언트 연결이 끊겨도 계속 실행되고 사용자가 로그인한 호스트의 같은 셸, 변수, 작업으로 돌아온다는 것입니다. 호스트 재부팅 후 작업 복원은 지원하지 않습니다.*
+
+## 요구 사항과 신뢰
+
 클라이언트와 호스트 모두 Windows가 필요합니다. 호스트는 실행 중이고 사용자가 로그인한 상태여야 합니다. 클라이언트는 Microsoft devtunnel CLI, 호스트는 code-tunnel.exe 같은 호환 네이티브 VS Code tunnel CLI를 사용합니다. 전체 편집기는 선택 사항입니다. 두 터널에 같은 GitHub 계정으로 로그인해야 하며 gh 인증과는 별개입니다. 아웃바운드 연결이 허용되어야 하고 종속 프로그램 다운로드에 동의하며 VS Code server 라이선스를 수락해야 합니다.
 
 [Windows 다운로드](https://github.com/yeelam/arterm/releases/latest)에서 x64 또는 ARM64를 선택하세요. 공개된 v0.7.1은 개발 인증서로 서명된 패키지이며 공개적으로 신뢰되는 운영 인증서가 아닙니다. 먼저 [ZIP 체크섬 비교](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation)에서 Get-FileHash로 해당 릴리스의 공개 체크섬과 비교합니다. ZIP 해시, CER 인증서 식별, 실행 파일 신뢰 검사는 서로 다릅니다. 실행 전 [읽기 전용 서명 검사](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them)의 Get-AuthenticodeSignature로 압축 해제한 설치 프로그램과 클라이언트를 확인하세요. 고정된 개발 서명자와 일치하고 상태가 Valid여야 합니다. 체크섬 누락·불일치, 알 수 없는 서명자 또는 Valid가 아닌 상태면 중지하세요. 인증서 신뢰는 사용자 명시적 승인과 조직 정책 허용이 별도로 필요하며 이후 다시 검사합니다. OS 경고, Authenticode, SmartScreen, 앱 제어를 우회하지 마세요.
+
+## 설정
+
+보존 출력, 일반 셸 기록, 복구 파일에는 명령, 경로, 코드 또는 비밀이 있을 수 있습니다. 양쪽에서 보호하고 로그, 캡처, 지원 자료를 공유하기 전 민감한 정보를 가리세요. 자격 증명의 DPAPI 보호가 모든 파일 암호화나 내용 부재를 뜻하지는 않습니다. 준비 상태 진단의 내용 제외는 더 좁은 범위입니다.
 
 검사에 통과하고 정책이 허용한 뒤 원격에서 arTerm-Host-Setup.exe를 실행하고 새 PowerShell을 엽니다:
 
@@ -19,6 +37,8 @@ arterm-host setup --name my-devbox
 ```powershell
 arterm connect my-devbox MyProof --shell powershell
 ```
+
+## 같은 셸 확인
 
 연결된 원격 PowerShell에서 실행하고 PID와 폴더를 기록합니다:
 
@@ -46,12 +66,16 @@ $PID; $artermProof; (Get-Location).Path
 
 
 
+## 제한
+
 호스트 재부팅, 로그아웃, 충돌, 종료 또는 셸 종료 후 프로세스를 되살리지 않습니다. 사용자 로그인 시 시작하며 자동 로그인이나 사용자 없는 서비스를 구성하지 않습니다. 출력 재생에는 보존 한도가 있습니다. 개발 브랜치 전체가 릴리스 승인된 것은 아닙니다. 파일 전송 아카이브의 독립 검토와 직접 입력 검증 조건은 미완료이며 임의의 TUI는 인증되지 않았습니다. 파일 자동 차단 해제는 안전 보장이 아닙니다.
 
-보존 출력, 일반 셸 기록, 복구 파일에는 명령, 경로, 코드 또는 비밀이 있을 수 있습니다. 양쪽에서 보호하고 로그, 캡처, 지원 자료를 공유하기 전 민감한 정보를 가리세요. 자격 증명의 DPAPI 보호가 모든 파일 암호화나 내용 부재를 뜻하지는 않습니다. 준비 상태 진단의 내용 제외는 더 좁은 범위입니다.
-
-Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi, Qwen CLI 사용자는 도구가 허용하는 일반 Windows 명령으로 사용할 수 있지만 여섯 제품의 네이티브 통합 인증은 아닙니다. 다른 로컬 제어 터미널은 같은 사용자, 로그인 세션, 무결성·권한 상승 상태와 바이트 단위로 동일한 신뢰된 서명 클라이언트가 필요합니다. 연결 프로세스를 유지하세요. 임의의 다른 컴퓨터 에이전트 공유가 아닙니다.
+## 복구 및 되돌리기
 
 실패하면 arterm doctor my-devbox로 계정과 네트워크를 확인하고 필요 시 arterm --login으로 클라이언트 인증을 복구하세요. 복구 기록을 삭제하거나 실행 중인 호스트를 재설치하지 마세요. 업데이트는 기본적으로 활성 세션 중단을 거부합니다. 호스트의 arterm-host stop --disable은 정지 상태를 유지하며 arterm-host start로 다시 시작하지만 잃은 셸은 복원하지 않습니다. 제거 후 사용자 데이터는 남습니다. 인증서 신뢰 철회는 설치 가이드를 참조하세요.
+
+## 고급 로컬 제어
+
+Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi, Qwen CLI 사용자는 도구가 허용하는 일반 Windows 명령으로 사용할 수 있지만 여섯 제품의 네이티브 통합 인증은 아닙니다. 다른 로컬 제어 터미널은 같은 사용자, 로그인 세션, 무결성·권한 상승 상태와 바이트 단위로 동일한 신뢰된 서명 클라이언트가 필요합니다. 연결 프로세스를 유지하세요. 임의의 다른 컴퓨터 에이전트 공유가 아닙니다.
 
 [English README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [문제 해결](../../README.md#installation-and-troubleshooting-details) · [업데이트 및 중지](../../QUICKSTART.md#upgrade-without-registering-again) · [인증서 신뢰 철회](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)

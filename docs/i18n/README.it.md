@@ -4,9 +4,27 @@
 
 Perdi la connessione, non il lavoro. Lascia build, comandi di lunga durata e agenti di programmazione sul computer Windows remoto. Dopo la chiusura del client, la perdita della VPN o il riavvio del portatile, torna alla stessa shell, con le stesse variabili e cartella di lavoro.
 
+L’host remoto mantiene la shell in esecuzione; il portatile si limita a collegarsi ad essa.
+
+Adatto con Windows su entrambi i lati, stesso account GitHub per i tunnel e connessioni in uscita consentite. L’host deve restare acceso con l’utente connesso. Riavvio, logout, crash o spegnimento dell’host e exit della shell non consentono di ripristinare il processo. I download attuali sono firmati per sviluppo, non build di produzione riconosciute pubblicamente.
+
+[Verifica il download e valuta la fiducia prima di installare](../../DEVELOPMENT-INSTALL.md). Non aggirare avvisi del sistema o policy dell’organizzazione.
+
+[Scarica x64 / ARM64](https://github.com/yeelam/arterm/releases/latest) · [Configura](../../README.md#get-connected) → [Verifica il ritorno alla stessa shell](../../README.md#prove-that-you-returned-to-the-same-shell)
+
+<a href="https://github.com/yeelam/arterm/releases/latest"><img src="../../.github/arterm-before-after.png" width="700" alt="Prima e dopo: dopo chiusura del client, perdita della VPN o riavvio del portatile, torna alla stessa shell remota, variabili e lavoro; l’host resta acceso con l’utente connesso."></a>
+
+*Illustrazione del flusso, non schermata di una sessione reale né prova di test. Le etichette nell’immagine sono in inglese. Il punto è tornare alla stessa shell, variabili e lavoro dopo la disconnessione del client, mentre l’host resta acceso e l’utente connesso. Non conserva i processi dopo un riavvio dell’host.*
+
+## Requisiti e fiducia
+
 Client e host richiedono Windows. L’host deve restare acceso con l’utente connesso. Il client usa Microsoft devtunnel CLI; l’host una CLI nativa compatibile con i tunnel VS Code, come code-tunnel.exe. L’editor completo è facoltativo. Accedi ai due tunnel con lo stesso account GitHub: l’autenticazione di gh è separata. Servono connessioni in uscita consentite, consenso ai download delle dipendenze e accettazione della licenza VS Code server.
 
 Scegli x64 o ARM64 nei [download Windows](https://github.com/yeelam/arterm/releases/latest). La versione pubblicata v0.7.1 ha una firma di sviluppo, non un certificato di produzione riconosciuto pubblicamente. Prima confronta il ZIP con il manifesto pubblico della stessa versione usando Get-FileHash, come nella [verifica del pacchetto](../../DEVELOPMENT-INSTALL.md#verify-the-downloaded-release-payload-before-trust-or-installation). Hash ZIP, identità CER e fiducia della firma eseguibile sono distinti. Prima di eseguire, usa Get-AuthenticodeSignature seguendo il [controllo in sola lettura](../../DEVELOPMENT-INSTALL.md#inspect-extracted-executable-signatures-without-running-them) di installer e client estratti: firmatario di sviluppo fissato e stato Valid. Checksum assente o diverso, firmatario sconosciuto o stato non Valid impongono di fermarsi. La fiducia richiede separatamente approvazione esplicita dell’utente e permesso della policy, poi una nuova verifica. Non aggirare avvisi OS, Authenticode, SmartScreen o controlli applicativi.
+
+## Configurazione
+
+Output conservato, normale cronologia della shell e file di recupero possono contenere comandi, percorsi, codice o segreti. Proteggili su entrambe le macchine e oscura i dati sensibili prima di condividere log, immagini o materiali di supporto. DPAPI protegge le credenziali, non significa che ogni file sia cifrato o privo di contenuto. Le esclusioni dei diagnostici di disponibilità sono più limitate.
 
 Dopo le verifiche e con il permesso della policy, esegui arTerm-Host-Setup.exe sull’host remoto e apri un nuovo PowerShell:
 
@@ -19,6 +37,8 @@ Completa l’accesso al tunnel e conserva il comando di registrazione stampato d
 ```powershell
 arterm connect my-devbox MyProof --shell powershell
 ```
+
+## Verificare la stessa shell
 
 Nella PowerShell remota connessa, esegui e annota PID e cartella:
 
@@ -46,12 +66,16 @@ Il risultato atteso è lo stesso PID, kept-on-host, la stessa cartella e True. R
 
 
 
+## Limiti
+
 Non vengono ripristinati processi dopo riavvio, logout, crash o spegnimento dell’host, né dopo l’uscita dalla shell. L’host parte al login dell’utente; non configura login automatico o servizi senza utente connesso. La riproduzione dell’output è limitata. L’intero branch di sviluppo non è qualificato per il rilascio: restano aperti la revisione indipendente degli archivi di trasferimento e i criteri di input diretto. Le TUI arbitrarie non sono certificate; lo sblocco automatico dei file non ne garantisce la sicurezza.
 
-Output conservato, normale cronologia della shell e file di recupero possono contenere comandi, percorsi, codice o segreti. Proteggili su entrambe le macchine e oscura i dati sensibili prima di condividere log, immagini o materiali di supporto. DPAPI protegge le credenziali, non significa che ogni file sia cifrato o privo di contenuto. Le esclusioni dei diagnostici di disponibilità sono più limitate.
-
-Chi usa Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi o Qwen CLI può seguire i comandi Windows ordinari se gli strumenti lo consentono, senza certificazione di integrazione nativa dei sei client. Un altro terminale di controllo locale richiede stesso utente, sessione, integrità/elevazione e client firmato affidabile identico byte per byte. Mantieni attivo il processo di connessione. Non è condivisione arbitraria fra agenti su macchine diverse.
+## Recupero e annullamento
 
 Se fallisce, usa arterm doctor my-devbox per account e rete e, se necessario, arterm --login per recuperare l’accesso del client. Non cancellare dati di recupero né reinstallare un host attivo. Gli aggiornamenti rifiutano per impostazione predefinita di interrompere sessioni attive. Sull’host arterm-host stop --disable mantiene l’arresto; arterm-host start lo riavvia ma non recupera shell perse. La disinstallazione conserva i dati; la guida spiega come revocare la fiducia del certificato.
+
+## Controllo locale avanzato
+
+Chi usa Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi o Qwen CLI può seguire i comandi Windows ordinari se gli strumenti lo consentono, senza certificazione di integrazione nativa dei sei client. Un altro terminale di controllo locale richiede stesso utente, sessione, integrità/elevazione e client firmato affidabile identico byte per byte. Mantieni attivo il processo di connessione. Non è condivisione arbitraria fra agenti su macchine diverse.
 
 [English README](../../README.md) · [Quick start](../../QUICKSTART.md) · [Automation](../../QUICKSTART.md#automation) · [Risoluzione dei problemi](../../README.md#installation-and-troubleshooting-details) · [Aggiornamento e arresto](../../QUICKSTART.md#upgrade-without-registering-again) · [Revocare la fiducia nel certificato](../../DEVELOPMENT-INSTALL.md) · [Release evidence / gates](../../README.md#released-downloads-versus-development-gates) · [Signing](../../SIGNING.md)
