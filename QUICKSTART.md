@@ -7,9 +7,13 @@ For development-signed downloads, first follow
 [DEVELOPMENT-INSTALL.md](DEVELOPMENT-INSTALL.md) to verify the public certificate
 and explicitly trust it if your organization permits it. This is separate from
 signing into the tunnel service.
-Use the official signed client build on the local machine: both the connection
+Use the published development-signed client build on the local machine: both the connection
 owner and control commands require Windows chain trust and byte-identical client
 images. Unsigned public CI artifacts are for development, not production IPC.
+
+Already installed? [Upgrade safely without registering again](#upgrade-without-registering-again).
+
+Host setup requires policy-permitted Windows Script Host/VBScript. Check this before trust or installation; a blocked component is not permission for a policy bypass. Verify ZIP bytes and executable signatures using the linked guide before running either role installer.
 
 ## Remote machine: install and configure the host
 
@@ -55,95 +59,6 @@ arterm-host.exe setup --name my-devbox --code-path 'C:\Tools\code-tunnel.exe' --
 
 `--no-download` prevents dependency installation, not license or sign-in prompts.
 Do not change a running host's configuration while it has live sessions.
-
-### Upgrade without registering again
-
-Rerun `arTerm-Host-Setup.exe` to update the binaries. Configured, enabled hosts
-receive an immediate ensure-running check through their per-user Task Scheduler
-registrations without rerunning setup. An expired sign-in or a failed dependency/
-network readiness probe is reported but does not disable a previously enabled
-schedule. Later checks can recover after explicit `arterm-host login` or network
-recovery; no login or provider change is performed automatically. Intentionally
-disabled tasks remain disabled.
-Fresh installations register a disabled task until explicit named setup, sign-in,
-and license acceptance are complete. Task Scheduler policy/permission failures
-are errors; there is no silent Run-key or elevated service fallback.
-The hidden task checks at user logon and every **10 minutes** afterward. It exits
-after leaving an existing broker alone or starting an absent broker; it does not
-monitor continuously. `arterm-host stop` allows the next check to start it again;
-use `arterm-host stop --disable` for a persistent stop. Windows Script Host with
-VBScript is required for the hidden bootstrap and is checked before registration.
-The installer does not reset setup, tunnel identity, registered client boxes,
-protected credentials, named session references, or certificates. Uninstall also
-retains user data. Keep the same Windows user and `VSTERM_REMOTE_HOME` (default:
-`%LOCALAPPDATA%\VsTerm`); another user/root reads different state, not a migration.
-Do not remove that directory or register the box again just to upgrade.
-
-Repeated `arterm-host setup` retains the saved name and Code CLI path; `--name`
-is required only for first setup. Explicit name/path arguments reconfigure them.
-Setup does not reset the isolated tunnel sign-in.
-
-If the bridge reports `cannot connect to broker pipe ... (os error 2)`, the
-executable ran but its scoped broker pipe was absent. This does not establish
-that the registered executable path is wrong or that registration was lost.
-On the remote host, use `arterm-host start`, then `arterm-host status --json`
-and `arterm-host sessions --json`. These commands are available in 0.5.3.
-Run them as the same Windows user, in the same logon session, with the same
-`VSTERM_REMOTE_HOME` (or default data root) as the bridge. A stopped broker or
-a mismatch in any of these scopes can produce this error. Starting a broker
-does not recover sessions lost when the previous broker was killed; use a new
-session reference for new work. An arbitrary attachment loss alone does not
-prove whether the remote session is still alive.
-
-By default, an upgrade refuses to stop a host with live sessions; unchanged
-runtime setup leaves the running host alone. To deliberately end its sessions:
-
-```powershell
-.\arTerm-Host-Setup.exe --terminate-sessions
-# Or, to stop and restart as part of runtime setup:
-arterm-host setup --terminate-sessions
-```
-
-**These flags end ALL live sessions of the scoped host, including detached shells;
-their running state cannot be recovered.** Saved references and credentials are
-retained. In 0.7.1, a name can be reused after the client has confirmed or
-authoritatively retired its ended session, creating fresh data and a new GUID.
-Unknown records are not automatically replaced. Shutdown uses the existing
-control command scoped to the current Windows user, logon session and data root,
-not process-name or all-user kills. Owned tasks sharing this installation are
-paused before shutdown/write, including other data roots. Their brokers in this
-logon are stopped with the same session-refusal rules. Other logons are not killed;
-if they hold installed executables open, the upgrade fails rather than killing them.
-Setup waits at most 20 seconds for each stop command and installer upgrades wait
-up to 10 seconds for executable release. An unresponsive host cancels the ordinary
-operation. Timed-out controller processes are terminated and reaped, but a stop
-request already delivered to the broker may still finish: check status before retrying.
-This retains the existing scoped host control
-boundary; it does not add pipe image attestation.
-Both `--option` and `/option` installer spellings are accepted, including
-`/terminate-sessions`. The option also applies to host `--uninstall`.
-
-If the host will not respond, explicitly force-stop it while upgrading:
-
-```powershell
-.\arTerm-Host-Setup.exe --force-stop-host
-arterm-host start
-# For runtime reconfiguration rather than a binary upgrade:
-arterm-host setup --force-stop-host
-```
-
-**Force-stop bypasses the control pipe and destroys ALL sessions of the matching
-host processes.** It verifies exact installed executable paths and the current
-Windows user/logon, holds process handles, and also stops their verified child
-processes (including the owned tunnel). This scope includes other data roots
-using the same host installation. Same-named executables in other installations
-are not killed; it is not an all-user process-name kill. Run from a separate
-local terminal, not from a remote session owned by the host being stopped.
-Force-stop is never automatic and does not erase configuration or credentials.
-After upgrading a configured host, use `start`, not `setup` or re-registration.
-No certificate trust or
-authentication policy is changed. Live installer/sign-in E2E requires a dedicated
-machine; temporary-fixture tests do not exercise it.
 
 ## Notebook: install and configure the client
 
@@ -266,12 +181,112 @@ replacement. A GUID never creates a replacement for a retired session.
 Unknown, corrupt, unreachable, or unconfirmed records are not silently replaced.
 Do not manually delete recovery files to force reuse.
 
+**Verify the first result before upgrading:** follow the canonical
+[same-shell proof](README.md#prove-that-you-returned-to-the-same-shell) to capture
+and compare the remote PID, variable and working directory across detach/reconnect.
+Expected result: the same values and `True`, with the host still running and
+logged in—not recovery after host reboot or logoff.
+
+### Upgrade without registering again
+
+Rerun `arTerm-Host-Setup.exe` to update the binaries. Configured, enabled hosts
+receive an immediate ensure-running check through their per-user Task Scheduler
+registrations without rerunning setup. An expired sign-in or a failed dependency/
+network readiness probe is reported but does not disable a previously enabled
+schedule. Later checks can recover after explicit `arterm-host login` or network
+recovery; no login or provider change is performed automatically. Intentionally
+disabled tasks remain disabled.
+Fresh installations register a disabled task until explicit named setup, sign-in,
+and license acceptance are complete. Task Scheduler policy/permission failures
+are errors; there is no silent Run-key or elevated service fallback.
+The hidden task checks at user logon and every **10 minutes** afterward. It exits
+after leaving an existing broker alone or starting an absent broker; it does not
+monitor continuously. `arterm-host stop` allows the next check to start it again;
+use `arterm-host stop --disable` for a persistent stop. Windows Script Host with
+VBScript is required for the hidden bootstrap and is checked before registration.
+The installer does not reset setup, tunnel identity, registered client boxes,
+protected credentials, named session references, or certificates. Uninstall also
+retains user data. Keep the same Windows user and `VSTERM_REMOTE_HOME` (default:
+`%LOCALAPPDATA%\VsTerm`); another user/root reads different state, not a migration.
+Do not remove that directory or register the box again just to upgrade.
+
+Repeated `arterm-host setup` retains the saved name and Code CLI path; `--name`
+is required only for first setup. Explicit name/path arguments reconfigure them.
+Setup does not reset the isolated tunnel sign-in.
+
+If the bridge reports `cannot connect to broker pipe ... (os error 2)`, the
+executable ran but its scoped broker pipe was absent. This does not establish
+that the registered executable path is wrong or that registration was lost.
+On the remote host, use `arterm-host start`, then `arterm-host status --json`
+and `arterm-host sessions --json`. These commands are available in 0.5.3.
+Run them as the same Windows user, in the same logon session, with the same
+`VSTERM_REMOTE_HOME` (or default data root) as the bridge. A stopped broker or
+a mismatch in any of these scopes can produce this error. Starting a broker
+does not recover sessions lost when the previous broker was killed; use a new
+session reference for new work. An arbitrary attachment loss alone does not
+prove whether the remote session is still alive.
+
+By default, an upgrade refuses to stop a host with live sessions; unchanged
+runtime setup leaves the running host alone. To deliberately end its sessions:
+
+```powershell
+.\arTerm-Host-Setup.exe --terminate-sessions
+# Or, to stop and restart as part of runtime setup:
+arterm-host setup --terminate-sessions
+```
+
+**These flags end ALL live sessions of the scoped host, including detached shells;
+their running state cannot be recovered.** Saved references and credentials are
+retained. In 0.7.1, a name can be reused after the client has confirmed or
+authoritatively retired its ended session, creating fresh data and a new GUID.
+Unknown records are not automatically replaced. Shutdown uses the existing
+control command scoped to the current Windows user, logon session and data root,
+not process-name or all-user kills. Owned tasks sharing this installation are
+paused before shutdown/write, including other data roots. Their brokers in this
+logon are stopped with the same session-refusal rules. Other logons are not killed;
+if they hold installed executables open, the upgrade fails rather than killing them.
+Setup waits at most 20 seconds for each stop command and installer upgrades wait
+up to 10 seconds for executable release. An unresponsive host cancels the ordinary
+operation. Timed-out controller processes are terminated and reaped, but a stop
+request already delivered to the broker may still finish: check status before retrying.
+This retains the existing scoped host control
+boundary; it does not add pipe image attestation.
+Both `--option` and `/option` installer spellings are accepted, including
+`/terminate-sessions`. The option also applies to host `--uninstall`.
+
+If the host will not respond, explicitly force-stop it while upgrading:
+
+```powershell
+.\arTerm-Host-Setup.exe --force-stop-host
+arterm-host start
+# For runtime reconfiguration rather than a binary upgrade:
+arterm-host setup --force-stop-host
+```
+
+**Force-stop bypasses the control pipe and destroys ALL sessions of the matching
+host processes.** It verifies exact installed executable paths and the current
+Windows user/logon, holds process handles, and also stops their verified child
+processes (including the owned tunnel). This scope includes other data roots
+using the same host installation. Same-named executables in other installations
+are not killed; it is not an all-user process-name kill. Run from a separate
+local terminal, not from a remote session owned by the host being stopped.
+Force-stop is never automatic and does not erase configuration or credentials.
+After upgrading a configured host, use `start`, not `setup` or re-registration.
+No certificate trust or
+authentication policy is changed. Live installer/sign-in E2E requires a dedicated
+machine; temporary-fixture tests do not exercise it.
+
 ## Automation
 
 Keep `arterm.exe connect my-devbox MyWork` running in one terminal. It is a normal
 native process, not a launcher that exits after starting a client daemon. Your
 caller, Copilot, or OS handles backgrounding. There is no arTerm `--background`,
 `start`, or `resume` command.
+
+**Before managed control:** create a new supported PowerShell/pwsh session; keep its matching, trusted local attachment running. Review the [release/workflow scope](README.md#release-and-workflow-scope) and open development gates; do not assume an old or arbitrary shell gained integration.
+
+Ordinary interactive startup supports only `-NoLogo`/`-NoProfile` startup
+arguments; the detailed shell-support limits below still apply.
 
 From a second local terminal, in the same Windows logon/session and
 integrity/elevation context:
@@ -431,6 +446,15 @@ command queue.
 **Development release gate:** files and automatic directory ZIP/extraction are
 integrated together. Independent archive review was blocked by service screening
 and remains a release blocker; this worktree is **not release-qualified**.
+
+**Before transferring:** the receiver automatically removes `Zone.Identifier`
+from received regular files, including extracted folder files: on the **host for
+send**, on the **client for receive**. There is **no opt-out**. This is not a
+malware scan, security approval or certificate/trust decision; signing and
+matching hashes do not prove content benign. Review received content before
+opening or running it. The independent archive qualification gate above remains
+open; this worktree is not release-qualified. See the full automatic
+receiver-side unblocking explanation below.
 
 The shared interface uses the already-running local connect owner:
 

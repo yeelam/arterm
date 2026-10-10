@@ -1,14 +1,28 @@
-# arTerm
+# arTerm — Persistent remote Windows terminal
 
-**Persistent remote Windows terminal for builds and coding agents.**
+<a id="languages"></a>
+<details>
+<summary>Languages / 语言 / 言語 / اللغات (16)</summary>
 
-### Lose the connection. Not your work.
+[English](README.md) | [简体中文](docs/i18n/README.zh-CN.md) | [繁體中文](docs/i18n/README.zh-TW.md) | [日本語](docs/i18n/README.ja.md) | [한국어](docs/i18n/README.ko.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md) | [Italiano](docs/i18n/README.it.md) | [Русский](docs/i18n/README.ru.md) | [Türkçe](docs/i18n/README.tr.md) | [Tiếng Việt](docs/i18n/README.vi.md) | [Bahasa Indonesia](docs/i18n/README.id.md) | [हिन्दी](docs/i18n/README.hi.md) | [العربية](docs/i18n/README.ar.md)
 
-Keep builds, coding agents, and long-running commands on a remote Windows
-machine, not tied to your local terminal. Close the client, lose your VPN, or
-restart your notebook. Come back to the **same remote shell, variables, and
-work in progress** while the host stays running and logged in.
-**The remote host owns the running shell; your notebook only attaches to it.**
+</details>
+
+Keep builds and coding agents running through client/VPN loss; reattach to the same interactive shell, variables and working directory; catch up on retained output—bounded replay, not a complete log. Both ends Windows; host stays running and logged in. No host reboot/logoff recovery.
+
+[Set up](#get-connected) · [Verify downloads and trust](DEVELOPMENT-INSTALL.md) · [Prove same-shell continuity](#prove-that-you-returned-to-the-same-shell)
+
+<img src=".github/arterm-before-after.png" width="700" alt="Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue.">
+
+*Workflow illustration with English labels, not a live-session screenshot or
+test proof. The remote Windows host must stay running and logged in; arTerm
+survives client-side loss, not host reboot or shutdown.*
+
+- **Keep work running when the client disappears.** Builds, coding agents and long-running commands stay on the remote Windows host through client closure, VPN loss or notebook restart.
+- **Return to your work, not a blank shell.** Reattach to the same interactive shell process, with its variables and working directory intact.
+- **Catch up on what happened while away.** Reconnection replays retained terminal output; retention is bounded, so gaps are possible and this is not a complete log.
+
+For ordinary noninteractive jobs, your existing approved remote-command channel may already be sufficient. Choose arTerm when you need to reattach to the **same host-owned interactive Windows shell and environment** after client closure, VPN loss or notebook restart, using its documented connectivity and local controls. Both ends must be Windows, and the host must remain running and logged in; this is not host-reboot recovery.
 
 **Fits:** Windows on both ends, the same GitHub account for both tunnels,
 and permitted outbound connectivity. The current downloads are
@@ -17,36 +31,15 @@ and permitted outbound connectivity. The current downloads are
 before installation. Never bypass OS warnings or your organization's policy.
 **Does not survive:** host reboot, logoff, crash/shutdown, or remote shell `exit`.
 
-**[Download for Windows: x64 and ARM64](https://github.com/yeelam/arterm/releases/latest)**
-| [Set up](#get-connected) → [Prove same-shell reconnection](#prove-that-you-returned-to-the-same-shell)
-| [Full quick start](QUICKSTART.md)
-
-**Languages:** [English](README.md) | [简体中文](docs/i18n/README.zh-CN.md) | [繁體中文](docs/i18n/README.zh-TW.md) | [日本語](docs/i18n/README.ja.md) | [한국어](docs/i18n/README.ko.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md) | [Italiano](docs/i18n/README.it.md) | [Русский](docs/i18n/README.ru.md) | [Türkçe](docs/i18n/README.tr.md) | [Tiếng Việt](docs/i18n/README.vi.md) | [Bahasa Indonesia](docs/i18n/README.id.md) | [हिन्दी](docs/i18n/README.hi.md) | [العربية](docs/i18n/README.ar.md)
-
-<a href="https://github.com/yeelam/arterm/releases/latest"><img src=".github/arterm-before-after.png" width="700" alt="Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue."></a>
-
-*Workflow illustration with English labels, not a live-session screenshot or
-test proof. The remote Windows host must stay running and logged in; arTerm
-survives client-side loss, not host reboot or shutdown.*
-
-## What you get
-
-- **Stop babysitting your connection.** Your remote build or agent keeps running
-  when the local client closes or disconnects.
-- **Return to your work, not a blank shell.** Reuse the same command to reattach
-  to the existing process and environment.
-- **Let people and agents share a working session.** Send a command, read output,
-  or interrupt work from another local CLI without creating a second shell.
-  Requires the same trusted local client/context—not arbitrary cross-machine
-  sharing. [Read the controller requirements](#agent-neutral-command-access)
-  before sending commands.
-
 <details>
-<summary>Network reach and file-transfer capabilities</summary>
+<summary>File-transfer capabilities and network details</summary>
 
 - **Reach your Windows machines across networks.** Connect to configured Dev
-  Boxes, VMs, and Windows Sandbox hosts through GitHub-authenticated tunnels,
-  without needing the same LAN or direct inbound host access.
+  Boxes and VMs through GitHub-authenticated tunnels, without needing the same
+  LAN or direct inbound host access. A configured **Windows Sandbox** is only a
+  candidate: separately validate your provisioned guest, tunnel connectivity and
+  guest/shell lifetime. No inspected versioned Sandbox proof is provided here;
+  do not assume support or import desktop-minimization advice from other tools.
 - **Move results without terminal paste.** Send files or whole folders through
   the attached session with integrity checks and unique receiving destinations.
 
@@ -57,66 +50,7 @@ Client and host need permitted outbound connectivity. See the
 [quick start](QUICKSTART.md) for setup and
 [development-signed installation guide](DEVELOPMENT-INSTALL.md) for trust requirements.
 
-<details>
-<summary>Technical details: session lifetime, shell integration, and development gates</summary>
 
-**File-transfer development gate:** independent archive review remains blocked;
-this integration is not release-qualified by that review.
-
-**Limit:** the remote host must stay running and logged in. Remote Windows
-reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.
-arTerm does not checkpoint or resurrect processes after those events.
-Managed command execution requires a newly created, supported PowerShell/pwsh
-session; existing sessions are not retrofitted.
-The direct-input integration additionally requires PSReadLine's F24 handler,
-buffer inspection, insertion, and accept-line APIs. An authenticated, bounded
-in-memory pipe delivers command data only to the owned shell process; the handler
-checks the real edit buffer and inserts the original source for ordinary
-top-level execution. Base64 is transport data, not an execution wrapper.
-A read-only `PSConsoleHostReadLine` adapter arms execution tracking only after
-the original reader returns the accepted source. Prompt redraws during editing
-or acceptance cannot report command completion or managed readiness.
-Managed source is excluded from PSReadLine history with a one-line handler that
-restores the exact current user handler before the next manual line. Manual
-history, save settings, and user filters are not globally disabled or replaced.
-Keyboard input is permitted while a managed command is running (including
-`Read-Host` answers) and while its profile prompt is finishing, but remains guarded before dispatch; other automated
-commands wait. Partial edit buffers are never cleared or overwritten.
-Command completion is published even when a preserved partial line keeps
-automation not ready; waiting for completion does not require submitting that line.
-Unsupported integration and invalid syntax fail explicitly without a wrapper
-fallback. Replacing the prompt or PSReadLine integration can stop managed
-completion/readiness.
-Cancellation is checked at the existing client queue-to-delivery boundary.
-Once dispatched, caller exit does not cancel queued work; delivery uncertainty
-must be queried by command ID, never retried under a new identity. Admission is
-not proof of execution: a real-buffer rejection, invalid syntax, or a hook that
-does not accept within five seconds records `not_submitted` (`submitted:false`).
-The payload is revoked and cannot run later. Timeout disables managed readiness
-instead of leaving an indefinitely accepted command or guessing the edit buffer.
-Mailbox commitment is distinct from confirmed PSReadLine acceptance. If start
-confirmation is missing for five seconds after commitment, the outcome becomes
-`unknown`, never `not_submitted`: the command may have executed. Its identity
-cannot be replayed. Manual input remains usable; a subsequent real prompt can
-restore readiness without falsely completing the unknown record. Late start or
-completion evidence is accepted only for the same still-eligible command ID.
-
-**Advanced local-host opt-in:** `ARTERM_SHELL_HISTORY_PATH` may specify an absolute
-PowerShell history path for newly created supported interactive shells, including
-unmanaged ones. The host validates and encodes this path as data and applies it
-before the first ReadLine; it does not change history save style or user filters.
-Unset preserves the user's normal path. This is a host-process setting, not a
-remote-client option; `VSTERM_HISTORY_PATH` remains unsupported. Test fixtures set
-unique owned paths explicitly because changing `APPDATA` alone does not isolate
-PSReadLine history on either supported shell.
-
-**Direct-input development gate:** this branch is not release-qualified.
-Fresh host/client/controller tests cover two `Read-Host` answers and recovery
-through the existing interrupt request on Windows PowerShell and PowerShell 7.
-Earlier minimal F24-only interruption probes are archived outside shipping tests;
-arbitrary TUI behavior and all custom profile/read-line handlers are not certified.
-
-</details>
 
 ## What you need
 
@@ -129,6 +63,8 @@ arbitrary TUI behavior and all custom profile/read-line handlers are not certifi
 
 The full VS Code editor is optional when a compatible standalone native CLI is
 provided. Tunnel sign-in is separate from `gh` CLI authentication.
+
+Host setup also requires policy-permitted **Windows Script Host with VBScript** for its per-user bootstrap. If blocked, stop and use an approved route; do not enable it against policy or use a fallback.
 
 Installers detect dependencies and offer downloads only with consent; vendor
 binaries are not bundled. Host setup requires acceptance of the VS Code server
@@ -157,47 +93,7 @@ file-transfer archive review and direct-input gates above remain unresolved;
 arbitrary TUIs, custom read-line handlers, and mixed-architecture end-to-end
 operation are not certified by this documentation.
 
-<details>
-<summary>Host startup and ownership details</summary>
 
-The per-user Task Scheduler task uses InteractiveToken/LeastPrivilege and runs
-under the current process's Windows token SID, including Entra/AAD `S-1-12-1`
-identities. Both the principal and logon trigger use that SID; no local-account
-name is derived or substituted. Registration validates persisted principal,
-trigger, executable and data-root ownership. Scheduler-returned account names
-are translated to SIDs only for verification; rejection is reported without
-password, SYSTEM, service, batch-logon or local-account fallback. At user logon,
-and every **10 minutes** afterward (`PT10M`, no repetition duration), the task
-runs a short, idempotent `ensure-running --data-root ...` check. A responsive
-broker is left untouched; an absent broker starts in the background, and the
-check exits. A locked/unresponsive broker is reported, never killed or replaced.
-There is no continuous monitor or crash-retry backoff. Task Scheduler's
-`RestartOnFailure` is not used. InteractiveToken prevents checks without a
-logged-in user; no service or unattended account logon is configured.
-The check and broker append startup/PID, shutdown, and error diagnostics
-to `host\host.stdout.log` and `host\host.stderr.log` under its explicit data root;
-the tunnel retains its separate `code-tunnel.*.log` files. A small owned VBScript
-bootstrap runs under GUI `wscript.exe`, launches the check with window style 0,
-waits for that bounded check and propagates its exit status. The check creates
-its broker with `CREATE_NO_WINDOW`. Shared terminal windows are never hidden or
-killed; Task Scheduler's Hidden flag is not relied upon. Registration probes
-Windows Script Host/VBScript availability and fails explicitly if unavailable
-or policy-blocked, with no visible-console fallback.
-**Ordinary `arterm-host stop` permits automatic startup at the next 10-minute
-check (or next logon). Use `stop --disable` to keep it stopped until explicit
-`start`.** Recovery creates a new broker, not restored terminal sessions.
-Install/update/uninstall only manage ownership-verified tasks for this installation.
-Runtime setup holds that pause through shutdown, explicit authentication, configuration
-save and task registration. A failed setup restores the prior configuration before
-restoring task state; unsafe recovery leaves checks disabled and reports the error.
-The installed `arterm-host.exe` and `vsterm-host.exe` aliases resolve the same
-SID/data-root task only when both belong to the same ownership-marked host
-installation. The registered action remains exact; another directory or publisher
-is not treated as an alias.
-Legacy `VsTermHost` Run entries are removed only after successful task registration
-and only when their command matches the owned installed executable.
-
-</details>
 
 ## Get connected
 
@@ -300,6 +196,8 @@ $PID; $artermProof; (Get-Location).Path
 ($PID -eq $artermPid) -and ($artermProof -eq 'kept-on-host') -and ((Get-Location).Path -eq $artermCwd)
 ```
 
+Replay is bounded; keep a remote build log if you need complete output. Reconnection is not an exact screen/history checkpoint.
+
 Expected: the same PID, `kept-on-host`, the same directory, and `True`.
 This demonstrates client detachment, not host reboot recovery. Finish this
 test with `exit` **inside the remote shell**; that ends it deliberately.
@@ -309,7 +207,7 @@ authentication recovery. Do not delete saved recovery records or reinstall a
 running host just because the client disconnected. See
 [troubleshooting](#installation-and-troubleshooting-details),
 [safe upgrades and stopping](QUICKSTART.md#upgrade-without-registering-again),
-and [trust removal](DEVELOPMENT-INSTALL.md).
+and [trust removal](DEVELOPMENT-INSTALL.md). Ordinary `arterm-host stop` may restart at the next scheduled check; use `arterm-host stop --disable` for a persistent stop after safely finishing sessions. `arterm-host start` restarts the host, not lost shells.
 
 <details>
 <summary>Console restoration and parser limitations</summary>
@@ -332,7 +230,82 @@ separate parser state.
 
 </details>
 
+## Release and workflow scope
+
+Public release metadata checked **2026-10-10** lists **v0.7.1** x64/ARM64
+**development-signed ZIPs** and `SHA256SUMS`. The existing
+[release route](https://github.com/yeelam/arterm/releases/latest) redirects to
+that release today; later versions need their own evidence. Metadata/checksums
+are not local binary execution or whole-product certification.
+
+| Workflow | First-use decision and evidence boundary |
+| --- | --- |
+| Attach, detach, reattach to the same shell | Use the unchanged PID/variable/cwd procedure above; `True` is expected, not a claimed run here. Host must stay running/logged in. |
+| Managed `send` / `read` | Requires a **newly created supported PowerShell/pwsh** session and the matching trusted local owner context. Existing shells are not retrofitted; other shells/unknown versions are not qualified by this example. |
+| Direct input and file/folder transfer | Implemented in the current branch, but its direct-input and independent transfer-archive review gates remain open. Published archives/CI do not close those gates or establish every branch capability for every release. |
+
 ## Control an attached session
+
+<details>
+<summary>Technical details: session lifetime, shell integration, and development gates</summary>
+
+**File-transfer development gate:** independent archive review remains blocked;
+this integration is not release-qualified by that review.
+
+**Limit:** the remote host must stay running and logged in. Remote Windows
+reboot/logoff, host crash/shutdown, or remote shell `exit` ends that process.
+arTerm does not checkpoint or resurrect processes after those events.
+Managed command execution requires a newly created, supported PowerShell/pwsh
+session; existing sessions are not retrofitted.
+The direct-input integration additionally requires PSReadLine's F24 handler,
+buffer inspection, insertion, and accept-line APIs. An authenticated, bounded
+in-memory pipe delivers command data only to the owned shell process; the handler
+checks the real edit buffer and inserts the original source for ordinary
+top-level execution. Base64 is transport data, not an execution wrapper.
+A read-only `PSConsoleHostReadLine` adapter arms execution tracking only after
+the original reader returns the accepted source. Prompt redraws during editing
+or acceptance cannot report command completion or managed readiness.
+Managed source is excluded from PSReadLine history with a one-line handler that
+restores the exact current user handler before the next manual line. Manual
+history, save settings, and user filters are not globally disabled or replaced.
+Keyboard input is permitted while a managed command is running (including
+`Read-Host` answers) and while its profile prompt is finishing, but remains guarded before dispatch; other automated
+commands wait. Partial edit buffers are never cleared or overwritten.
+Command completion is published even when a preserved partial line keeps
+automation not ready; waiting for completion does not require submitting that line.
+Unsupported integration and invalid syntax fail explicitly without a wrapper
+fallback. Replacing the prompt or PSReadLine integration can stop managed
+completion/readiness.
+Cancellation is checked at the existing client queue-to-delivery boundary.
+Once dispatched, caller exit does not cancel queued work; delivery uncertainty
+must be queried by command ID, never retried under a new identity. Admission is
+not proof of execution: a real-buffer rejection, invalid syntax, or a hook that
+does not accept within five seconds records `not_submitted` (`submitted:false`).
+The payload is revoked and cannot run later. Timeout disables managed readiness
+instead of leaving an indefinitely accepted command or guessing the edit buffer.
+Mailbox commitment is distinct from confirmed PSReadLine acceptance. If start
+confirmation is missing for five seconds after commitment, the outcome becomes
+`unknown`, never `not_submitted`: the command may have executed. Its identity
+cannot be replayed. Manual input remains usable; a subsequent real prompt can
+restore readiness without falsely completing the unknown record. Late start or
+completion evidence is accepted only for the same still-eligible command ID.
+
+**Advanced local-host opt-in:** `ARTERM_SHELL_HISTORY_PATH` may specify an absolute
+PowerShell history path for newly created supported interactive shells, including
+unmanaged ones. The host validates and encodes this path as data and applies it
+before the first ReadLine; it does not change history save style or user filters.
+Unset preserves the user's normal path. This is a host-process setting, not a
+remote-client option; `VSTERM_HISTORY_PATH` remains unsupported. Test fixtures set
+unique owned paths explicitly because changing `APPDATA` alone does not isolate
+PSReadLine history on either supported shell.
+
+**Direct-input development gate:** this branch is not release-qualified.
+Fresh host/client/controller tests cover two `Read-Host` answers and recovery
+through the existing interrupt request on Windows PowerShell and PowerShell 7.
+Earlier minimal F24-only interruption probes are archived outside shipping tests;
+arbitrary TUI behavior and all custom profile/read-line handlers are not certified.
+
+</details>
 
 ### Agent-neutral command access
 
@@ -344,6 +317,8 @@ running; controller commands require the same local Windows user, logon/session,
 integrity/elevation context, and byte-identical trusted signed client. Your caller
 owns backgrounding; there is no arTerm `--background` or `resume` command.
 
+**Before managed control:** create a new supported PowerShell/pwsh session; keep its matching, trusted local attachment running. Review the [release/workflow scope](#release-and-workflow-scope) and open development gates; do not assume an old or arbitrary shell gained integration.
+
 Leave `arterm connect my-devbox MyWork` running, then use another local terminal:
 
 ```powershell
@@ -352,6 +327,8 @@ arterm list --server my-devbox
 arterm send my-devbox MyWork --command 'Get-Location' --wait --timeout 60s
 arterm read my-devbox MyWork --lines 20
 ```
+
+**Before transfer:** the current branch automatically removes recipient `Zone.Identifier` (Mark-of-the-Web). This is not malware scanning, benign-content assurance or certificate trust. The independent archive-review gate remains open; see [workflow scope](#release-and-workflow-scope).
 
 File transfers use the same active owner:
 
@@ -452,6 +429,48 @@ For standalone dependency paths, setup options, and troubleshooting, see
 [QUICKSTART.md](QUICKSTART.md). See [SIGNING.md](SIGNING.md) for signing policy.
 
 ## Session and recovery details
+
+<details>
+<summary>Host startup and ownership details</summary>
+
+The per-user Task Scheduler task uses InteractiveToken/LeastPrivilege and runs
+under the current process's Windows token SID, including Entra/AAD `S-1-12-1`
+identities. Both the principal and logon trigger use that SID; no local-account
+name is derived or substituted. Registration validates persisted principal,
+trigger, executable and data-root ownership. Scheduler-returned account names
+are translated to SIDs only for verification; rejection is reported without
+password, SYSTEM, service, batch-logon or local-account fallback. At user logon,
+and every **10 minutes** afterward (`PT10M`, no repetition duration), the task
+runs a short, idempotent `ensure-running --data-root ...` check. A responsive
+broker is left untouched; an absent broker starts in the background, and the
+check exits. A locked/unresponsive broker is reported, never killed or replaced.
+There is no continuous monitor or crash-retry backoff. Task Scheduler's
+`RestartOnFailure` is not used. InteractiveToken prevents checks without a
+logged-in user; no service or unattended account logon is configured.
+The check and broker append startup/PID, shutdown, and error diagnostics
+to `host\host.stdout.log` and `host\host.stderr.log` under its explicit data root;
+the tunnel retains its separate `code-tunnel.*.log` files. A small owned VBScript
+bootstrap runs under GUI `wscript.exe`, launches the check with window style 0,
+waits for that bounded check and propagates its exit status. The check creates
+its broker with `CREATE_NO_WINDOW`. Shared terminal windows are never hidden or
+killed; Task Scheduler's Hidden flag is not relied upon. Registration probes
+Windows Script Host/VBScript availability and fails explicitly if unavailable
+or policy-blocked, with no visible-console fallback.
+**Ordinary `arterm-host stop` permits automatic startup at the next 10-minute
+check (or next logon). Use `stop --disable` to keep it stopped until explicit
+`start`.** Recovery creates a new broker, not restored terminal sessions.
+Install/update/uninstall only manage ownership-verified tasks for this installation.
+Runtime setup holds that pause through shutdown, explicit authentication, configuration
+save and task registration. A failed setup restores the prior configuration before
+restoring task state; unsafe recovery leaves checks disabled and reports the error.
+The installed `arterm-host.exe` and `vsterm-host.exe` aliases resolve the same
+SID/data-root task only when both belong to the same ownership-marked host
+installation. The registered action remains exact; another directory or publisher
+is not treated as an alias.
+Legacy `VsTermHost` Run entries are removed only after successful task registration
+and only when their command matches the owned installed executable.
+
+</details>
 
 <details>
 <summary>Names, retries, replay, and command history</summary>
