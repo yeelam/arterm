@@ -1,5 +1,7 @@
 # arTerm
 
+**Persistent remote Windows terminal for builds and coding agents.**
+
 ### Lose the connection. Not your work.
 
 Keep builds, coding agents, and long-running commands on a remote Windows
@@ -10,6 +12,8 @@ work in progress** while the host stays running.
 **[Download for Windows: x64 and ARM64](https://github.com/yeelam/arterm/releases/latest)**
 | [Get connected](#get-connected)
 | [Full quick start](QUICKSTART.md)
+
+**Languages:** English | [简体中文](docs/i18n/README.zh-CN.md) | [日本語](docs/i18n/README.ja.md) | [Español](docs/i18n/README.es.md) | [Português (Brasil)](docs/i18n/README.pt-BR.md) | [Français](docs/i18n/README.fr.md) | [Deutsch](docs/i18n/README.de.md)
 
 [![Before: a terminal-bound workflow loses context when the client disconnects. After: arTerm keeps work on the remote host so you can reconnect and continue.](.github/arterm-before-after.png)](https://github.com/yeelam/arterm/releases/latest)
 
@@ -111,6 +115,28 @@ Installers detect dependencies and offer downloads only with consent; vendor
 binaries are not bundled. Host setup requires acceptance of the VS Code server
 license terms. Host startup is at **Windows user logon**, not a SYSTEM service:
 a cold boot requires Windows sign-in, and arTerm does not configure autologon.
+
+### Released downloads versus development gates
+
+The existing download route above redirects to the published
+[v0.7.1 release](https://github.com/yeelam-gordon/arterm/releases/tag/v0.7.1).
+It offers **development-signed**, not publicly trusted production-signed, x64
+and ARM64 archives. Verify checksums and the public certificate using
+[DEVELOPMENT-INSTALL.md](DEVELOPMENT-INSTALL.md); local trust is a separate,
+explicit, policy-permitted decision. Do not bypass SmartScreen, application
+control, Authenticode checks, dependency consent, or the server license prompt.
+
+For source `73c59e0682fbe9a4d966dd48468436248b94e3e7`, the public
+[native Windows CI run](https://github.com/yeelam-gordon/arterm/actions/runs/37918662460)
+completed successfully. The release author reports protected signing gates on
+both architectures; those private results are not independently verified here,
+and the release explicitly excludes real-cloud terminal testing. The pending
+ARM64 rollout discussion in [SIGNING.md](SIGNING.md) describes earlier
+source-change scope, not the current download inventory. Neither the published
+archives nor CI success qualifies this entire development branch: independent
+file-transfer archive review and direct-input gates above remain unresolved;
+arbitrary TUIs, custom read-line handlers, and mixed-architecture end-to-end
+operation are not certified by this documentation.
 
 <details>
 <summary>Host startup and ownership details</summary>
@@ -219,6 +245,60 @@ Without a reference, `arterm connect my-devbox` **only prints** a complete
 reusable command and exits; it does not start a remote shell.
 
 ## Control an attached session
+
+### Prove that you returned to the same shell
+
+After the setup and registration above, use a new reference for this small
+PowerShell check on the **local client**:
+
+```powershell
+arterm connect my-devbox MyProof --shell powershell
+```
+
+In the **attached remote PowerShell**, run:
+
+```powershell
+$artermProof = 'kept-on-host'
+$artermPid = $PID
+$artermCwd = (Get-Location).Path
+$PID; $artermProof; (Get-Location).Path
+```
+
+Note the PID and directory. Press **Ctrl+]** (or close only the local client
+tab). Keep the remote Windows host running and logged in. In a local terminal,
+repeat the **same** command:
+
+```powershell
+arterm connect my-devbox MyProof --shell powershell
+```
+
+In the reattached **remote** shell, run:
+
+```powershell
+$PID; $artermProof; (Get-Location).Path
+($PID -eq $artermPid) -and ($artermProof -eq 'kept-on-host') -and ((Get-Location).Path -eq $artermCwd)
+```
+
+Expected: the same PID, `kept-on-host`, the same directory, and `True`.
+This demonstrates client detachment, not host reboot recovery. Finish this
+test with `exit` **inside the remote shell**; that ends it deliberately.
+If discovery or sign-in fails, run `arterm doctor my-devbox`, check both tunnel
+accounts and outbound access, and use `arterm --login` for explicit client
+authentication recovery. Do not delete saved recovery records or reinstall a
+running host just because the client disconnected. See
+[troubleshooting](#installation-and-troubleshooting-details),
+[safe upgrades and stopping](QUICKSTART.md#upgrade-without-registering-again),
+and [trust removal](DEVELOPMENT-INSTALL.md).
+
+### Agent-neutral command access
+
+Copilot CLI, Claude Code, Codex, Gemini CLI, Kimi, and Qwen CLI users can inspect
+these public instructions and, where their tools permit ordinary Windows CLI
+execution, use the same attach/control workflow. This is **not a claim of native
+integration or six-client runtime certification**. Keep one attachment process
+running; controller commands require the same local Windows user, logon/session,
+integrity/elevation context, and byte-identical trusted signed client. Your caller
+owns backgrounding; there is no arTerm `--background` or `resume` command.
 
 Leave `arterm connect my-devbox MyWork` running, then use another local terminal:
 
@@ -456,9 +536,11 @@ do not gain the new in-memory command adapter when a client reconnects.
 
 Use Windows and a host-native stable MSVC Rust toolchain. The C runtime is
 statically linked on both x64 and ARM64. ARM64 runtimes and installers have
-been cross-built and their PE architecture checked; native ARM64 functional,
-installer lifecycle, and signed-production IPC validation are still pending.
-Do not treat cross-compilation as a native support certification.
+been cross-built and their PE architecture checked. Native ARM64 functional,
+installer lifecycle, and signed-production IPC validation were pending in the
+earlier source-change notes. See [released-download evidence](#released-downloads-versus-development-gates)
+for the later v0.7.1 native CI and attributed signing results; these do not close
+every development gate. Do not treat cross-compilation as native certification.
 
 ```text
 cargo test --locked --features test-unsigned-ipc -- --test-threads=1
@@ -503,7 +585,9 @@ structural checks do not replace Authenticode verification or native execution.
 runtime bytes without rebuilding, with the same architecture checks.
 Public CI uses native `windows-2022` x64 and `windows-11-arm` ARM64 jobs,
 explicit target triples, and a required nonzero ignored-functional-test count.
-These jobs have been configured, not executed as part of this local change.
+These jobs were configured but not executed as part of the earlier local source
+change; the later release-linked public run is recorded above. No CI or runtime
+tests were executed for this documentation change.
 For feature-branch validation, open a draft pull request against `main` after
 review: the existing `pull_request` trigger runs both native jobs on opening
 and subsequent pushes. No signing credentials or production trust are available
